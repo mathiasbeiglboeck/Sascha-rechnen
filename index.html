@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Rechenheft">
+<meta name="theme-color" content="#fbfcf7">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" href="icon-192.png">
+<title>Saschas Rechenheft</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;700;800&family=Nunito:wght@500;700;800&display=swap">
+<style>
+/* Layout: ein Blatt Kästchenpapier in der Mitte, oben Fortschritt, darunter Aufgabe, Ziffernblock unten */
+:root {
+  --paper: #fbfcf7;
+  --grid: #d9e6f2;
+  --ink: #1f4fa8;
+  --text: #22304a;
+  --muted: #6a7790;
+  --red: #d2463a;
+  --green: #23875a;
+  --pencil: #f2b632;
+  --key: #ffffff;
+  --key-edge: #c9d6e6;
+  --sheet: rgba(255,255,255,.72);
+  --f-display: "Baloo 2", "Nunito", system-ui, sans-serif;
+  --f-body: "Nunito", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #18202e; --grid: #243149; --ink: #8db4ff; --text: #e6ecf7; --muted: #9aa8c2;
+    --red: #ff7b6e; --green: #5fd39a; --pencil: #f5c04a; --key: #222d40; --key-edge: #34435e;
+    --sheet: rgba(24,32,46,.8); color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #18202e; --grid: #243149; --ink: #8db4ff; --text: #e6ecf7; --muted: #9aa8c2;
+  --red: #ff7b6e; --green: #5fd39a; --pencil: #f5c04a; --key: #222d40; --key-edge: #34435e;
+  --sheet: rgba(24,32,46,.8); color-scheme: dark;
+}
+html, body { min-height: 100%; }
+body { margin: 0; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); box-sizing: border-box; overscroll-behavior: none; }
+[hidden] { display: none !important; }
+body {
+  background-color: var(--paper);
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 28px 28px;
+  color: var(--text);
+  font-family: var(--f-body);
+  font-size: 18px;
+}
+.wrap {
+  max-width: 560px; margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 20px 32px;
+  display: flex; flex-direction: column; gap: 20px;
+}
+h1, h2 { font-family: var(--f-display); margin: 0; text-wrap: balance; line-height: 1.1; }
+h1 { font-size: 2.2rem; color: var(--ink); font-weight: 800; }
+h2 { font-size: 1.3rem; font-weight: 700; }
+p { margin: 0; }
+.lead { color: var(--muted); font-weight: 700; }
+.step { display: flex; flex-direction: column; gap: 12px; }
+.label { font-size: .8rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 800; }
+
+button { font: inherit; color: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent; touch-action: manipulation; -webkit-user-select: none; user-select: none; }
+button:focus-visible { outline: 3px solid var(--pencil); outline-offset: 3px; }
+
+.ops { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.op {
+  background: var(--key); border: 3px solid var(--key-edge); border-radius: 18px;
+  padding: 14px 10px; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  box-shadow: 0 4px 0 var(--key-edge); transition: transform .08s;
+}
+.op .sym { font-family: var(--f-display); font-size: 2.6rem; font-weight: 800; line-height: 1; color: var(--ink); }
+.op .name { font-weight: 800; }
+.op .hint { font-size: .8rem; color: var(--muted); font-weight: 700; }
+.op[aria-pressed="true"] { border-color: var(--ink); box-shadow: 0 4px 0 var(--ink); background: color-mix(in srgb, var(--ink) 10%, var(--key)); }
+.op:active, .lvl:active, .key:active { transform: translateY(3px); box-shadow: 0 1px 0 var(--key-edge); }
+
+.lvls { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.lvl {
+  background: var(--key); border: 3px solid var(--key-edge); border-radius: 18px;
+  padding: 14px 6px; box-shadow: 0 4px 0 var(--key-edge);
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+}
+.lvl .name { font-family: var(--f-display); font-size: 1.35rem; font-weight: 800; }
+.lvl .dots { letter-spacing: 2px; color: var(--pencil); font-size: 1.1rem; }
+.lvl .hint { font-size: .75rem; color: var(--muted); font-weight: 700; text-align: center; }
+.lvl:disabled { opacity: .45; cursor: not-allowed; }
+.tally { background: var(--sheet); border: 3px dashed var(--pencil); border-radius: 16px; padding: 10px 14px; font-weight: 800; display: flex; gap: 10px; align-items: center; }
+.tally .num { font-family: var(--f-display); font-size: 2rem; color: var(--ink); line-height: 1; }
+.note { color: var(--red); font-weight: 800; min-height: 1.4em; }
+
+/* Spiel */
+.top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.quit { background: none; border: 0; color: var(--muted); font-weight: 800; padding: 6px 4px; }
+.progress { display: flex; gap: 6px; flex-wrap: wrap; }
+.pip { width: 18px; height: 18px; border-radius: 50%; border: 2.5px solid var(--key-edge); background: var(--key); }
+.pip.now { border-color: var(--ink); }
+.pip.ok { background: var(--green); border-color: var(--green); }
+.pip.ok2 { background: var(--pencil); border-color: var(--pencil); }
+.pip.no { background: var(--red); border-color: var(--red); }
+
+.sheet {
+  background: var(--sheet); border: 3px solid var(--key-edge); border-radius: 22px;
+  padding: 22px 16px; display: flex; flex-direction: column; align-items: center; gap: 10px;
+  backdrop-filter: blur(1px);
+}
+.count { font-weight: 800; color: var(--muted); font-size: .9rem; }
+.task {
+  font-family: var(--f-display); font-weight: 800; font-size: clamp(2.6rem, 12vw, 4rem);
+  line-height: 1.1; display: flex; align-items: center; gap: .3em; flex-wrap: wrap; justify-content: center;
+  font-variant-numeric: tabular-nums;
+}
+.ans {
+  min-width: 2.4em; padding: 0 .2em; border-bottom: 5px solid var(--ink); color: var(--ink);
+  text-align: center; min-height: 1.1em;
+}
+.ans.empty::after { content: "?"; color: var(--grid); }
+.ans.wrong { color: var(--red); border-color: var(--red); animation: shake .35s; }
+.ans.right { color: var(--green); border-color: var(--green); }
+@keyframes shake { 25% { transform: translateX(-8px); } 50% { transform: translateX(8px); } 75% { transform: translateX(-4px); } }
+.feedback { font-family: var(--f-display); font-weight: 800; font-size: 1.4rem; min-height: 1.6em; text-align: center; }
+.feedback.ok { color: var(--green); }
+.feedback.no { color: var(--red); }
+
+.pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.key {
+  background: var(--key); border: 3px solid var(--key-edge); border-radius: 16px;
+  font-family: var(--f-display); font-weight: 800; font-size: 2rem; padding: 8px 0;
+  box-shadow: 0 4px 0 var(--key-edge); min-height: 64px;
+}
+.key.del { color: var(--red); font-size: 1.6rem; }
+.key.go { background: var(--green); border-color: var(--green); color: #fff; box-shadow: 0 4px 0 color-mix(in srgb, var(--green) 60%, #000); font-size: 1.6rem; }
+.key:disabled { opacity: .5; }
+.kbd { text-align: center; color: var(--muted); font-size: .8rem; font-weight: 700; }
+
+/* Ergebnis */
+.big { font-family: var(--f-display); font-weight: 800; font-size: 3.4rem; color: var(--ink); line-height: 1; }
+.stars { font-size: 2.4rem; color: var(--pencil); letter-spacing: 4px; }
+.stars .off { color: var(--key-edge); }
+.list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; width: 100%; font-variant-numeric: tabular-nums; }
+.list li { font-weight: 800; display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px dashed var(--key-edge); padding: 4px 0; }
+.list .mark-ok { color: var(--green); }
+.list .mark-ok2 { color: #b9860f; }
+:root[data-theme="dark"] .list .mark-ok2 { color: var(--pencil); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .list .mark-ok2 { color: var(--pencil); } }
+.list .mark-no { color: var(--red); }
+.legend { font-size: .8rem; color: var(--muted); font-weight: 700; text-align: center; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; }
+.plain {
+  background: none; border: 3px solid var(--key-edge); border-radius: 14px; padding: 10px 16px; font-weight: 800;
+}
+@media (max-width: 420px) {
+  .list { grid-template-columns: 1fr; }
+  .lvl .hint { display: none; }
+}
+@media (pointer: coarse) { .kbd { display: none; } }
+@media (max-height: 760px) {
+  .wrap { padding-block: 10px 16px; gap: 12px; }
+  .sheet { padding: 12px 12px; gap: 4px; }
+  .task { font-size: clamp(2.2rem, 11vw, 3.2rem); }
+  .feedback { font-size: 1.15rem; }
+  .key { min-height: 52px; font-size: 1.7rem; padding: 4px 0; }
+  .pad { gap: 8px; }
+}
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- Start -->
+  <section id="start" class="step" style="gap:24px">
+    <div class="step" style="gap:4px">
+      <h1>Saschas Rechenheft</h1>
+      <p class="lead">Such dir aus, was du rechnen willst. Dann gibt es 10 Aufgaben.</p>
+    </div>
+    <div class="tally" id="tally"></div>
+    <div class="step">
+      <span class="label">1. Rechenart (du kannst auch mehrere nehmen)</span>
+      <div class="ops" id="ops">
+        <button class="op" id="op-mul" data-op="mul" aria-pressed="true"><span class="sym">×</span><span class="name">Mal</span><span class="hint">Einmaleins</span></button>
+        <button class="op" id="op-div" data-op="div" aria-pressed="false"><span class="sym">÷</span><span class="name">Geteilt</span><span class="hint">Einmaleins</span></button>
+        <button class="op" id="op-add" data-op="add" aria-pressed="false"><span class="sym">+</span><span class="name">Plus</span><span class="hint">zweistellig</span></button>
+        <button class="op" id="op-sub" data-op="sub" aria-pressed="false"><span class="sym">−</span><span class="name">Minus</span><span class="hint">zweistellig</span></button>
+      </div>
+    </div>
+    <div class="step">
+      <span class="label">2. Wie schwer? Dann geht's los</span>
+      <div class="lvls" id="lvls-start"></div>
+      <p class="note" id="note"></p>
+    </div>
+  </section>
+
+  <!-- Spiel -->
+  <section id="game" class="step" hidden>
+    <div class="top">
+      <div class="progress" id="progress"></div>
+      <button class="quit" id="quit">Aufhören</button>
+    </div>
+    <div class="sheet">
+      <span class="count" id="count">Aufgabe 1 von 10</span>
+      <div class="task" id="task"></div>
+      <div class="feedback" id="feedback"></div>
+    </div>
+    <div class="pad" id="pad"></div>
+    <p class="kbd">Du kannst auch die Zifferntasten benutzen. Enter = OK, Löschtaste = ⌫</p>
+  </section>
+
+  <!-- Ergebnis -->
+  <section id="result" class="step" hidden>
+    <div class="sheet">
+      <span class="count" id="r-what"></span>
+      <div class="big" id="r-score"></div>
+      <div class="stars" id="r-stars"></div>
+      <h2 id="r-msg"></h2>
+      <p class="lead" id="r-tally"></p>
+      <ul class="list" id="r-list"></ul>
+      <p class="legend"><span style="color:var(--green)">●</span> gleich richtig &nbsp; <span style="color:var(--pencil)">●</span> beim 2. Versuch &nbsp; <span style="color:var(--red)">●</span> noch üben</p>
+    </div>
+    <div class="step">
+      <span class="label">Noch 10 Aufgaben? Wähle wie schwer</span>
+      <div class="lvls" id="lvls-again"></div>
+    </div>
+    <div class="row"><button class="plain" id="back">Andere Rechenart wählen</button></div>
+  </section>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const rnd = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+  const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+  const SYM = { mul: "×", div: "÷", add: "+", sub: "−" };
+  const LEVELS = [
+    { id: "leicht", dots: "★", hint: "zum Aufwärmen" },
+    { id: "mittel", dots: "★★", hint: "schon kniffliger" },
+    { id: "schwer", dots: "★★★", hint: "für Profis" },
+  ];
+
+  // Einmaleins-Reihen je Stufe
+  const ROWS = { leicht: [1, 2, 5, 10], mittel: [2, 3, 4, 5, 6, 10], schwer: [6, 7, 8, 9] };
+
+  function makeTask(op, lvl) {
+    let a, b, r;
+    if (op === "mul" || op === "div") {
+      const row = pick(ROWS[lvl]);
+      const other = lvl === "schwer" ? rnd(3, 9) : rnd(1, 10);
+      if (op === "mul") {
+        [a, b] = Math.random() < .5 ? [row, other] : [other, row];
+        r = a * b;
+      } else {
+        a = row * other; b = row; r = other;
+      }
+    } else if (op === "add") {
+      if (lvl === "leicht") {        // ohne Zehnerübergang, Ergebnis < 100
+        do { a = rnd(11, 78); b = rnd(11, 78); } while ((a % 10) + (b % 10) > 9 || a + b > 99);
+      } else if (lvl === "mittel") { // mit Zehnerübergang, Ergebnis < 100
+        do { a = rnd(12, 79); b = rnd(12, 79); } while ((a % 10) + (b % 10) < 10 || a + b > 99);
+      } else {                       // mit Übergang, über 100 hinaus
+        do { a = rnd(35, 99); b = rnd(25, 99); } while ((a % 10) + (b % 10) < 10 || a + b <= 100);
+      }
+      r = a + b;
+    } else {
+      if (lvl === "leicht") {        // ohne Zehnerübergang
+        do { a = rnd(21, 99); b = rnd(11, a - 1); } while ((a % 10) < (b % 10));
+      } else if (lvl === "mittel") { // mit Zehnerübergang
+        do { a = rnd(31, 99); b = rnd(12, a - 5); } while ((a % 10) >= (b % 10));
+      } else {                       // von über 100 weg, mit Übergang
+        do { a = rnd(101, 180); b = rnd(25, 99); } while ((a % 10) >= (b % 10) || a - b < 5);
+      }
+      r = a - b;
+    }
+    return { op, a, b, r, key: op + a + "," + b };
+  }
+
+  function makeRound(ops, lvl) {
+    const list = [], seen = new Set();
+    let guard = 0;
+    while (list.length < 10 && guard++ < 500) {
+      const t = makeTask(ops[list.length % ops.length], lvl);
+      if (seen.has(t.key)) continue;
+      seen.add(t.key); list.push(t);
+    }
+    // Rechenarten mischen, wenn mehrere gewählt sind
+    for (let i = list.length - 1; i > 0; i--) { const j = rnd(0, i); [list[i], list[j]] = [list[j], list[i]]; }
+    return list;
+  }
+
+  // Geschaffte Runden merken (bleibt im Browser auf diesem Computer gespeichert)
+  const STORE = "sascha-rechenheft-v1";
+  function loadLog() { try { return JSON.parse(localStorage.getItem(STORE)) || []; } catch (e) { return []; } }
+  function saveLog(log) { try { localStorage.setItem(STORE, JSON.stringify(log)); } catch (e) {} }
+  const today = () => new Date().toLocaleDateString("de-AT");
+  function showTally() {
+    const log = loadLog(), n = log.length, t = log.filter(r => r.d === today()).length;
+    $("tally").innerHTML = n
+      ? `<span class="num">${n}</span><span>${n === 1 ? "Runde" : "Runden"} schon geschafft${t ? ` · heute ${t}` : ""}</span>`
+      : `<span>Deine erste Runde! Los geht's.</span>`;
+  }
+  showTally();
+
+  // Zustand
+  let ops = ["mul"], lvl = "leicht", tasks = [], idx = 0, input = "", tries = 0, results = [], locked = false;
+
+  // Startbildschirm
+  function selectedOps() {
+    return [...document.querySelectorAll(".op")].filter(b => b.getAttribute("aria-pressed") === "true").map(b => b.dataset.op);
+  }
+  document.querySelectorAll(".op").forEach(b => b.addEventListener("click", () => {
+    b.setAttribute("aria-pressed", b.getAttribute("aria-pressed") === "true" ? "false" : "true");
+    $("note").textContent = selectedOps().length ? "" : "Wähle mindestens eine Rechenart.";
+  }));
+
+  function buildLevels(container) {
+    container.innerHTML = "";
+    LEVELS.forEach(L => {
+      const b = document.createElement("button");
+      b.className = "lvl"; b.id = container.id + "-" + L.id;
+      b.innerHTML = `<span class="name">${L.id[0].toUpperCase() + L.id.slice(1)}</span><span class="dots">${L.dots}</span><span class="hint">${L.hint}</span>`;
+      b.addEventListener("click", () => {
+        if (container.id === "lvls-start") {
+          const s = selectedOps();
+          if (!s.length) { $("note").textContent = "Wähle zuerst eine Rechenart."; return; }
+          ops = s;
+        }
+        startRound(L.id);
+      });
+      container.appendChild(b);
+    });
+  }
+  buildLevels($("lvls-start"));
+  buildLevels($("lvls-again"));
+
+  // Ziffernblock
+  const pad = $("pad");
+  ["1","2","3","4","5","6","7","8","9","del","0","ok"].forEach(k => {
+    const b = document.createElement("button");
+    b.className = "key" + (k === "del" ? " del" : k === "ok" ? " go" : "");
+    b.id = "key-" + k;
+    b.textContent = k === "del" ? "⌫" : k === "ok" ? "OK" : k;
+    b.setAttribute("aria-label", k === "del" ? "Löschen" : k === "ok" ? "Antwort prüfen" : k);
+    b.addEventListener("click", () => press(k));
+    pad.appendChild(b);
+  });
+
+  function show(id) { ["start", "game", "result"].forEach(s => $(s).hidden = s !== id); window.scrollTo(0, 0); }
+
+  function startRound(level) {
+    lvl = level; tasks = makeRound(ops, lvl); idx = 0; results = [];
+    show("game"); nextTask(true);
+  }
+
+  function nextTask(first) {
+    if (!first) idx++;
+    if (idx >= tasks.length) return finish();
+    input = ""; tries = 0; locked = false;
+    $("feedback").textContent = ""; $("feedback").className = "feedback";
+    render();
+  }
+
+  function render() {
+    const t = tasks[idx];
+    $("count").textContent = `Aufgabe ${idx + 1} von 10`;
+    $("task").innerHTML = `<span>${t.a}</span><span>${SYM[t.op]}</span><span>${t.b}</span><span>=</span><span class="ans${input ? "" : " empty"}" id="ans">${input}</span>`;
+    const pr = $("progress"); pr.innerHTML = "";
+    for (let i = 0; i < 10; i++) {
+      const p = document.createElement("span");
+      const r = results[i];
+      p.className = "pip" + (r === 1 ? " ok" : r === 2 ? " ok2" : r === 0 ? " no" : i === idx ? " now" : "");
+      pr.appendChild(p);
+    }
+  }
+
+  function setAns(cls) {
+    const a = $("ans"); a.textContent = input; a.className = "ans" + (input ? "" : " empty") + (cls ? " " + cls : "");
+  }
+
+  const PRAISE = ["Super!", "Toll!", "Richtig!", "Bravo!", "Spitze!", "Genau!", "Klasse!"];
+
+  function press(k) {
+    if (locked || $("game").hidden) return;
+    if (k === "del") { input = input.slice(0, -1); setAns(); return; }
+    if (k === "ok") return check();
+    if (input.length >= 3) return;
+    if (input === "0") input = "";
+    input += k; setAns();
+  }
+
+  function check() {
+    if (!input) { $("feedback").textContent = "Tipp zuerst eine Zahl ein."; $("feedback").className = "feedback"; return; }
+    const t = tasks[idx], ok = Number(input) === t.r;
+    tries++;
+    if (ok) {
+      results[idx] = tries === 1 ? 1 : 2;
+      setAns("right");
+      $("feedback").textContent = tries === 1 ? pick(PRAISE) : "Jetzt stimmt's!";
+      $("feedback").className = "feedback ok";
+      locked = true; render(); setAns("right");
+      setTimeout(() => nextTask(), 900);
+    } else if (tries === 1) {
+      setAns("wrong");
+      $("feedback").textContent = "Fast! Probier's nochmal.";
+      $("feedback").className = "feedback no";
+      locked = true;
+      setTimeout(() => { input = ""; setAns(); locked = false; }, 900);
+    } else {
+      results[idx] = 0;
+      locked = true;
+      setAns("wrong");
+      $("feedback").textContent = `Richtig ist ${t.r}. Merk's dir!`;
+      $("feedback").className = "feedback no";
+      setTimeout(() => { input = String(t.r); render(); setAns("right"); }, 700);
+      setTimeout(() => nextTask(), 2600);
+    }
+  }
+
+  function finish() {
+    const first = results.filter(r => r === 1).length;
+    const second = results.filter(r => r === 2).length;
+    const points = first + second * 0.5;
+    const nStars = points >= 9.5 ? 3 : points >= 7 ? 2 : points >= 4 ? 1 : 0;
+    $("r-what").textContent = ops.map(o => SYM[o]).join(" ") + " · " + lvl;
+    $("r-score").textContent = `${first + second} von 10`;
+    $("r-stars").innerHTML = [0, 1, 2].map(i => i < nStars ? "★" : '<span class="off">★</span>').join("");
+    $("r-msg").textContent =
+      first === 10 ? "Alles gleich richtig. Wow!" :
+      nStars === 3 ? "Ganz toll gemacht!" :
+      nStars === 2 ? "Sehr gut! Weiter so." :
+      nStars === 1 ? "Gut geübt! Noch eine Runde?" : "Übung macht den Meister. Probier's nochmal!";
+    $("r-list").innerHTML = tasks.map((t, i) => {
+      const m = results[i] === 1 ? ["mark-ok", "✓"] : results[i] === 2 ? ["mark-ok2", "✓"] : ["mark-no", "✗"];
+      return `<li><span>${t.a} ${SYM[t.op]} ${t.b} = ${t.r}</span><span class="${m[0]}">${m[1]}</span></li>`;
+    }).join("");
+    const log = loadLog();
+    log.push({ d: today(), ops: ops.join(","), lvl, ok: first + second, first });
+    saveLog(log);
+    $("r-tally").textContent = `Das war deine ${log.length}. Runde!`;
+    showTally();
+    show("result");
+  }
+
+  $("quit").addEventListener("click", () => show("start"));
+  $("back").addEventListener("click", () => show("start"));
+
+  document.addEventListener("keydown", e => {
+    if ($("game").hidden) return;
+    if (/^[0-9]$/.test(e.key)) { press(e.key); e.preventDefault(); }
+    else if (e.key === "Backspace" || e.key === "Delete") { press("del"); e.preventDefault(); }
+    else if (e.key === "Enter") { press("ok"); e.preventDefault(); }
+  });
+})();
+</script>
+<script>if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});</script>
+</body>
+</html>
