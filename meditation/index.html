@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Stille">
+<meta name="theme-color" content="#1c1a18">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" href="icon-192.png">
+<title>Stille</title>
+<style>
+/* Ruhig und dunkel: Einstellungen oben, ein Startknopf, während der Sitzung fast nur Schwarz */
+:root {
+  --bg: #1c1a18;
+  --text: #e9e2d6;
+  --muted: #9a917f;
+  --line: #3a3530;
+  --gold: #d6b070;
+  --chip: #26231f;
+  --f: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
+  --f-ui: -apple-system, system-ui, "Segoe UI", sans-serif;
+  color-scheme: dark;
+}
+html, body { min-height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: var(--f-ui); font-size: 17px;
+  padding: env(safe-area-inset-top, 0px) 0 env(safe-area-inset-bottom, 0px);
+  box-sizing: border-box; overscroll-behavior: none;
+  -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+}
+[hidden] { display: none !important; }
+.wrap {
+  max-width: 480px; margin: 0 auto; min-height: 100vh; min-height: 100dvh; box-sizing: border-box;
+  padding: 28px max(20px, env(safe-area-inset-right, 0px)) 28px max(20px, env(safe-area-inset-left, 0px));
+  display: flex; flex-direction: column; gap: 26px;
+}
+h1 { font-family: var(--f); font-weight: 400; font-size: 2rem; margin: 8px 0 0; letter-spacing: .02em; }
+.row { display: flex; flex-direction: column; gap: 10px; }
+.label { color: var(--muted); font-size: .85rem; letter-spacing: .06em; text-transform: uppercase; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  appearance: none; border: 1px solid var(--line); background: var(--chip); color: var(--text);
+  font: inherit; font-size: 1rem; padding: 9px 14px; border-radius: 999px; min-width: 52px; cursor: pointer;
+}
+.chip[aria-pressed="true"] { border-color: var(--gold); color: var(--gold); }
+.toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; cursor: pointer; }
+.toggle input { appearance: none; width: 50px; height: 30px; border-radius: 99px; background: var(--line); position: relative; margin: 0; flex: none; transition: background .2s; }
+.toggle input::after { content: ""; position: absolute; top: 3px; left: 3px; width: 24px; height: 24px; border-radius: 50%; background: var(--text); transition: transform .2s; }
+.toggle input:checked { background: var(--gold); }
+.toggle input:checked::after { transform: translateX(20px); }
+.hint { color: var(--muted); font-size: .9rem; line-height: 1.45; margin: 0; }
+.summary { font-family: var(--f); font-size: 1.1rem; color: var(--muted); line-height: 1.5; margin: 0; }
+.start {
+  appearance: none; margin-top: auto; border: 1px solid var(--gold); background: transparent; color: var(--gold);
+  font-family: var(--f); font-size: 1.4rem; padding: 16px; border-radius: 16px; cursor: pointer;
+}
+.start:disabled { opacity: .4; }
+/* Sitzung */
+.session { position: fixed; inset: 0; background: #000; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 28px; padding: 24px; text-align: center; }
+.session .time { font-family: var(--f); font-size: 3.2rem; color: #6f675b; font-variant-numeric: tabular-nums; }
+.session .sub { color: #4f493f; font-size: .95rem; }
+.session .btns { position: absolute; bottom: calc(40px + env(safe-area-inset-bottom, 0px)); display: flex; gap: 14px; }
+.ghost { appearance: none; background: transparent; border: 1px solid #2c2925; color: #6f675b; font: inherit; padding: 10px 20px; border-radius: 999px; cursor: pointer; }
+</style>
+</head>
+<body>
+<main class="wrap" id="setup">
+  <h1>Stille</h1>
+
+  <div class="row">
+    <span class="label">Dauer</span>
+    <div class="chips" data-key="dur"></div>
+  </div>
+
+  <div class="row">
+    <span class="label">Gong dazwischen</span>
+    <div class="chips" data-key="every"></div>
+  </div>
+
+  <div class="row">
+    <span class="label">Vorlauf bis zum ersten Gong</span>
+    <div class="chips" data-key="prep"></div>
+  </div>
+
+  <div class="row">
+    <label class="toggle"><span>Hörbuch oder Musik daneben</span><input type="checkbox" id="mix"></label>
+    <p class="hint" id="mixHint"></p>
+  </div>
+
+  <p class="summary" id="summary"></p>
+  <button class="start" id="start" disabled>Beginnen</button>
+</main>
+
+<div class="session" id="session" hidden>
+  <div class="time" id="time"></div>
+  <div class="sub" id="sub"></div>
+  <div class="btns">
+    <button class="ghost" id="pause" hidden>Weiter</button>
+    <button class="ghost" id="stop">Beenden</button>
+  </div>
+</div>
+
+<script>
+// Die ganze Sitzung wird zu EINER MP3-Datei zusammengesetzt: Stille mit Gongs an den richtigen Stellen.
+// So spielt iOS sie wie Musik weiter, auch bei gesperrtem Bildschirm.
+// Alle Bausteine sind MPEG-2 Layer III, 22050 Hz, mono, ohne Bit-Reservoir, also frei aneinanderreihbar.
+const OPTIONS = {
+  dur:   { values: [10, 20, 30, 45, 60, 90, 120], label: v => v + " min", def: 60 },
+  every: { values: [0, 5, 10, 15, 20, 30], label: v => v ? v + " min" : "aus", def: 20 },
+  prep:  { values: [0, 10, 30, 60], label: v => v ? (v < 60 ? v + " s" : "1 min") : "keiner", def: 10 },
+};
+const STORE = "stille-v1";
+const FRAME_SEC = 576 / 22050;
+let settings = { dur: 60, every: 20, prep: 10, mix: false };
+try { Object.assign(settings, JSON.parse(localStorage.getItem(STORE) || "{}")); } catch (e) {}
+
+const $ = id => document.getElementById(id);
+let gong1, gong3; // { bytes, frames }
+let audio = null, url = null, wakeLock = null, tick = null;
+
+// MP3-Frames zählen (nur das Format, das wir selbst erzeugen)
+const KBPS = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+function countFrames(b) {
+  let i = 0, n = 0;
+  while (i + 4 <= b.length && b[i] === 0xFF) { i += Math.floor(72 * KBPS[b[i + 2] >> 4] * 1000 / 22050) + ((b[i + 2] >> 1) & 1); n++; }
+  return n;
+}
+// Stummer Frame: Kopf (8 kbit/s, mono) und lauter Nullen → dekodiert zu Stille
+function frame(kbpsIndex) {
+  const f = new Uint8Array(Math.floor(72 * KBPS[kbpsIndex] * 1000 / 22050));
+  f.set([0xFF, 0xF3, kbpsIndex << 4, 0xC4]);
+  return f;
+}
+const SILENT = frame(1);
+
+function buildTrack() {
+  const lead = Math.round(settings.prep / FRAME_SEC);
+  const len = Math.round(settings.dur * 60 / FRAME_SEC);
+  const events = new Map([[lead, gong1]]);
+  if (settings.every) for (let m = settings.every; m < settings.dur; m += settings.every) events.set(lead + Math.round(m * 60 / FRAME_SEC), gong1);
+  events.set(lead + len, gong3);
+
+  // erst Größe ausrechnen, dann in einem Rutsch füllen
+  const parts = []; let f = 0, frames = 0, bytes = 0;
+  const end = lead + len + gong3.frames;
+  while (f < end) {
+    const g = events.get(f);
+    if (g) { parts.push(g.bytes); f += g.frames; frames += g.frames; bytes += g.bytes.length; continue; }
+    let run = 0; while (f + run < end && !events.has(f + run)) run++;
+    parts.push(run); f += run; frames += run; bytes += run * SILENT.length;
+  }
+  // Xing-Kopf, damit iOS die Länge der Datei kennt
+  const xing = frame(4);
+  const dv = new DataView(xing.buffer);
+  xing.set([0x58, 0x69, 0x6E, 0x67], 13);
+  dv.setUint32(17, 3); dv.setUint32(21, frames); dv.setUint32(25, bytes + xing.length);
+
+  const out = new Uint8Array(xing.length + bytes);
+  out.set(xing); let o = xing.length;
+  for (const p of parts) {
+    if (typeof p === "number") { for (let k = 0; k < p; k++, o += SILENT.length) out.set(SILENT, o); }
+    else { out.set(p, o); o += p.length; }
+  }
+  return new Blob([out], { type: "audio/mpeg" });
+}
+
+async function load(name) {
+  const bytes = new Uint8Array(await (await fetch(name)).arrayBuffer());
+  return { bytes, frames: countFrames(bytes) };
+}
+
+// Einstellungen
+function renderChips() {
+  document.querySelectorAll(".chips").forEach(box => {
+    const key = box.dataset.key, opt = OPTIONS[key];
+    if (!opt.values.includes(settings[key])) settings[key] = opt.def;
+    box.innerHTML = "";
+    for (const v of opt.values) {
+      const b = document.createElement("button");
+      b.className = "chip"; b.textContent = opt.label(v);
+      b.setAttribute("aria-pressed", v === settings[key]);
+      b.onclick = () => { settings[key] = v; save(); renderChips(); };
+      box.append(b);
+    }
+  });
+  $("mix").checked = settings.mix;
+  $("mixHint").textContent = settings.mix
+    ? "Der Gong mischt sich zum anderen Ton. Dafür bleibt der Bildschirm an (schwarz). Handy mit dem Display nach unten legen, Lautlos-Schalter aus. Zuerst das Hörbuch starten, dann hier beginnen."
+    : "Läuft auch bei gesperrtem Bildschirm. Anderer Ton (z. B. Audible) wird dabei angehalten.";
+  const n = settings.every ? Math.ceil(settings.dur / settings.every) - 1 : 0;
+  $("summary").textContent = `Ein Gong zu Beginn, ${n ? (WORDS[n] || n) + " dazwischen" : "keiner dazwischen"}, drei am Ende.`;
+}
+const WORDS = ["", "einer", "zwei", "drei", "vier", "fünf", "sechs", "sieben", "acht", "neun", "zehn", "elf", "zwölf"];
+function save() { try { localStorage.setItem(STORE, JSON.stringify(settings)); } catch (e) {} }
+$("mix").onchange = e => { settings.mix = e.target.checked; save(); renderChips(); };
+
+// Sitzung
+function fmt(s) { s = Math.max(0, Math.ceil(s)); const m = Math.floor(s / 60); return m + ":" + String(s % 60).padStart(2, "0"); }
+function update() {
+  if (!audio) return;
+  const t = audio.currentTime - settings.prep;
+  if (t < 0) { $("time").textContent = fmt(-t); $("sub").textContent = "gleich beginnt es"; }
+  else if (t < settings.dur * 60) { $("time").textContent = fmt(settings.dur * 60 - t); $("sub").textContent = "noch"; }
+  else { $("time").textContent = "0:00"; $("sub").textContent = "Ende"; }
+  $("pause").hidden = !audio.paused || audio.ended;
+}
+
+async function start() {
+  try { if (navigator.audioSession) navigator.audioSession.type = settings.mix ? "ambient" : "playback"; } catch (e) {}
+  url = URL.createObjectURL(buildTrack());
+  audio = new Audio(url);
+  audio.onended = finish;
+  audio.onpause = audio.onplay = update;
+  audio.play().catch(() => update());
+  if ("mediaSession" in navigator) {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: "Meditation · " + settings.dur + " min",
+      artist: settings.every ? "Gong alle " + settings.every + " min" : "Stille",
+      artwork: [{ src: "icon-512.png", sizes: "512x512", type: "image/png" }],
+    });
+  }
+  if (settings.mix && "wakeLock" in navigator) { try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {} }
+  $("setup").hidden = true; $("session").hidden = false;
+  update(); tick = setInterval(update, 1000);
+}
+function finish() { stop(); }
+function stop() {
+  clearInterval(tick);
+  if (audio) { audio.pause(); audio.removeAttribute("src"); audio.load(); audio = null; }
+  if (url) { URL.revokeObjectURL(url); url = null; }
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  $("session").hidden = true; $("setup").hidden = false;
+}
+$("start").onclick = start;
+$("stop").onclick = stop;
+$("pause").onclick = () => audio && audio.play();
+// Wake Lock geht verloren, wenn die App kurz verlassen wird
+document.addEventListener("visibilitychange", async () => {
+  if (wakeLock && wakeLock.released) wakeLock = null;
+  if (document.visibilityState === "visible" && audio && settings.mix && !wakeLock && "wakeLock" in navigator) {
+    try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+  }
+  update();
+});
+
+renderChips();
+Promise.all([load("gong1.mp3"), load("gong3.mp3")]).then(([a, b]) => { gong1 = a; gong3 = b; $("start").disabled = false; });
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js");
+</script>
+</body>
+</html>
