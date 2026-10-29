@@ -1,0 +1,11 @@
+{
+  "aktuell": "einkauf",
+  "listen": [
+    {
+      "id": "einkauf",
+      "titel": "Einkaufsliste",
+      "runde": "2026-10-29",
+      "eintraege": []
+    }
+  ]
+}
