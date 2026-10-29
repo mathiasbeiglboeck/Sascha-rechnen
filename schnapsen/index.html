@@ -81,6 +81,17 @@ h1 { font-size: 28px; margin: 4px 0; letter-spacing: -.02em; }
 .team.B .who, .team.B .tot { color: var(--b); }
 .team.A.sel { border-color: var(--a); background: var(--a-soft); }
 .team.B.sel { border-color: var(--b); background: var(--b-soft); }
+/* 3er: jeder Spieler eine eigene Karte; wer punktet, wird vor jeder Eingabe angetippt */
+.teams.drei { grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.drei .team { padding: 10px 10px 12px; min-height: 120px; }
+.drei .team .tot { font-size: 42px; }
+.drei .team.sel { border-color: var(--text); background: var(--chip); }
+.p.C { background: var(--text); color: var(--paper); }
+
+/* Umschalter 4er / 3er */
+.modus { display: inline-flex; background: var(--chip); border-radius: 10px; padding: 3px; gap: 2px; }
+.modus button { background: none; border-radius: 8px; padding: 6px 12px; font-size: 15px; font-weight: 600; color: var(--muted); }
+.modus button[aria-pressed="true"] { background: var(--sheet); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
 
 /* Punkte-Tasten: links einfach, rechts doppelt */
 .pad { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
@@ -109,6 +120,7 @@ h1 { font-size: 28px; margin: 4px 0; letter-spacing: -.02em; }
 .sheet h3 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; padding: 14px 16px 6px; }
 .row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 9px 16px; border-top: 1px solid var(--line); font-size: 16px; }
 .row:first-of-type { border-top: 0; }
+.row span:first-child { min-width: 0; }
 .row .m { color: var(--muted); font-size: 14px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .stand { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; padding: 4px 8px 12px; }
 .stand div { text-align: center; padding: 6px 0; }
@@ -120,22 +132,22 @@ h1 { font-size: 28px; margin: 4px 0; letter-spacing: -.02em; }
 .toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%);
   background: var(--text); color: var(--paper); padding: 10px 16px; border-radius: 12px; font-size: 15px; opacity: 0; transition: opacity .2s; pointer-events: none; }
 .toast.on { opacity: .95; }
-@media (max-width: 370px) { .k { height: 48px; font-size: 20px; } .team .tot { font-size: 44px; } .p { font-size: 17px; } }
+@media (max-width: 370px) { h1 { font-size: 23px; } .modus button { padding: 6px 9px; } .k { height: 48px; font-size: 20px; } .team .tot { font-size: 44px; } .p { font-size: 17px; } }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <h1>Schnapsen</h1>
+    <div class="modus" role="group" aria-label="Spielart">
+      <button data-m="4">4er</button><button data-m="3">3er</button>
+    </div>
     <button class="link" id="undo">↶ Zurück</button>
   </header>
-  <div class="hint" id="hint">Spieler antippen: einmal Team grün, zweimal Team rot, dreimal raus.</div>
+  <div class="hint" id="hint"></div>
   <div class="players" id="players"></div>
 
-  <div class="teams">
-    <button class="team A" id="tA" data-t="A"><span class="who"></span><span class="tot"></span><span class="rest"></span><span class="log"></span></button>
-    <button class="team B" id="tB" data-t="B"><span class="who"></span><span class="tot"></span><span class="rest"></span><span class="log"></span></button>
-  </div>
+  <div class="teams" id="teams"></div>
 
   <div class="result" id="result" hidden>
     <b id="resTitle"></b>
@@ -178,98 +190,170 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
 };
 
-// Zustand: Teamzuordnung, laufende Partie (Einträge je Team), Bummerl je Spieler, fertige Partien
+// Zustand. Jede Eingabe merkt sich, welche Spieler die Punkte bekommen: beim 4er das ganze Team,
+// beim 3er entweder der Alleinspieler oder seine zwei Gegner. Gezählt wird pro Spieler.
 const leer = () => ({
-  team: {}, sel: "A",
-  partie: { A: [], B: [] },
+  modus: "4",
+  team: {}, sel: "A",      // 4er: Teamzuordnung, gewähltes Team
+  mit: [], wahl: [],       // 3er: wer mitspielt, wer die nächsten Punkte bekommt
+  partie: [],              // [{ ids: [...], w }]
   ende: null,
   bummerl: Object.fromEntries(SPIELER.map(p => [p.id, 0])),
   partien: []
 });
-let st = Object.assign(leer(), store.get(KEY, {}));
+// Ältere Speicherstände: Partie lag als Punkte je Team vor
+function auffrischen(s) {
+  s = Object.assign(leer(), s);
+  if (s.partie && !Array.isArray(s.partie)) {
+    const alt = s.partie, neu = [];
+    ["A", "B"].forEach(t => (alt[t] || []).forEach(w => neu.push({ ids: Object.keys(s.team).filter(i => s.team[i] === t), w })));
+    s.partie = neu;
+  }
+  return s;
+}
+let st = auffrischen(store.get(KEY, {}));
 let undo = store.get(KEY + "-undo", []);
 
 function save() { store.set(KEY, st); store.set(KEY + "-undo", undo.slice(-150)); }
 function merk() { undo.push(JSON.stringify(st)); if (undo.length > 150) undo.shift(); }
 const name = id => { const p = SPIELER.find(x => x.id === id); return p ? p.n + (p.s ? p.s : "") : id; };
+const namen = ids => ids.map(name).join(" · ");
 const mitglieder = t => SPIELER.filter(p => st.team[p.id] === t).map(p => p.id);
-const summe = t => st.partie[t].reduce((a, b) => a + b, 0);
-const teamName = t => mitglieder(t).map(name).join(" · ") || (t === "A" ? "Team grün" : "Team rot");
+const drei = () => st.modus === "3";
+// Punkte einer Gruppe: jede Eingabe zählt einmal, wenn sie einen der Spieler betrifft
+const punkte = ids => st.partie.filter(e => e.ids.some(i => ids.includes(i))).reduce((a, e) => a + e.w, 0);
+const posten = ids => st.partie.filter(e => e.ids.some(i => ids.includes(i))).map(e => e.w);
+
+// Die Karten, auf die man tippt: 4er zwei Teams, 3er drei Spieler
+function karten() {
+  if (drei()) return SPIELER.filter(p => st.mit.includes(p.id)).map(p => ({ key: p.id, ids: [p.id], cls: "C", titel: name(p.id) }));
+  return ["A", "B"].map(t => ({ key: t, ids: mitglieder(t), cls: t, titel: namen(mitglieder(t)) || (t === "A" ? "Team grün" : "Team rot") }));
+}
+const bereit = () => drei() ? st.mit.length === 3 : mitglieder("A").length > 0 && mitglieder("B").length > 0;
 
 function toast(t) {
   const el = document.getElementById("toast");
   el.textContent = t; el.classList.add("on");
-  clearTimeout(toast.h); toast.h = setTimeout(() => el.classList.remove("on"), 1600);
+  clearTimeout(toast.h); toast.h = setTimeout(() => el.classList.remove("on"), 1800);
 }
 
 function tippSpieler(id) {
-  merk();
-  const jetzt = st.team[id];
-  st.team[id] = jetzt === undefined ? "A" : jetzt === "A" ? "B" : undefined;
-  if (st.team[id] === undefined) delete st.team[id];
+  if (drei()) {
+    if (!st.mit.includes(id) && st.mit.length >= 3) { toast("Beim 3er spielen nur drei mit"); return; }
+    merk();
+    st.mit = st.mit.includes(id) ? st.mit.filter(x => x !== id) : st.mit.concat(id);
+    st.wahl = st.wahl.filter(x => st.mit.includes(x));
+  } else {
+    merk();
+    const jetzt = st.team[id];
+    st.team[id] = jetzt === undefined ? "A" : jetzt === "A" ? "B" : undefined;
+    if (st.team[id] === undefined) delete st.team[id];
+  }
+  save(); zeige();
+}
+
+function tippKarte(key) {
+  if (st.ende) return;
+  if (drei()) st.wahl = st.wahl.includes(key) ? st.wahl.filter(x => x !== key) : st.wahl.concat(key);
+  else st.sel = key;
   save(); zeige();
 }
 
 function eintragen(w) {
   if (st.ende) return;
-  if (!mitglieder("A").length || !mitglieder("B").length) { toast("Zuerst beide Teams wählen"); return; }
+  if (!bereit()) { toast(drei() ? "Zuerst drei Spieler wählen" : "Zuerst beide Teams wählen"); return; }
+  let ids;
+  if (drei()) {
+    if (!st.wahl.length) { toast("Wer bekommt die Punkte? Spieler antippen"); return; }
+    if (st.wahl.length === 3) { toast("Höchstens zwei Spieler antippen"); return; }
+    ids = st.wahl.slice();
+  } else ids = mitglieder(st.sel);
   merk();
-  const t = st.sel;
-  st.partie[t].push(w);
-  if (summe(t) >= ZIEL) {
-    const v = t === "A" ? "B" : "A";
-    const schneider = summe(v) === 0;
-    const zahl = schneider ? 2 : 1;
-    const verlierer = mitglieder(v);
-    verlierer.forEach(id => st.bummerl[id] = (st.bummerl[id] || 0) + zahl);
-    st.ende = { sieger: t, schneider };
-    st.partien.unshift({
-      zeit: Date.now(), sieger: mitglieder(t), verlierer, schneider,
-      punkte: [summe(t), summe(v)]
-    });
-  }
+  st.partie.push({ ids, w });
+  st.wahl = [];
+  pruefeEnde();
   save(); zeige();
+}
+
+// Sobald jemand 24 hat, ist die Partie aus: jeder, der darunter liegt, bekommt ein Bummerl, bei 0 Punkten zwei (Schneider)
+function pruefeEnde() {
+  const ks = karten();
+  const sieger = ks.filter(k => punkte(k.ids) >= ZIEL);
+  if (!sieger.length) return;
+  const verlierer = ks.filter(k => punkte(k.ids) < ZIEL);
+  const bu = {};
+  verlierer.forEach(k => k.ids.forEach(id => {
+    bu[id] = punkte(k.ids) === 0 ? 2 : 1;
+    st.bummerl[id] = (st.bummerl[id] || 0) + bu[id];
+  }));
+  st.ende = { sieger: sieger.map(k => k.key), bu };
+  st.partien.unshift({
+    zeit: Date.now(),
+    text: namen(sieger.flatMap(k => k.ids)) + " vor " + verlierer.map(k => namen(k.ids) + (punkte(k.ids) === 0 ? " (Schneider)" : "")).join(", "),
+    stand: ks.map(k => punkte(k.ids)).join(":")
+  });
 }
 
 function neuePartie() {
   merk();
-  st.partie = { A: [], B: [] }; st.ende = null;
+  st.partie = []; st.ende = null; st.wahl = [];
   save(); zeige();
 }
 
 function zeige() {
+  document.querySelectorAll(".modus button").forEach(b => b.setAttribute("aria-pressed", b.dataset.m === st.modus));
+
   // Spieler
   const pl = document.getElementById("players");
   pl.innerHTML = "";
   SPIELER.forEach(p => {
     const b = document.createElement("button");
-    b.className = "p " + (st.team[p.id] || "");
+    const cls = drei() ? (st.mit.includes(p.id) ? "C" : "") : (st.team[p.id] || "");
+    b.className = "p " + cls;
     b.innerHTML = p.n + (p.s ? "<sub>" + p.s + "</sub>" : "") + (st.bummerl[p.id] ? '<span class="bu">' + st.bummerl[p.id] + "</span>" : "");
-    b.setAttribute("aria-label", name(p.id) + (st.team[p.id] ? ", Team " + (st.team[p.id] === "A" ? "grün" : "rot") : ", spielt nicht"));
+    b.setAttribute("aria-label", name(p.id) + (cls ? ", spielt mit" : ", spielt nicht"));
     b.onclick = () => tippSpieler(p.id);
     pl.appendChild(b);
   });
 
-  // Teams
-  ["A", "B"].forEach(t => {
-    const el = document.getElementById("t" + t);
-    const s = summe(t);
-    el.classList.toggle("sel", st.sel === t && !st.ende);
-    el.querySelector(".who").textContent = teamName(t);
-    el.querySelector(".tot").textContent = s;
-    el.querySelector(".rest").textContent = s >= ZIEL ? "gewonnen" : "noch " + (ZIEL - s);
-    el.querySelector(".log").textContent = st.partie[t].join(" + ");
+  // Karten
+  const tw = document.getElementById("teams");
+  tw.className = "teams" + (drei() ? " drei" : "");
+  tw.innerHTML = "";
+  karten().forEach(k => {
+    const s = punkte(k.ids);
+    const b = document.createElement("button");
+    const gewaehlt = !st.ende && (drei() ? st.wahl.includes(k.key) : st.sel === k.key);
+    b.className = "team " + k.cls + (gewaehlt ? " sel" : "");
+    b.innerHTML = '<span class="who"></span><span class="tot"></span><span class="rest"></span><span class="log"></span>';
+    b.querySelector(".who").textContent = k.titel;
+    b.querySelector(".tot").textContent = s;
+    b.querySelector(".rest").textContent = s >= ZIEL ? "gewonnen" : "noch " + (ZIEL - s);
+    b.querySelector(".log").textContent = posten(k.ids).join(" + ");
+    b.onclick = () => tippKarte(k.key);
+    tw.appendChild(b);
   });
+
+  // Hinweis
+  const hint = document.getElementById("hint");
+  hint.textContent = !bereit()
+    ? (drei() ? "Die drei Spieler antippen." : "Spieler antippen: einmal Team grün, zweimal Team rot, dreimal raus.")
+    : drei() && !st.ende ? "Wer schreibt? Den Alleinspieler antippen, oder seine zwei Gegner. Dann die Punkte." : "";
+  hint.hidden = !hint.textContent;
 
   // Ergebnis
   const res = document.getElementById("result");
   res.hidden = !st.ende;
   document.getElementById("pad").classList.toggle("off", !!st.ende);
   if (st.ende) {
-    const v = st.ende.sieger === "A" ? "B" : "A";
-    document.getElementById("resTitle").textContent = (st.ende.schneider ? "Schneider! " : "Bummerl! ") + teamName(st.ende.sieger) + " gewinnt";
-    document.getElementById("resText").textContent = summe(st.ende.sieger) + " : " + summe(v) + ". " +
-      mitglieder(v).map(name).join(" und ") + (st.ende.schneider ? " bekommen je 2 Bummerl." : " bekommen je 1 Bummerl.");
+    const bu = st.ende.bu, ids = Object.keys(bu);
+    const schneider = ids.some(i => bu[i] === 2);
+    const sieger = karten().filter(k => st.ende.sieger.includes(k.key)).flatMap(k => k.ids);
+    document.getElementById("resTitle").textContent = (schneider ? "Schneider! " : "Bummerl! ") + namen(sieger) + (sieger.length > 1 ? " gewinnen" : " gewinnt");
+    const eins = ids.filter(i => bu[i] === 1), zwei = ids.filter(i => bu[i] === 2);
+    const teil = (l, n) => l.map(name).join(" und ") + (l.length > 1 ? " bekommen je " : " bekommt ") + n;
+    document.getElementById("resText").textContent = karten().map(k => punkte(k.ids)).join(" : ") + ". " +
+      [eins.length ? teil(eins, "1 Bummerl") : "", zwei.length ? teil(zwei, "2 Bummerl") : ""].filter(Boolean).join(", ") + ".";
   }
 
   // Bummerl-Stand
@@ -286,14 +370,13 @@ function zeige() {
     d.className = "row";
     const uhr = new Date(x.zeit).toLocaleTimeString("de-AT", { hour: "2-digit", minute: "2-digit" });
     d.innerHTML = "<span></span><span class='m'></span>";
-    d.firstChild.textContent = x.sieger.map(name).join("·") + " vor " + x.verlierer.map(name).join("·") + (x.schneider ? " (Schneider)" : "");
-    d.lastChild.textContent = x.punkte[0] + ":" + x.punkte[1] + "  " + uhr;
+    d.firstChild.textContent = x.text || (namen(x.sieger) + " vor " + namen(x.verlierer) + (x.schneider ? " (Schneider)" : ""));
+    d.lastChild.textContent = (x.stand || x.punkte.join(":")) + "  " + uhr;
     h.appendChild(d);
   });
 
   document.getElementById("undo").disabled = !undo.length;
-  document.getElementById("abort").hidden = !(st.partie.A.length || st.partie.B.length) || !!st.ende;
-  document.getElementById("hint").hidden = mitglieder("A").length > 0 && mitglieder("B").length > 0;
+  document.getElementById("abort").hidden = !st.partie.length || !!st.ende;
 }
 
 // Tasten bauen
@@ -306,21 +389,25 @@ function zeige() {
     g.appendChild(b);
   });
 });
-document.querySelectorAll(".team").forEach(el => el.onclick = () => {
-  if (st.ende) return;
-  st.sel = el.dataset.t; save(); zeige();
+document.querySelectorAll(".modus button").forEach(b => b.onclick = () => {
+  if (st.modus === b.dataset.m) return;
+  if (st.partie.length && !st.ende && !confirm("Laufende Partie abbrechen und wechseln?")) return;
+  merk();
+  st.modus = b.dataset.m;
+  st.partie = []; st.ende = null; st.wahl = [];
+  save(); zeige();
 });
 document.getElementById("undo").onclick = () => {
   if (!undo.length) return;
-  st = Object.assign(leer(), JSON.parse(undo.pop()));
+  st = auffrischen(JSON.parse(undo.pop()));
   save(); zeige(); toast("Rückgängig");
 };
 document.getElementById("next").onclick = neuePartie;
 document.getElementById("abort").onclick = () => { if (confirm("Laufende Partie ohne Bummerl beenden?")) neuePartie(); };
 document.getElementById("reset").onclick = () => {
-  if (!confirm("Alle Bummerl und den Verlauf löschen? Die Teams bleiben.")) return;
+  if (!confirm("Alle Bummerl und den Verlauf löschen? Die Spieler bleiben.")) return;
   merk();
-  const team = st.team; st = leer(); st.team = team;
+  const { modus, team, mit } = st; st = leer(); Object.assign(st, { modus, team, mit });
   save(); zeige();
 };
 
