@@ -5,7 +5,11 @@
       "id": "einkauf",
       "titel": "Einkaufsliste",
       "runde": "2026-10-29",
-      "eintraege": []
+      "eintraege": [
+        { "text": "Milch", "notiz": "für Mio" },
+        { "text": "Milch", "notiz": "für Tilda" },
+        "Nutella"
+      ]
     }
   ]
 }
