@@ -8,7 +8,23 @@
       "eintraege": [
         "Milch für Mio",
         "Milch für Tilda",
-        "Nutella"
+        "Nutella",
+        {
+          "text": "Gummis für Mio",
+          "notiz": "für die Heimfahrt"
+        },
+        {
+          "text": "Mehl",
+          "notiz": "für Stockbrot und Palatschinken"
+        },
+        {
+          "text": "Gurke",
+          "notiz": "für Gin Tonic"
+        },
+        {
+          "text": "Limonen",
+          "notiz": "für Gin Tonic"
+        }
       ]
     }
   ]
