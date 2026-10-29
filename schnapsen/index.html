@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Schnapsen">
+<meta name="theme-color" content="#f3efe4">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" href="icon-192.png">
+<title>Schnapsen</title>
+<style>
+/* Ein Schreibblock: oben die Spieler, darunter die beiden Teams mit Stand, dann die Punkte-Tasten */
+:root {
+  --paper: #f3efe4;
+  --sheet: #fffdf7;
+  --line: #e3dccb;
+  --text: #24261f;
+  --muted: #7c7b70;
+  --a: #2f6b4f;
+  --a-soft: #dcebe2;
+  --b: #a8402f;
+  --b-soft: #f4ddd6;
+  --chip: #e9e3d4;
+  --f: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #151714; --sheet: #1e211d; --line: #30342e; --text: #ebede8; --muted: #8f958c;
+    --a: #6cc39a; --a-soft: #233a2e; --b: #ef8a74; --b-soft: #42271f; --chip: #2a2e28; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #151714; --sheet: #1e211d; --line: #30342e; --text: #ebede8; --muted: #8f958c;
+  --a: #6cc39a; --a-soft: #233a2e; --b: #ef8a74; --b-soft: #42271f; --chip: #2a2e28; color-scheme: dark;
+}
+[hidden] { display: none !important; }
+sub { line-height: 0; }
+* { box-sizing: border-box; }
+html, body { min-height: 100%; }
+body {
+  margin: 0; background: var(--paper); color: var(--text); font-family: var(--f); font-size: 18px;
+  padding: env(safe-area-inset-top, 0px) 0 env(safe-area-inset-bottom, 0px);
+  -webkit-tap-highlight-color: transparent; -webkit-user-select: none; user-select: none;
+  touch-action: manipulation;
+}
+button { appearance: none; border: 0; font: inherit; color: inherit; cursor: pointer; }
+.wrap { max-width: 520px; margin: 0 auto; padding: 14px 16px 40px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+h1 { font-size: 28px; margin: 4px 0; letter-spacing: -.02em; }
+.link { background: none; color: var(--muted); font-size: 15px; padding: 6px 2px; }
+.link:disabled { opacity: .35; }
+.hint { color: var(--muted); font-size: 14px; margin: 2px 0 8px; }
+
+/* Spieler: Antippen wechselt  – → A → B → – */
+.players { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; }
+.p {
+  position: relative; height: 46px; border-radius: 12px; background: var(--chip); font-weight: 700; font-size: 19px;
+  display: flex; align-items: center; justify-content: center;
+}
+.p sub { font-size: 11px; font-weight: 600; margin-left: 1px; }
+.p.A { background: var(--a); color: var(--sheet); }
+.p.B { background: var(--b); color: var(--sheet); }
+.p .bu { position: absolute; top: -6px; right: -4px; min-width: 18px; height: 18px; padding: 0 4px; border-radius: 9px;
+  background: var(--text); color: var(--paper); font-size: 11px; line-height: 18px; font-weight: 700; }
+
+/* Teams */
+.teams { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+.team {
+  background: var(--sheet); border: 2px solid var(--line); border-radius: 16px; padding: 10px 12px 12px; text-align: left;
+  display: flex; flex-direction: column; min-height: 132px;
+}
+.team .who { font-weight: 700; font-size: 17px; min-height: 22px; }
+.team .tot { font-size: 52px; font-weight: 700; line-height: 1.05; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.team .rest { color: var(--muted); font-size: 14px; }
+.team .log { color: var(--muted); font-size: 14px; margin-top: 6px; line-height: 1.35; word-break: break-word; font-variant-numeric: tabular-nums; }
+.team.A .who, .team.A .tot { color: var(--a); }
+.team.B .who, .team.B .tot { color: var(--b); }
+.team.A.sel { border-color: var(--a); background: var(--a-soft); }
+.team.B.sel { border-color: var(--b); background: var(--b-soft); }
+
+/* Punkte-Tasten: links einfach, rechts doppelt */
+.pad { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+.pad h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 6px 2px; }
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.k {
+  height: 54px; border-radius: 12px; background: var(--sheet); border: 1px solid var(--line);
+  font-size: 23px; font-weight: 600; font-variant-numeric: tabular-nums;
+}
+.k:active { transform: scale(.96); }
+.dbl .k { background: var(--chip); }
+.pad.off { opacity: .4; pointer-events: none; }
+
+.bar { display: flex; gap: 10px; margin-top: 14px; }
+.btn { flex: 1; height: 50px; border-radius: 14px; background: var(--chip); font-weight: 600; font-size: 17px; }
+.btn:disabled { opacity: .4; }
+.btn.go { background: var(--text); color: var(--paper); }
+
+/* Ergebnis einer Partie */
+.result { background: var(--sheet); border: 2px solid var(--text); border-radius: 16px; padding: 14px 16px; margin-top: 14px; }
+.result b { font-size: 22px; display: block; margin-bottom: 4px; }
+.result p { margin: 4px 0 12px; color: var(--muted); font-size: 16px; }
+
+/* Verlauf und Bummerl-Stand */
+.sheet { background: var(--sheet); border: 1px solid var(--line); border-radius: 16px; margin-top: 18px; overflow: hidden; }
+.sheet h3 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; padding: 14px 16px 6px; }
+.row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 9px 16px; border-top: 1px solid var(--line); font-size: 16px; }
+.row:first-of-type { border-top: 0; }
+.row .m { color: var(--muted); font-size: 14px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.stand { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; padding: 4px 8px 12px; }
+.stand div { text-align: center; padding: 6px 0; }
+.stand .n { font-weight: 700; font-size: 17px; }
+.stand .c { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.stand .c.z { color: var(--muted); font-weight: 400; }
+.empty { color: var(--muted); font-size: 15px; padding: 4px 16px 14px; }
+.foot { display: flex; justify-content: center; gap: 20px; margin-top: 10px; }
+.toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%);
+  background: var(--text); color: var(--paper); padding: 10px 16px; border-radius: 12px; font-size: 15px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+.toast.on { opacity: .95; }
+@media (max-width: 370px) { .k { height: 48px; font-size: 20px; } .team .tot { font-size: 44px; } .p { font-size: 17px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Schnapsen</h1>
+    <button class="link" id="undo">↶ Zurück</button>
+  </header>
+  <div class="hint" id="hint">Spieler antippen: einmal Team grün, zweimal Team rot, dreimal raus.</div>
+  <div class="players" id="players"></div>
+
+  <div class="teams">
+    <button class="team A" id="tA" data-t="A"><span class="who"></span><span class="tot"></span><span class="rest"></span><span class="log"></span></button>
+    <button class="team B" id="tB" data-t="B"><span class="who"></span><span class="tot"></span><span class="rest"></span><span class="log"></span></button>
+  </div>
+
+  <div class="result" id="result" hidden>
+    <b id="resTitle"></b>
+    <p id="resText"></p>
+    <button class="btn go" id="next" style="width:100%">Neue Partie</button>
+  </div>
+
+  <div class="pad" id="pad">
+    <div><h2>einfach</h2><div class="grid" id="g1"></div></div>
+    <div class="dbl"><h2>doppelt</h2><div class="grid" id="g2"></div></div>
+  </div>
+
+  <div class="sheet">
+    <h3>Bummerl</h3>
+    <div class="stand" id="stand"></div>
+  </div>
+
+  <div class="sheet">
+    <h3>Partien</h3>
+    <div id="hist"></div>
+  </div>
+
+  <div class="foot">
+    <button class="link" id="abort">Partie abbrechen</button>
+    <button class="link" id="reset">Alles löschen</button>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const ZIEL = 24;
+const WERTE = [1, 2, 3, 5, 6, 8, 9, 10, 12];
+const SPIELER = [
+  { id: "S", n: "S" }, { id: "M1", n: "M", s: "1" }, { id: "M2", n: "M", s: "2" }, { id: "L", n: "L" },
+  { id: "T", n: "T" }, { id: "P", n: "P" }, { id: "E", n: "E" }, { id: "H", n: "H" }
+];
+const KEY = "schnapsen-v1";
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+};
+
+// Zustand: Teamzuordnung, laufende Partie (Einträge je Team), Bummerl je Spieler, fertige Partien
+const leer = () => ({
+  team: {}, sel: "A",
+  partie: { A: [], B: [] },
+  ende: null,
+  bummerl: Object.fromEntries(SPIELER.map(p => [p.id, 0])),
+  partien: []
+});
+let st = Object.assign(leer(), store.get(KEY, {}));
+let undo = store.get(KEY + "-undo", []);
+
+function save() { store.set(KEY, st); store.set(KEY + "-undo", undo.slice(-150)); }
+function merk() { undo.push(JSON.stringify(st)); if (undo.length > 150) undo.shift(); }
+const name = id => { const p = SPIELER.find(x => x.id === id); return p ? p.n + (p.s ? p.s : "") : id; };
+const mitglieder = t => SPIELER.filter(p => st.team[p.id] === t).map(p => p.id);
+const summe = t => st.partie[t].reduce((a, b) => a + b, 0);
+const teamName = t => mitglieder(t).map(name).join(" · ") || (t === "A" ? "Team grün" : "Team rot");
+
+function toast(t) {
+  const el = document.getElementById("toast");
+  el.textContent = t; el.classList.add("on");
+  clearTimeout(toast.h); toast.h = setTimeout(() => el.classList.remove("on"), 1600);
+}
+
+function tippSpieler(id) {
+  merk();
+  const jetzt = st.team[id];
+  st.team[id] = jetzt === undefined ? "A" : jetzt === "A" ? "B" : undefined;
+  if (st.team[id] === undefined) delete st.team[id];
+  save(); zeige();
+}
+
+function eintragen(w) {
+  if (st.ende) return;
+  if (!mitglieder("A").length || !mitglieder("B").length) { toast("Zuerst beide Teams wählen"); return; }
+  merk();
+  const t = st.sel;
+  st.partie[t].push(w);
+  if (summe(t) >= ZIEL) {
+    const v = t === "A" ? "B" : "A";
+    const schneider = summe(v) === 0;
+    const zahl = schneider ? 2 : 1;
+    const verlierer = mitglieder(v);
+    verlierer.forEach(id => st.bummerl[id] = (st.bummerl[id] || 0) + zahl);
+    st.ende = { sieger: t, schneider };
+    st.partien.unshift({
+      zeit: Date.now(), sieger: mitglieder(t), verlierer, schneider,
+      punkte: [summe(t), summe(v)]
+    });
+  }
+  save(); zeige();
+}
+
+function neuePartie() {
+  merk();
+  st.partie = { A: [], B: [] }; st.ende = null;
+  save(); zeige();
+}
+
+function zeige() {
+  // Spieler
+  const pl = document.getElementById("players");
+  pl.innerHTML = "";
+  SPIELER.forEach(p => {
+    const b = document.createElement("button");
+    b.className = "p " + (st.team[p.id] || "");
+    b.innerHTML = p.n + (p.s ? "<sub>" + p.s + "</sub>" : "") + (st.bummerl[p.id] ? '<span class="bu">' + st.bummerl[p.id] + "</span>" : "");
+    b.setAttribute("aria-label", name(p.id) + (st.team[p.id] ? ", Team " + (st.team[p.id] === "A" ? "grün" : "rot") : ", spielt nicht"));
+    b.onclick = () => tippSpieler(p.id);
+    pl.appendChild(b);
+  });
+
+  // Teams
+  ["A", "B"].forEach(t => {
+    const el = document.getElementById("t" + t);
+    const s = summe(t);
+    el.classList.toggle("sel", st.sel === t && !st.ende);
+    el.querySelector(".who").textContent = teamName(t);
+    el.querySelector(".tot").textContent = s;
+    el.querySelector(".rest").textContent = s >= ZIEL ? "gewonnen" : "noch " + (ZIEL - s);
+    el.querySelector(".log").textContent = st.partie[t].join(" + ");
+  });
+
+  // Ergebnis
+  const res = document.getElementById("result");
+  res.hidden = !st.ende;
+  document.getElementById("pad").classList.toggle("off", !!st.ende);
+  if (st.ende) {
+    const v = st.ende.sieger === "A" ? "B" : "A";
+    document.getElementById("resTitle").textContent = (st.ende.schneider ? "Schneider! " : "Bummerl! ") + teamName(st.ende.sieger) + " gewinnt";
+    document.getElementById("resText").textContent = summe(st.ende.sieger) + " : " + summe(v) + ". " +
+      mitglieder(v).map(name).join(" und ") + (st.ende.schneider ? " bekommen je 2 Bummerl." : " bekommen je 1 Bummerl.");
+  }
+
+  // Bummerl-Stand
+  document.getElementById("stand").innerHTML = SPIELER.map(p => {
+    const c = st.bummerl[p.id] || 0;
+    return '<div><div class="n">' + p.n + (p.s ? "<sub>" + p.s + "</sub>" : "") + '</div><div class="c' + (c ? "" : " z") + '">' + c + "</div></div>";
+  }).join("");
+
+  // Verlauf
+  const h = document.getElementById("hist");
+  h.innerHTML = st.partien.length ? "" : '<div class="empty">Noch keine Partie fertig.</div>';
+  st.partien.slice(0, 40).forEach(x => {
+    const d = document.createElement("div");
+    d.className = "row";
+    const uhr = new Date(x.zeit).toLocaleTimeString("de-AT", { hour: "2-digit", minute: "2-digit" });
+    d.innerHTML = "<span></span><span class='m'></span>";
+    d.firstChild.textContent = x.sieger.map(name).join("·") + " vor " + x.verlierer.map(name).join("·") + (x.schneider ? " (Schneider)" : "");
+    d.lastChild.textContent = x.punkte[0] + ":" + x.punkte[1] + "  " + uhr;
+    h.appendChild(d);
+  });
+
+  document.getElementById("undo").disabled = !undo.length;
+  document.getElementById("abort").hidden = !(st.partie.A.length || st.partie.B.length) || !!st.ende;
+  document.getElementById("hint").hidden = mitglieder("A").length > 0 && mitglieder("B").length > 0;
+}
+
+// Tasten bauen
+[["g1", 1], ["g2", 2]].forEach(([id, f]) => {
+  const g = document.getElementById(id);
+  WERTE.forEach(w => {
+    const b = document.createElement("button");
+    b.className = "k"; b.textContent = w * f;
+    b.onclick = () => eintragen(w * f);
+    g.appendChild(b);
+  });
+});
+document.querySelectorAll(".team").forEach(el => el.onclick = () => {
+  if (st.ende) return;
+  st.sel = el.dataset.t; save(); zeige();
+});
+document.getElementById("undo").onclick = () => {
+  if (!undo.length) return;
+  st = Object.assign(leer(), JSON.parse(undo.pop()));
+  save(); zeige(); toast("Rückgängig");
+};
+document.getElementById("next").onclick = neuePartie;
+document.getElementById("abort").onclick = () => { if (confirm("Laufende Partie ohne Bummerl beenden?")) neuePartie(); };
+document.getElementById("reset").onclick = () => {
+  if (!confirm("Alle Bummerl und den Verlauf löschen? Die Teams bleiben.")) return;
+  merk();
+  const team = st.team; st = leer(); st.team = team;
+  save(); zeige();
+};
+
+zeige();
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+</script>
+</body>
+</html>
