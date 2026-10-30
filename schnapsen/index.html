@@ -129,7 +129,7 @@ h1 { font-size: 28px; margin: 4px 0; letter-spacing: -.02em; }
 .wer .w.A { color: var(--a); } .wer .w.B { color: var(--b); }
 .wer .w.A[aria-pressed="true"] { background: var(--a); color: var(--sheet); }
 .wer .w.B[aria-pressed="true"] { background: var(--b); color: var(--sheet); }
-.zahlen { display: grid; grid-template-columns: repeat(9, 1fr); gap: 4px; }
+.zahlen { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
 .zahlen .w { padding: 0; font-variant-numeric: tabular-nums; }
 .spritz .w { flex: 1; font-size: 15px; white-space: nowrap; }
 .summe { text-align: center; font-size: 17px; margin: 14px 0 10px; min-height: 22px; font-variant-numeric: tabular-nums; }
@@ -182,8 +182,10 @@ h1 { font-size: 28px; margin: 4px 0; letter-spacing: -.02em; }
       <div class="reihe wer" id="wer"></div>
       <h2>Was?</h2>
       <div class="reihe" id="was"></div>
-      <h2>Punkte</h2>
-      <div class="zahlen" id="zahlen"></div>
+      <div id="punkteNormal">
+        <h2>Punkte</h2>
+        <div class="zahlen" id="zahlen"></div>
+      </div>
       <h2>Gespritzt?</h2>
       <div class="reihe spritz" id="spritz"></div>
       <div class="summe" id="summe"></div>
@@ -224,8 +226,8 @@ h1 { font-size: 28px; margin: 4px 0; letter-spacing: -.02em; }
 
 <script>
 const ZIEL = 24;
-const WERTE = [1, 2, 3, 5, 6, 8, 9, 10, 12];
-// Spiele mit ihrem üblichen Wert; der Wert lässt sich vor dem Eintragen noch ändern
+const NORMAL = [1, 2, 3];   // nur beim normalen Spiel wählbar, sonst folgt der Wert aus dem Spiel
+// Spiele mit ihrem Wert
 const SPIELE = [
   { id: "normal", n: "Normal", w: 1 },
   { id: "bettler", n: "Bettler", w: 5 },
@@ -433,8 +435,9 @@ function zeige() {
   spielend().forEach(id => wer.appendChild(knopf(marke(id), n.wer === id, () => waehle("wer", id), drei() ? "" : st.team[id])));
   const was = document.getElementById("was"); was.innerHTML = "";
   SPIELE.forEach(s => was.appendChild(knopf(s.n, n.typ === s.id, () => waehle("typ", s.id))));
+  document.getElementById("punkteNormal").hidden = n.typ !== "normal";
   const za = document.getElementById("zahlen"); za.innerHTML = "";
-  WERTE.forEach(w => za.appendChild(knopf(w, n.wert === w, () => waehle("wert", w))));
+  NORMAL.forEach(w => za.appendChild(knopf(w, n.wert === w, () => waehle("wert", w))));
   const sp = document.getElementById("spritz"); sp.innerHTML = "";
   SPRITZ.forEach(s => sp.appendChild(knopf(s.n + " ×" + s.f, n.f === s.f, () => waehle("f", s.f))));
   document.getElementById("summe").innerHTML = n.wer
