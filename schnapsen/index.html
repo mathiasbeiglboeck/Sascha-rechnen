@@ -13,7 +13,7 @@
 <link rel="icon" href="icon-192.png">
 <title>Schnapsen</title>
 <style>
-/* Ein Schreibblock: oben die Spieler, darunter die beiden Teams mit Stand, dann die Punkte-Tasten */
+/* Ein Schreibblock: oben die Spieler, darunter die beiden Teams mit Stand, dann die Eingabe eines Spiels */
 :root {
   --paper: #f3efe4;
   --sheet: #fffdf7;
@@ -93,23 +93,6 @@ h1 { font-size: 28px; margin: 4px 0; letter-spacing: -.02em; }
 .modus button { background: none; border-radius: 8px; padding: 6px 12px; font-size: 15px; font-weight: 600; color: var(--muted); }
 .modus button[aria-pressed="true"] { background: var(--sheet); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
 
-/* Punkte-Tasten: links einfach, rechts doppelt */
-.pad { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
-.pad h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 6px 2px; }
-.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
-.k {
-  height: 54px; border-radius: 12px; background: var(--sheet); border: 1px solid var(--line);
-  font-size: 23px; font-weight: 600; font-variant-numeric: tabular-nums;
-}
-.k:active { transform: scale(.96); }
-.dbl .k { background: var(--chip); }
-.pad.off { opacity: .4; pointer-events: none; }
-
-.bar { display: flex; gap: 10px; margin-top: 14px; }
-.btn { flex: 1; height: 50px; border-radius: 14px; background: var(--chip); font-weight: 600; font-size: 17px; }
-.btn:disabled { opacity: .4; }
-.btn.go { background: var(--text); color: var(--paper); }
-
 /* Ergebnis einer Partie */
 .result { background: var(--sheet); border: 2px solid var(--text); border-radius: 16px; padding: 14px 16px; margin-top: 14px; }
 .result b { font-size: 22px; display: block; margin-bottom: 4px; }
@@ -132,7 +115,44 @@ h1 { font-size: 28px; margin: 4px 0; letter-spacing: -.02em; }
 .toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%);
   background: var(--text); color: var(--paper); padding: 10px 16px; border-radius: 12px; font-size: 15px; opacity: 0; transition: opacity .2s; pointer-events: none; }
 .toast.on { opacity: .95; }
-@media (max-width: 370px) { h1 { font-size: 23px; } .modus button { padding: 6px 9px; } .k { height: 48px; font-size: 20px; } .team .tot { font-size: 44px; } .p { font-size: 17px; } }
+/* Eingabe eines Spiels: wer spielt, was, wie viel, gespritzt, dann gewonnen oder verloren */
+.eingabe { background: var(--sheet); border: 1px solid var(--line); border-radius: 16px; margin-top: 14px; padding: 4px 12px 14px; }
+.eingabe h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 12px 2px 6px; }
+.reihe { display: flex; flex-wrap: wrap; gap: 6px; }
+.w {
+  min-height: 44px; padding: 0 14px; border-radius: 12px; background: var(--chip); font-size: 17px; font-weight: 600;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.w sub { font-size: 11px; margin-left: 1px; }
+.w[aria-pressed="true"] { background: var(--text); color: var(--paper); }
+.wer .w { flex: 1; font-size: 20px; }
+.wer .w.A { color: var(--a); } .wer .w.B { color: var(--b); }
+.wer .w.A[aria-pressed="true"] { background: var(--a); color: var(--sheet); }
+.wer .w.B[aria-pressed="true"] { background: var(--b); color: var(--sheet); }
+.zahlen { display: grid; grid-template-columns: repeat(9, 1fr); gap: 4px; }
+.zahlen .w { padding: 0; font-variant-numeric: tabular-nums; }
+.spritz .w { flex: 1; font-size: 15px; white-space: nowrap; }
+.summe { text-align: center; font-size: 17px; margin: 14px 0 10px; min-height: 22px; font-variant-numeric: tabular-nums; }
+.summe b { font-size: 22px; }
+.ende { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.ende .btn { height: 56px; font-size: 19px; color: var(--sheet); }
+.ende .gew { background: var(--a); } .ende .ver { background: var(--b); }
+.ende .btn:disabled { opacity: .3; }
+.eingabe.off { opacity: .4; pointer-events: none; }
+.team { cursor: default; }
+
+/* Statistik */
+.tabs { display: flex; gap: 6px; margin: 10px 0 4px; }
+.stat table { width: 100%; border-collapse: collapse; font-size: 15px; font-variant-numeric: tabular-nums; }
+.stat th, .stat td { padding: 6px 4px; text-align: right; border-top: 1px solid var(--line); }
+.stat th:first-child, .stat td:first-child { text-align: left; }
+.stat th { font-weight: 600; color: var(--muted); font-size: 13px; border-top: 0; }
+.stat .pad16 { padding: 0 12px 12px; }
+.stat .kopf { display: flex; justify-content: space-between; align-items: baseline; padding: 12px 12px 4px; }
+.stat .kopf b { font-size: 20px; }
+.stat .kopf span { color: var(--muted); font-size: 14px; }
+.stat .gw { color: var(--a); } .stat .vl { color: var(--b); }
+@media (max-width: 370px) { h1 { font-size: 23px; } .modus button { padding: 6px 9px; } .team .tot { font-size: 44px; } .p { font-size: 17px; } .w { padding: 0 10px; font-size: 15px; } }
 </style>
 </head>
 <body>
@@ -144,42 +164,78 @@ h1 { font-size: 28px; margin: 4px 0; letter-spacing: -.02em; }
     </div>
     <button class="link" id="undo">↶ Zurück</button>
   </header>
-  <div class="hint" id="hint"></div>
-  <div class="players" id="players"></div>
 
-  <div class="teams" id="teams"></div>
+  <main id="block">
+    <div class="hint" id="hint"></div>
+    <div class="players" id="players"></div>
 
-  <div class="result" id="result" hidden>
-    <b id="resTitle"></b>
-    <p id="resText"></p>
-    <button class="btn go" id="next" style="width:100%">Neue Partie</button>
-  </div>
+    <div class="teams" id="teams"></div>
 
-  <div class="pad" id="pad">
-    <div><h2>einfach</h2><div class="grid" id="g1"></div></div>
-    <div class="dbl"><h2>doppelt</h2><div class="grid" id="g2"></div></div>
-  </div>
+    <div class="result" id="result" hidden>
+      <b id="resTitle"></b>
+      <p id="resText"></p>
+      <button class="btn go" id="next" style="width:100%">Neue Partie</button>
+    </div>
 
-  <div class="sheet">
-    <h3>Bummerl</h3>
-    <div class="stand" id="stand"></div>
-  </div>
+    <div class="eingabe" id="eingabe">
+      <h2>Wer spielt?</h2>
+      <div class="reihe wer" id="wer"></div>
+      <h2>Was?</h2>
+      <div class="reihe" id="was"></div>
+      <h2>Punkte</h2>
+      <div class="zahlen" id="zahlen"></div>
+      <h2>Gespritzt?</h2>
+      <div class="reihe spritz" id="spritz"></div>
+      <div class="summe" id="summe"></div>
+      <div class="ende">
+        <button class="btn gew" id="gew">Gewonnen</button>
+        <button class="btn ver" id="ver">Verloren</button>
+      </div>
+    </div>
 
-  <div class="sheet">
-    <h3>Partien</h3>
-    <div id="hist"></div>
-  </div>
+    <div class="sheet">
+      <h3>Bummerl</h3>
+      <div class="stand" id="stand"></div>
+    </div>
 
-  <div class="foot">
-    <button class="link" id="abort">Partie abbrechen</button>
-    <button class="link" id="reset">Alles löschen</button>
-  </div>
+    <div class="sheet">
+      <h3>Partien</h3>
+      <div id="hist"></div>
+    </div>
+
+    <div class="foot">
+      <button class="link" id="zurStat">Statistik</button>
+      <button class="link" id="abort">Partie abbrechen</button>
+      <button class="link" id="reset">Bummerl löschen</button>
+    </div>
+  </main>
+
+  <section id="statistik" class="stat" hidden>
+    <h2 style="margin:14px 0 0;font-size:22px">Statistik</h2>
+    <div class="tabs" id="statTabs"></div>
+    <div id="statInhalt"></div>
+    <div class="foot">
+      <button class="link" id="zumBlock">← Zurück zum Block</button>
+      <button class="link" id="statLoeschen">Statistik löschen</button>
+    </div>
+  </section>
 </div>
 <div class="toast" id="toast"></div>
 
 <script>
 const ZIEL = 24;
 const WERTE = [1, 2, 3, 5, 6, 8, 9, 10, 12];
+// Spiele mit ihrem üblichen Wert; der Wert lässt sich vor dem Eintragen noch ändern
+const SPIELE = [
+  { id: "normal", n: "Normal", w: 1 },
+  { id: "bettler", n: "Bettler", w: 5 },
+  { id: "schnapser", n: "Schnapser", w: 6 },
+  { id: "sauplauderer", n: "Sauplauderer", w: 8 },
+  { id: "gangerl", n: "Gangerl", w: 9 },
+  { id: "zehnerloch", n: "Zehnerloch", w: 10 },
+  { id: "bauer", n: "Bauer", w: 12 }
+];
+const SPRITZ = [{ f: 2, n: "gespritzt" }, { f: 4, n: "gegengespritzt" }];
 const SPIELER = [
   { id: "S", n: "S" }, { id: "M1", n: "M", s: "1" }, { id: "M2", n: "M", s: "2" }, { id: "L", n: "L" },
   { id: "T", n: "T" }, { id: "P", n: "P" }, { id: "E", n: "E" }, { id: "H", n: "H" }
@@ -190,16 +246,19 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
 };
 
-// Zustand. Jede Eingabe merkt sich, welche Spieler die Punkte bekommen: beim 4er das ganze Team,
-// beim 3er entweder der Alleinspieler oder seine zwei Gegner. Gezählt wird pro Spieler.
+// Zustand. Jede Eingabe in der Partie merkt sich, welche Spieler die Punkte bekommen: beim 4er das Team,
+// beim 3er der Alleinspieler oder seine zwei Gegner. Gezählt wird pro Spieler.
+// Alle gespielten Spiele landen zusätzlich in "spiele" für die Statistik.
 const leer = () => ({
   modus: "4",
-  team: {}, sel: "A",      // 4er: Teamzuordnung, gewähltes Team
-  mit: [], wahl: [],       // 3er: wer mitspielt, wer die nächsten Punkte bekommt
+  team: {},                // 4er: Teamzuordnung
+  mit: [],                 // 3er: wer mitspielt
+  neu: { wer: null, typ: "normal", wert: 1, f: 1 },  // das Spiel, das gerade eingegeben wird
   partie: [],              // [{ ids: [...], w }]
   ende: null,
   bummerl: Object.fromEntries(SPIELER.map(p => [p.id, 0])),
-  partien: []
+  partien: [],             // neueste zuerst
+  spiele: []               // [{ zeit, modus, spieler, wer, typ, wert, f, gewonnen }]
 });
 // Ältere Speicherstände: Partie lag als Punkte je Team vor
 function auffrischen(s) {
@@ -212,21 +271,37 @@ function auffrischen(s) {
   return s;
 }
 let st = auffrischen(store.get(KEY, {}));
-let undo = store.get(KEY + "-undo", []);
+// Rückgängig merkt sich den Zustand ohne die langen Listen, nur deren Länge
+let undo = store.get(KEY + "-undo", []).filter(u => u.includes('"_n"'));
+let statModus = st.modus;
 
-function save() { store.set(KEY, st); store.set(KEY + "-undo", undo.slice(-150)); }
-function merk() { undo.push(JSON.stringify(st)); if (undo.length > 150) undo.shift(); }
+function save() { store.set(KEY, st); store.set(KEY + "-undo", undo.slice(-100)); }
+function merk() {
+  const { spiele, partien, ...rest } = st;
+  undo.push(JSON.stringify(Object.assign(rest, { _n: spiele.length, _p: partien.length })));
+  if (undo.length > 100) undo.shift();
+}
+function zurueck() {
+  const s = JSON.parse(undo.pop());
+  const spiele = st.spiele.slice(0, s._n), partien = st.partien.slice(Math.max(0, st.partien.length - s._p));
+  delete s._n; delete s._p;
+  st = auffrischen(Object.assign(s, { spiele, partien }));
+}
 const name = id => { const p = SPIELER.find(x => x.id === id); return p ? p.n + (p.s ? p.s : "") : id; };
+const marke = id => { const p = SPIELER.find(x => x.id === id); return p.n + (p.s ? "<sub>" + p.s + "</sub>" : ""); };
 const namen = ids => ids.map(name).join(" · ");
 const mitglieder = t => SPIELER.filter(p => st.team[p.id] === t).map(p => p.id);
 const drei = () => st.modus === "3";
+const spielend = () => drei() ? SPIELER.filter(p => st.mit.includes(p.id)).map(p => p.id) : mitglieder("A").concat(mitglieder("B"));
+const spielName = id => (SPIELE.find(s => s.id === id) || { n: id }).n;
 // Punkte einer Gruppe: jede Eingabe zählt einmal, wenn sie einen der Spieler betrifft
 const punkte = ids => st.partie.filter(e => e.ids.some(i => ids.includes(i))).reduce((a, e) => a + e.w, 0);
 const posten = ids => st.partie.filter(e => e.ids.some(i => ids.includes(i))).map(e => e.w);
+const laeuft = () => st.partie.length > 0 && !st.ende;
 
-// Die Karten, auf die man tippt: 4er zwei Teams, 3er drei Spieler
+// Die Anzeige-Karten: 4er zwei Teams, 3er drei Spieler
 function karten() {
-  if (drei()) return SPIELER.filter(p => st.mit.includes(p.id)).map(p => ({ key: p.id, ids: [p.id], cls: "C", titel: name(p.id) }));
+  if (drei()) return st.mit.length ? spielend().map(id => ({ key: id, ids: [id], cls: "C", titel: name(id) })) : [];
   return ["A", "B"].map(t => ({ key: t, ids: mitglieder(t), cls: t, titel: namen(mitglieder(t)) || (t === "A" ? "Team grün" : "Team rot") }));
 }
 const bereit = () => drei() ? st.mit.length === 3 : mitglieder("A").length > 0 && mitglieder("B").length > 0;
@@ -238,41 +313,44 @@ function toast(t) {
 }
 
 function tippSpieler(id) {
+  if (laeuft()) { toast("Während der Partie fix. Zum Ändern die Partie abbrechen."); return; }
   if (drei()) {
     if (!st.mit.includes(id) && st.mit.length >= 3) { toast("Beim 3er spielen nur drei mit"); return; }
     merk();
     st.mit = st.mit.includes(id) ? st.mit.filter(x => x !== id) : st.mit.concat(id);
-    st.wahl = st.wahl.filter(x => st.mit.includes(x));
   } else {
     merk();
     const jetzt = st.team[id];
     st.team[id] = jetzt === undefined ? "A" : jetzt === "A" ? "B" : undefined;
     if (st.team[id] === undefined) delete st.team[id];
   }
+  if (!spielend().includes(st.neu.wer)) st.neu.wer = null;
   save(); zeige();
 }
 
-function tippKarte(key) {
-  if (st.ende) return;
-  if (drei()) st.wahl = st.wahl.includes(key) ? st.wahl.filter(x => x !== key) : st.wahl.concat(key);
-  else st.sel = key;
+function waehle(feld, wert) {
+  const n = st.neu;
+  if (feld === "typ") { n.typ = wert; n.wert = SPIELE.find(s => s.id === wert).w; }
+  else if (feld === "f") n.f = n.f === wert ? 1 : wert;
+  else n[feld] = n[feld] === wert && feld === "wer" ? null : wert;
   save(); zeige();
 }
 
-function eintragen(w) {
-  if (st.ende) return;
-  if (!bereit()) { toast(drei() ? "Zuerst drei Spieler wählen" : "Zuerst beide Teams wählen"); return; }
-  let ids;
-  if (drei()) {
-    if (!st.wahl.length) { toast("Wer bekommt die Punkte? Spieler antippen"); return; }
-    if (st.wahl.length === 3) { toast("Höchstens zwei Spieler antippen"); return; }
-    ids = st.wahl.slice();
-  } else ids = mitglieder(st.sel);
+// Spiel abschließen: Punkte an die Gewinner, Spiel in die Statistik
+function abschliessen(gewonnen) {
+  const n = st.neu;
+  if (st.ende || !bereit() || !n.wer) return;
   merk();
+  const w = n.wert * n.f;
+  let ids;
+  if (drei()) ids = gewonnen ? [n.wer] : spielend().filter(i => i !== n.wer);
+  else { const t = st.team[n.wer]; ids = mitglieder(gewonnen ? t : t === "A" ? "B" : "A"); }
   st.partie.push({ ids, w });
-  st.wahl = [];
+  st.spiele.push({ zeit: Date.now(), modus: st.modus, spieler: spielend(), wer: n.wer, typ: n.typ, wert: n.wert, f: n.f, gewonnen });
+  st.neu = { wer: null, typ: "normal", wert: 1, f: 1 };
   pruefeEnde();
   save(); zeige();
+  toast(namen(ids) + " +" + w);
 }
 
 // Sobald jemand 24 hat, ist die Partie aus: jeder, der darunter liegt, bekommt ein Bummerl, bei 0 Punkten zwei (Schneider)
@@ -296,8 +374,17 @@ function pruefeEnde() {
 
 function neuePartie() {
   merk();
-  st.partie = []; st.ende = null; st.wahl = [];
+  st.partie = []; st.ende = null; st.neu = { wer: null, typ: "normal", wert: 1, f: 1 };
   save(); zeige();
+}
+
+function knopf(html, an, klick, cls) {
+  const b = document.createElement("button");
+  b.className = "w" + (cls ? " " + cls : "");
+  b.innerHTML = html;
+  b.setAttribute("aria-pressed", an ? "true" : "false");
+  b.onclick = klick;
+  return b;
 }
 
 function zeige() {
@@ -310,48 +397,61 @@ function zeige() {
     const b = document.createElement("button");
     const cls = drei() ? (st.mit.includes(p.id) ? "C" : "") : (st.team[p.id] || "");
     b.className = "p " + cls;
-    b.innerHTML = p.n + (p.s ? "<sub>" + p.s + "</sub>" : "") + (st.bummerl[p.id] ? '<span class="bu">' + st.bummerl[p.id] + "</span>" : "");
+    b.innerHTML = marke(p.id) + (st.bummerl[p.id] ? '<span class="bu">' + st.bummerl[p.id] + "</span>" : "");
     b.setAttribute("aria-label", name(p.id) + (cls ? ", spielt mit" : ", spielt nicht"));
     b.onclick = () => tippSpieler(p.id);
     pl.appendChild(b);
   });
 
-  // Karten
+  // Karten mit dem Stand
   const tw = document.getElementById("teams");
   tw.className = "teams" + (drei() ? " drei" : "");
   tw.innerHTML = "";
   karten().forEach(k => {
     const s = punkte(k.ids);
-    const b = document.createElement("button");
-    const gewaehlt = !st.ende && (drei() ? st.wahl.includes(k.key) : st.sel === k.key);
-    b.className = "team " + k.cls + (gewaehlt ? " sel" : "");
-    b.innerHTML = '<span class="who"></span><span class="tot"></span><span class="rest"></span><span class="log"></span>';
-    b.querySelector(".who").textContent = k.titel;
-    b.querySelector(".tot").textContent = s;
-    b.querySelector(".rest").textContent = s >= ZIEL ? "gewonnen" : "noch " + (ZIEL - s);
-    b.querySelector(".log").textContent = posten(k.ids).join(" + ");
-    b.onclick = () => tippKarte(k.key);
-    tw.appendChild(b);
+    const d = document.createElement("div");
+    d.className = "team " + k.cls;
+    d.innerHTML = '<span class="who"></span><span class="tot"></span><span class="rest"></span><span class="log"></span>';
+    d.querySelector(".who").textContent = k.titel;
+    d.querySelector(".tot").textContent = s;
+    d.querySelector(".rest").textContent = s >= ZIEL ? "gewonnen" : "noch " + (ZIEL - s);
+    d.querySelector(".log").textContent = posten(k.ids).join(" + ");
+    tw.appendChild(d);
   });
 
   // Hinweis
   const hint = document.getElementById("hint");
-  hint.textContent = !bereit()
-    ? (drei() ? "Die drei Spieler antippen." : "Spieler antippen: einmal Team grün, zweimal Team rot, dreimal raus.")
-    : drei() && !st.ende ? "Wer schreibt? Den Alleinspieler antippen, oder seine zwei Gegner. Dann die Punkte." : "";
+  hint.textContent = bereit() ? "" : drei() ? "Die drei Spieler antippen." : "Spieler antippen: einmal Team grün, zweimal Team rot, dreimal raus.";
   hint.hidden = !hint.textContent;
+
+  // Eingabe
+  const n = st.neu;
+  const ein = document.getElementById("eingabe");
+  ein.hidden = !bereit();
+  ein.classList.toggle("off", !!st.ende);
+  const wer = document.getElementById("wer"); wer.innerHTML = "";
+  spielend().forEach(id => wer.appendChild(knopf(marke(id), n.wer === id, () => waehle("wer", id), drei() ? "" : st.team[id])));
+  const was = document.getElementById("was"); was.innerHTML = "";
+  SPIELE.forEach(s => was.appendChild(knopf(s.n, n.typ === s.id, () => waehle("typ", s.id))));
+  const za = document.getElementById("zahlen"); za.innerHTML = "";
+  WERTE.forEach(w => za.appendChild(knopf(w, n.wert === w, () => waehle("wert", w))));
+  const sp = document.getElementById("spritz"); sp.innerHTML = "";
+  SPRITZ.forEach(s => sp.appendChild(knopf(s.n + " ×" + s.f, n.f === s.f, () => waehle("f", s.f))));
+  document.getElementById("summe").innerHTML = n.wer
+    ? name(n.wer) + " spielt " + spielName(n.typ) + (n.f > 1 ? ", " + SPRITZ.find(s => s.f === n.f).n : "") + ": <b>" + (n.f > 1 ? n.wert + " × " + n.f + " = " : "") + n.wert * n.f + "</b>"
+    : "Zuerst antippen, wer spielt.";
+  document.getElementById("gew").disabled = document.getElementById("ver").disabled = !n.wer;
 
   // Ergebnis
   const res = document.getElementById("result");
   res.hidden = !st.ende;
-  document.getElementById("pad").classList.toggle("off", !!st.ende);
   if (st.ende) {
     const bu = st.ende.bu, ids = Object.keys(bu);
     const schneider = ids.some(i => bu[i] === 2);
     const sieger = karten().filter(k => st.ende.sieger.includes(k.key)).flatMap(k => k.ids);
     document.getElementById("resTitle").textContent = (schneider ? "Schneider! " : "Bummerl! ") + namen(sieger) + (sieger.length > 1 ? " gewinnen" : " gewinnt");
     const eins = ids.filter(i => bu[i] === 1), zwei = ids.filter(i => bu[i] === 2);
-    const teil = (l, n) => l.map(name).join(" und ") + (l.length > 1 ? " bekommen je " : " bekommt ") + n;
+    const teil = (l, z) => l.map(name).join(" und ") + (l.length > 1 ? " bekommen je " : " bekommt ") + z;
     document.getElementById("resText").textContent = karten().map(k => punkte(k.ids)).join(" : ") + ". " +
       [eins.length ? teil(eins, "1 Bummerl") : "", zwei.length ? teil(zwei, "2 Bummerl") : ""].filter(Boolean).join(", ") + ".";
   }
@@ -359,7 +459,7 @@ function zeige() {
   // Bummerl-Stand
   document.getElementById("stand").innerHTML = SPIELER.map(p => {
     const c = st.bummerl[p.id] || 0;
-    return '<div><div class="n">' + p.n + (p.s ? "<sub>" + p.s + "</sub>" : "") + '</div><div class="c' + (c ? "" : " z") + '">' + c + "</div></div>";
+    return '<div><div class="n">' + marke(p.id) + '</div><div class="c' + (c ? "" : " z") + '">' + c + "</div></div>";
   }).join("");
 
   // Verlauf
@@ -376,39 +476,88 @@ function zeige() {
   });
 
   document.getElementById("undo").disabled = !undo.length;
-  document.getElementById("abort").hidden = !st.partie.length || !!st.ende;
+  document.getElementById("abort").hidden = !laeuft();
 }
 
-// Tasten bauen
-[["g1", 1], ["g2", 2]].forEach(([id, f]) => {
-  const g = document.getElementById(id);
-  WERTE.forEach(w => {
-    const b = document.createElement("button");
-    b.className = "k"; b.textContent = w * f;
-    b.onclick = () => eintragen(w * f);
-    g.appendChild(b);
+// Statistik, getrennt für 3er und 4er
+const pz = (a, b) => b ? Math.round(100 * a / b) + " %" : "–";
+function zeigeStatistik() {
+  const tabs = document.getElementById("statTabs"); tabs.innerHTML = "";
+  [["4", "4er"], ["3", "3er"]].forEach(([m, t]) => tabs.appendChild(knopf(t, statModus === m, () => { statModus = m; zeigeStatistik(); })));
+  const sp = st.spiele.filter(s => s.modus === statModus);
+  const out = document.getElementById("statInhalt");
+  if (!sp.length) { out.innerHTML = '<div class="sheet"><div class="empty" style="padding-top:14px">Noch keine Spiele beim ' + statModus + 'er eingetragen.</div></div>'; return; }
+
+  const zeile = cells => "<tr>" + cells.map(c => "<td>" + c + "</td>").join("") + "</tr>";
+  const gespritzt = sp.filter(s => s.f > 1).length;
+  let html = '<div class="sheet"><div class="kopf"><b>' + sp.length + ' Spiele</b><span>davon ' + gespritzt + " gespritzt</span></div><div class='pad16'><table>" +
+    "<tr><th>Spiel</th><th>Anzahl</th><th>Anteil</th><th>gewonnen</th></tr>";
+  SPIELE.forEach(t => {
+    const x = sp.filter(s => s.typ === t.id);
+    if (x.length) html += zeile([t.n, x.length, pz(x.length, sp.length), pz(x.filter(s => s.gewonnen).length, x.length)]);
   });
-});
+  html += "</table></div></div>";
+
+  // pro Spieler: wie oft dabei, wie oft etwas angesagt (alles außer Normal), was und mit welchem Erfolg
+  SPIELER.forEach(p => {
+    const dabei = sp.filter(s => s.spieler.includes(p.id));
+    if (!dabei.length) return;
+    const eigene = sp.filter(s => s.wer === p.id);
+    const angesagt = eigene.filter(s => s.typ !== "normal");
+    html += '<div class="sheet"><div class="kopf"><b>' + marke(p.id) + "</b><span>" + dabei.length + " Spiele dabei, sagt in " +
+      pz(angesagt.length, dabei.length) + " etwas an</span></div>";
+    if (eigene.length) {
+      html += "<div class='pad16'><table><tr><th>spielt</th><th>mal</th><th>gewonnen</th><th>verloren</th></tr>";
+      SPIELE.forEach(t => {
+        const x = eigene.filter(s => s.typ === t.id);
+        if (!x.length) return;
+        const g = x.filter(s => s.gewonnen).length;
+        html += zeile([t.n, x.length, "<span class='gw'>" + g + " · " + pz(g, x.length) + "</span>", "<span class='vl'>" + (x.length - g) + " · " + pz(x.length - g, x.length) + "</span>"]);
+      });
+      html += "</table></div>";
+    }
+    html += "</div>";
+  });
+  out.innerHTML = html;
+}
+function ansicht(stat) {
+  document.getElementById("block").hidden = stat;
+  document.getElementById("statistik").hidden = !stat;
+  if (stat) { statModus = st.modus; zeigeStatistik(); }
+  window.scrollTo(0, 0);
+}
+
 document.querySelectorAll(".modus button").forEach(b => b.onclick = () => {
   if (st.modus === b.dataset.m) return;
-  if (st.partie.length && !st.ende && !confirm("Laufende Partie abbrechen und wechseln?")) return;
+  if (laeuft() && !confirm("Laufende Partie abbrechen und wechseln?")) return;
   merk();
   st.modus = b.dataset.m;
-  st.partie = []; st.ende = null; st.wahl = [];
+  st.partie = []; st.ende = null; st.neu = { wer: null, typ: "normal", wert: 1, f: 1 };
   save(); zeige();
+  if (!document.getElementById("statistik").hidden) { statModus = st.modus; zeigeStatistik(); }
 });
+document.getElementById("gew").onclick = () => abschliessen(true);
+document.getElementById("ver").onclick = () => abschliessen(false);
 document.getElementById("undo").onclick = () => {
   if (!undo.length) return;
-  st = auffrischen(JSON.parse(undo.pop()));
+  zurueck();
   save(); zeige(); toast("Rückgängig");
+  if (!document.getElementById("statistik").hidden) zeigeStatistik();
 };
 document.getElementById("next").onclick = neuePartie;
-document.getElementById("abort").onclick = () => { if (confirm("Laufende Partie ohne Bummerl beenden?")) neuePartie(); };
+document.getElementById("abort").onclick = () => { if (confirm("Laufende Partie ohne Bummerl beenden? Die Spiele bleiben in der Statistik.")) neuePartie(); };
 document.getElementById("reset").onclick = () => {
-  if (!confirm("Alle Bummerl und den Verlauf löschen? Die Spieler bleiben.")) return;
+  if (!confirm("Alle Bummerl auf 0 setzen? Verlauf und Statistik bleiben.")) return;
   merk();
-  const { modus, team, mit } = st; st = leer(); Object.assign(st, { modus, team, mit });
+  st.bummerl = leer().bummerl; st.partie = []; st.ende = null;
   save(); zeige();
+};
+document.getElementById("zurStat").onclick = () => ansicht(true);
+document.getElementById("zumBlock").onclick = () => ansicht(false);
+document.getElementById("statLoeschen").onclick = () => {
+  if (!confirm("Alle gespeicherten Spiele löschen? Das lässt sich nicht rückgängig machen.")) return;
+  st.spiele = []; undo = [];
+  save(); zeige(); zeigeStatistik();
 };
 
 zeige();
