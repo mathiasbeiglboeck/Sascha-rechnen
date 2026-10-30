@@ -111,6 +111,7 @@ h1 { font-size: 28px; margin: 4px 0; letter-spacing: -.02em; }
 .stand .c { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .stand .c.z { color: var(--muted); font-weight: 400; }
 .empty { color: var(--muted); font-size: 15px; padding: 4px 16px 14px; }
+.leise { font-size: 12px; opacity: .25; margin-top: 30px; }
 .foot { display: flex; justify-content: center; gap: 20px; margin-top: 10px; }
 .toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%);
   background: var(--text); color: var(--paper); padding: 10px 16px; border-radius: 12px; font-size: 15px; opacity: 0; transition: opacity .2s; pointer-events: none; }
@@ -195,20 +196,9 @@ h1 { font-size: 28px; margin: 4px 0; letter-spacing: -.02em; }
       </div>
     </div>
 
-    <div class="sheet">
-      <h3>Bummerl</h3>
-      <div class="stand" id="stand"></div>
-    </div>
-
-    <div class="sheet">
-      <h3>Partien</h3>
-      <div id="hist"></div>
-    </div>
-
     <div class="foot">
       <button class="link" id="zurStat">Statistik</button>
       <button class="link" id="abort">Partie abbrechen</button>
-      <button class="link" id="reset">Bummerl löschen</button>
     </div>
   </main>
 
@@ -218,7 +208,22 @@ h1 { font-size: 28px; margin: 4px 0; letter-spacing: -.02em; }
     <div id="statInhalt"></div>
     <div class="foot">
       <button class="link" id="zumBlock">← Zurück zum Block</button>
-      <button class="link" id="statLoeschen">Statistik löschen</button>
+    </div>
+    <!-- Bummerl-Stand und Verlauf bewusst versteckt: nur über den unauffälligen Punkt „Erweiterung“ -->
+    <div class="foot"><button class="link leise" id="zurErw">Erweiterung</button></div>
+    <div id="erweiterung" hidden>
+      <div class="sheet">
+        <h3>Bummerl</h3>
+        <div class="stand" id="stand"></div>
+      </div>
+      <div class="sheet">
+        <h3>Partien</h3>
+        <div id="hist"></div>
+      </div>
+      <div class="foot">
+        <button class="link" id="reset">Bummerl löschen</button>
+        <button class="link" id="statLoeschen">Statistik löschen</button>
+      </div>
     </div>
   </section>
 </div>
@@ -400,7 +405,7 @@ function zeige() {
     const b = document.createElement("button");
     const cls = drei() ? (st.mit.includes(p.id) ? "C" : "") : (st.team[p.id] || "");
     b.className = "p " + cls;
-    b.innerHTML = marke(p.id) + (st.bummerl[p.id] ? '<span class="bu">' + st.bummerl[p.id] + "</span>" : "");
+    b.innerHTML = marke(p.id);
     b.setAttribute("aria-label", name(p.id) + (cls ? ", spielt mit" : ", spielt nicht"));
     b.onclick = () => tippSpieler(p.id);
     pl.appendChild(b);
@@ -527,6 +532,7 @@ function zeigeStatistik() {
 function ansicht(stat) {
   document.getElementById("block").hidden = stat;
   document.getElementById("statistik").hidden = !stat;
+  document.getElementById("erweiterung").hidden = true;
   if (stat) { statModus = st.modus; zeigeStatistik(); }
   window.scrollTo(0, 0);
 }
@@ -558,8 +564,14 @@ document.getElementById("reset").onclick = () => {
 };
 document.getElementById("zurStat").onclick = () => ansicht(true);
 document.getElementById("zumBlock").onclick = () => ansicht(false);
+document.getElementById("zurErw").onclick = () => {
+  const e = document.getElementById("erweiterung");
+  e.hidden = !e.hidden;
+};
+// Löschen nur nach Eintippen des Wortes, damit es nicht aus Versehen passiert
 document.getElementById("statLoeschen").onclick = () => {
-  if (!confirm("Alle gespeicherten Spiele löschen? Das lässt sich nicht rückgängig machen.")) return;
+  const w = prompt("Alle gespeicherten Spiele werden gelöscht. Das lässt sich nicht rückgängig machen.\nZum Bestätigen „löschen“ eintippen:");
+  if ((w || "").trim().toLowerCase() !== "löschen") { if (w !== null) toast("Nicht gelöscht"); return; }
   st.spiele = []; undo = [];
   save(); zeige(); zeigeStatistik();
 };
