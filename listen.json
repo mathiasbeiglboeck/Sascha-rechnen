@@ -1,6 +1,20 @@
 {
-  "aktuell": "einkauf",
+  "aktuell": "todo",
   "listen": [
+    {
+      "id": "todo",
+      "titel": "To-do",
+      "runde": "2026-10-31",
+      "eintraege": [
+        "Markus eine neue Version schicken",
+        "Astrid wegen Markus schreiben",
+        "Um Mones Pension kümmern",
+        {
+          "text": "Einleitung schreiben",
+          "notiz": "bis Mittwoch, 4. November"
+        }
+      ]
+    },
     {
       "id": "einkauf",
       "titel": "Einkaufsliste",
