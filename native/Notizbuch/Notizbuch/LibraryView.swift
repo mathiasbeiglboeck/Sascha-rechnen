@@ -52,6 +52,17 @@ struct LibraryView: View {
                     importError = error.localizedDescription
                 }
             }
+            // PDFs, die aus einer anderen App (Dateien, Mail, AirDrop …) mit „Notizbuch“ geöffnet werden
+            .onOpenURL { url in
+                guard url.pathExtension.lowercased() == "pdf" else { return }
+                do {
+                    let doc = try store.importPDF(from: url)
+                    openDoc = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { openDoc = doc }
+                } catch {
+                    importError = error.localizedDescription
+                }
+            }
             .fullScreenCover(item: $openDoc, onDismiss: { store.reload() }) { doc in
                 EditorView(doc: doc).environmentObject(store)
             }

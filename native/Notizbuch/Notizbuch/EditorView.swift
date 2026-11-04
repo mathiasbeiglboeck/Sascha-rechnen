@@ -120,6 +120,14 @@ struct ToolBar: View {
             modeButton(.lasso, symbol: "lasso")
             Button { tools.canvas?.undo() } label: { Image(systemName: "arrow.uturn.backward") }
             Button { tools.canvas?.redo() } label: { Image(systemName: "arrow.uturn.forward") }
+            divider
+            Menu {
+                Button { share(.pagePDF) } label: { Label("Diese Seite als PDF", systemImage: "doc") }
+                Button { share(.pageImage) } label: { Label("Diese Seite als Bild", systemImage: "photo") }
+                Button { share(.documentPDF) } label: { Label("Alles als PDF", systemImage: "doc.on.doc") }
+            } label: {
+                Image(systemName: "square.and.arrow.up")
+            }
         }
         .font(.body)
         .tint(.primary)
@@ -127,6 +135,12 @@ struct ToolBar: View {
         .padding(.vertical, 8)
         .background(.regularMaterial, in: Capsule())
         .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+    }
+
+    private func share(_ kind: ShareKind) {
+        guard let canvas = tools.canvas else { return }
+        let b = canvas.view.bounds
+        canvas.share(kind, from: CGRect(x: b.midX, y: 60, width: 1, height: 1))
     }
 
     private func modeButton(_ mode: ToolMode, symbol: String) -> some View {

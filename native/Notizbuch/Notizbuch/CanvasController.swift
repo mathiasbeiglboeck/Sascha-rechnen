@@ -12,15 +12,15 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     var onToggleMenus: () -> Void = {}
     var onToggleEraser: () -> Void = {}
 
-    private let doc: NoteDocument
+    let doc: NoteDocument
     private let store: DocumentStore
-    private let canvas = PKCanvasView()
+    let canvas = PKCanvasView()
     private let pagesView = UIView()
-    private var pdf: CGPDFDocument?
+    private(set) var pdf: CGPDFDocument?
     private var pageCount: Int
-    private var layout = PageLayout.notebook(pages: 1)
+    private(set) var layout = PageLayout.notebook(pages: 1)
     /// Bildschirmpunkte pro Seitenpunkt bei Zoom 1 (Seite füllt die Breite)
-    private var k: CGFloat = 0
+    private(set) var k: CGFloat = 0
     private var pendingSave: DispatchWorkItem?
     private var dirty = false
     private var settingDrawing = false
@@ -363,7 +363,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         updateContentSize()
     }
 
-    @objc private func saveNow() {
+    @objc func saveNow() {
         pendingSave?.cancel()
         pendingSave = nil
         guard dirty, k > 0 else { return }
@@ -389,5 +389,87 @@ final class EraserGesture: UIGestureRecognizer {
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
         state = .cancelled
+    }
+}
+
+// MARK: Teilen: Seite oder ganzes Dokument als PDF oder Bild
+
+enum ShareKind {
+    case pagePDF, pageImage, documentPDF
+}
+
+extension CanvasController {
+    /// Seite, deren Mitte gerade am nächsten zur Bildschirmmitte liegt
+    var currentPageIndex: Int {
+        guard k > 0 else { return 0 }
+        let s = k * canvas.zoomScale
+        let y = (canvas.contentOffset.y + canvas.bounds.height / 2) / s
+        return layout.frames.indices.min { abs(layout.frames[$0].midY - y) < abs(layout.frames[$1].midY - y) } ?? 0
+    }
+
+    func share(_ kind: ShareKind, from sourceRect: CGRect) {
+        saveNow()
+        let ink = canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k))
+        let i = currentPageIndex
+        let name: String
+        let data: Data
+        switch kind {
+        case .pagePDF:
+            name = "\(doc.title) – Seite \(i + 1).pdf"
+            data = pdfData(pages: [i], ink: ink)
+        case .documentPDF:
+            name = "\(doc.title).pdf"
+            data = pdfData(pages: Array(layout.frames.indices), ink: ink)
+        case .pageImage:
+            name = "\(doc.title) – Seite \(i + 1).png"
+            let frame = layout.frames[i]
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 2
+            data = UIGraphicsImageRenderer(size: frame.size, format: format).pngData { c in
+                drawPage(i, ink: ink, in: c.cgContext)
+            }
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(name.replacingOccurrences(of: "/", with: "-"))
+        do { try data.write(to: url, options: .atomic) } catch { return }
+        let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        sheet.popoverPresentationController?.sourceView = view
+        sheet.popoverPresentationController?.sourceRect = sourceRect
+        present(sheet, animated: true)
+    }
+
+    /// PDF in echter Größe: Notizbuchseiten als A4, PDF-Seiten in ihrer Originalgröße
+    private func pdfData(pages: [Int], ink: PKDrawing) -> Data {
+        let renderer = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 595.28, height: 841.89))
+        return renderer.pdfData { c in
+            for i in pages {
+                let frame = layout.frames[i]
+                var outWidth: CGFloat = 595.28
+                if let page = pdf?.page(at: i + 1) {
+                    let box = page.getBoxRect(.cropBox)
+                    outWidth = abs(page.rotationAngle) % 180 == 90 ? box.height : box.width
+                }
+                let s = outWidth / frame.width
+                c.beginPage(withBounds: CGRect(x: 0, y: 0, width: outWidth, height: frame.height * s), pageInfo: [:])
+                c.cgContext.scaleBy(x: s, y: s)
+                drawPage(i, ink: ink, in: c.cgContext)
+            }
+        }
+    }
+
+    /// Zeichnet Seite `i` (Hintergrund und Tinte) in Seitenpunkten ab (0, 0)
+    private func drawPage(_ i: Int, ink: PKDrawing, in ctx: CGContext) {
+        let frame = layout.frames[i]
+        let rect = CGRect(origin: .zero, size: frame.size)
+        ctx.setFillColor(UIColor.white.cgColor)
+        ctx.fill(rect)
+        if let page = pdf?.page(at: i + 1) {
+            PageView.drawPDF(page, in: ctx, size: frame.size)
+        } else {
+            PageView.drawGrid(in: ctx, rect: rect, lineWidth: 0.5)
+        }
+        UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
+            ink.image(from: frame, scale: 4).draw(in: rect)
+        }
     }
 }
