@@ -332,7 +332,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         let changes = pending
         pending = RemoteChanges()
         guard let merged = StrokeCodec.apply(changes, to: pageDrawing()) else { return }
+        let wasEmpty = canvas.drawing.strokes.isEmpty
         setDrawing(merged.transformed(using: CGAffineTransform(scaleX: k, y: k)))
+        // Auf einer leeren Leinwand zeigt PencilKit den ersten Strich von außen sonst nicht an
+        if wasEmpty { redrawInkSoon() }
         // Alte Rückgängig-Schritte würden fremde Striche wieder entfernen
         canvas.undoManager?.removeAllActions()
         growIfNeeded()
