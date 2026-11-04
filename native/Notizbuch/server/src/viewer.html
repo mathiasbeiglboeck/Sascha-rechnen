@@ -55,9 +55,10 @@ const W = 768, GAP = 6, A4H = W * 297 / 210, GRID = W / 30;
 const base = location.pathname.replace(/\/$/, "");
 const COLORS = [[0.8,0.17,0.15],[0.12,0.27,0.64],[0.13,0.52,0.29],[0.1,0.1,0.11]];
 // PencilKit zeichnet dünne Striche am iPhone fast unsichtbar: unter etwa 3 Seitenpunkten werden sie blass
-const WIDTHS = [3.2, 4.2, 6.5];
+// Die beiden dünnsten wirken am iPhone (PencilKit, kleiner Maßstab) blass, am iPad und im Browser normal
+const WIDTHS = [1.8, 2.5, 3.2, 4.2, 6.5];
 const ERASER_PX = 8;      // Radius am Bildschirm, wie in der App
-let color = 0, width = 1, follow = true, erasing = false;
+let color = 0, width = 2, follow = true, erasing = false;
 
 let doc = null;           // {title, kind, pageCount}
 let pdf = null;           // pdf.js-Dokument
@@ -79,7 +80,7 @@ COLORS.forEach((c, i) => {
 });
 WIDTHS.forEach((w, i) => {
   const b = document.createElement("span");
-  b.className = "w"; b.innerHTML = `<span style="width:${4 + i * 4}px;height:${4 + i * 4}px"></span>`;
+  b.className = "w"; b.innerHTML = `<span style="width:${3 + i * 3}px;height:${3 + i * 3}px"></span>`;
   b.onclick = () => { width = i; erasing = false; tools(); };
   widthsEl.appendChild(b);
 });
