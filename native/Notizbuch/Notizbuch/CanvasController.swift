@@ -12,6 +12,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     var onToggleMenus: () -> Void = {}
     var onToggleEraser: () -> Void = {}
     var onFlash: (String) -> Void = { _ in }
+    var onGuests: (Int?) -> Void = { _ in }
 
     let doc: NoteDocument
     private let store: DocumentStore
@@ -31,6 +32,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private var inkWidth: CGFloat = 2
     private var erasing = false
     private var lasso = false
+    private var viewOnly = false
     private let eraserGesture = EraserGesture()
     private let eraserCursor = UIView()
     private var eraseStart: PKDrawing?
@@ -121,6 +123,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             MainActor.assumeIsolated { self?.syncCycle() }
         }
         syncCycle()
+        connectLive()
     }
 
     override func viewDidLayoutSubviews() {
@@ -155,6 +158,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         super.viewWillDisappear(animated)
         syncTimer?.invalidate()
         syncTimer = nil
+        socket?.cancel(with: .goingAway, reason: nil)
+        socket = nil
         applyPending()
         saveNow()
         if sync.openController === self { sync.openController = nil }
@@ -186,6 +191,116 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         Task { [weak self] in
             let ok = await sync.syncStrokes(id, snapshot: snapshot)
             if !ok, snapshot != nil { self?.localChanged = true }
+        }
+    }
+
+    /// Kurz nach einem Strich abgleichen, damit Zuschauer ihn gleich sehen
+    private var syncSoonWork: DispatchWorkItem?
+    private func syncSoon() {
+        syncSoonWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.syncCycle() }
+        syncSoonWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    // MARK: Live-Teilen
+
+    private var socket: URLSessionWebSocketTask?
+    private var shared = false
+    private var guests = 0
+    private var lastViewSent = Date.distantPast
+
+    private func connectLive() {
+        guard socket == nil, syncTimer != nil, let req = sync.webSocketRequest(doc.id) else { return }
+        let task = URLSession.shared.webSocketTask(with: req)
+        socket = task
+        task.resume()
+        receive(task)
+        sendView(force: true)
+    }
+
+    private func receive(_ task: URLSessionWebSocketTask) {
+        task.receive { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self, self.socket === task else { return }
+                switch result {
+                case .success(let message):
+                    if case .string(let text) = message { self.handleLive(text) }
+                    self.receive(task)
+                case .failure:
+                    self.socket = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.connectLive() }
+                }
+            }
+        }
+    }
+
+    private func handleLive(_ text: String) {
+        guard let obj = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
+              let type = obj["type"] as? String else { return }
+        switch type {
+        case "changes":
+            syncSoon()
+        case "presence":
+            guests = obj["guests"] as? Int ?? 0
+            onGuests(shared || guests > 0 ? guests : nil)
+        default:
+            break
+        }
+    }
+
+    /// Teilt mit, welcher Bereich gerade zu sehen ist; Gäste mit „Folgen“ scrollen mit
+    private func sendView(force: Bool = false) {
+        guard let socket, k > 0, force || Date().timeIntervalSince(lastViewSent) > 0.3 else { return }
+        lastViewSent = Date()
+        let s = k * canvas.zoomScale
+        let y0 = (canvas.contentOffset.y + canvas.contentInset.top) / s
+        let y1 = (canvas.contentOffset.y + canvas.bounds.height) / s
+        let text = "{\"type\":\"view\",\"y0\":\(Double(y0)),\"y1\":\(Double(y1))}"
+        socket.send(.string(text)) { _ in }
+    }
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        sendView()
+    }
+
+    func startLiveSharing() {
+        guard sync.isConfigured else {
+            onFlash("Erst den Server einrichten (Zahnrad in der Übersicht)")
+            return
+        }
+        onFlash("Link wird erstellt …")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let url = try await self.sync.shareLink(self.doc.id)
+                self.shared = true
+                self.onGuests(self.guests)
+                self.connectLive()
+                self.syncCycle()
+                UIPasteboard.general.url = url
+                self.onFlash("Link kopiert")
+                let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+                sheet.popoverPresentationController?.sourceView = self.view
+                sheet.popoverPresentationController?.sourceRect = CGRect(x: self.view.bounds.midX, y: 60, width: 1, height: 1)
+                self.present(sheet, animated: true)
+            } catch {
+                self.onFlash("Teilen fehlgeschlagen: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func stopLiveSharing() {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.sync.stopSharing(self.doc.id)
+                self.shared = false
+                self.onGuests(nil)
+                self.onFlash("Teilen beendet, der Link gilt nicht mehr")
+            } catch {
+                self.onFlash("Beenden fehlgeschlagen: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -221,7 +336,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     // MARK: Werkzeuge
 
-    func apply(color: UIColor, width: CGFloat, mode: ToolMode) {
+    func apply(color: UIColor, width: CGFloat, mode: ToolMode, viewOnly: Bool = false) {
+        self.viewOnly = viewOnly
         inkColor = color
         inkWidth = width
         erasing = mode == .eraser
@@ -237,8 +353,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         } else {
             canvas.tool = PKInkingTool(.pen, color: inkColor, width: inkWidth * max(k, 0.5))
         }
-        canvas.drawingGestureRecognizer.isEnabled = !erasing
-        eraserGesture.isEnabled = erasing
+        // Nur-Sehen-Modus (am iPhone Standard): nichts zeichnet, ein Finger scrollt
+        canvas.drawingGestureRecognizer.isEnabled = !erasing && !viewOnly
+        eraserGesture.isEnabled = erasing && !viewOnly
+        if !isPad { canvas.panGestureRecognizer.minimumNumberOfTouches = viewOnly ? 1 : 2 }
         if !erasing { eraserCursor.isHidden = true }
     }
 
@@ -430,6 +548,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         guard !settingDrawing else { return }
         dirty = true
         localChanged = true
+        syncSoon()
         growIfNeeded()
         pendingSave?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.saveNow() }
@@ -482,7 +601,9 @@ final class EraserGesture: UIGestureRecognizer {
 // MARK: Teilen: Seite oder ganzes Dokument als PDF oder Bild
 
 enum ShareKind {
-    case pagePDF, pageImage, documentPDF, sendToAI
+    case pagePDF, pageImage, documentPDF
+    /// Seite in den Ausgang für einen Empfänger: "claude" oder "chatgpt"
+    case sendTo(String)
 }
 
 extension CanvasController {
@@ -498,14 +619,14 @@ extension CanvasController {
         saveNow()
         let ink = canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k))
         let i = currentPageIndex
-        if kind == .sendToAI {
-            sendPageToAI(i, ink: ink)
+        if case .sendTo(let recipient) = kind {
+            sendPage(i, ink: ink, to: recipient)
             return
         }
         let name: String
         let data: Data
         switch kind {
-        case .sendToAI:
+        case .sendTo:
             return
         case .pagePDF:
             name = "\(doc.title) – Seite \(i + 1).pdf"
@@ -532,7 +653,7 @@ extension CanvasController {
     }
 
     /// Legt die Seite als PDF und als Bild in den Ausgang des Briefkastens, wo Claude oder Codex sie abholen
-    private func sendPageToAI(_ i: Int, ink: PKDrawing) {
+    private func sendPage(_ i: Int, ink: PKDrawing, to recipient: String) {
         guard sync.isConfigured else {
             onFlash("Erst den Server einrichten (Zahnrad in der Übersicht)")
             return
@@ -548,9 +669,9 @@ extension CanvasController {
         let sync = self.sync
         Task { [weak self] in
             do {
-                try await sync.sendToOutbox(name: base + ".pdf", data: pdf, type: "application/pdf")
-                try await sync.sendToOutbox(name: base + ".png", data: png, type: "image/png")
-                self?.onFlash("Seite \(i + 1) liegt im Ausgang")
+                try await sync.sendToOutbox(to: recipient, name: base + ".pdf", data: pdf, type: "application/pdf")
+                try await sync.sendToOutbox(to: recipient, name: base + ".png", data: png, type: "image/png")
+                self?.onFlash("Seite \(i + 1) liegt bereit für \(recipient == "claude" ? "Claude" : "ChatGPT")")
             } catch {
                 self?.onFlash("Senden fehlgeschlagen: \(error.localizedDescription)")
             }

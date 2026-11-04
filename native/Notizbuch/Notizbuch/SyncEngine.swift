@@ -290,10 +290,43 @@ final class SyncEngine: ObservableObject {
 
     // MARK: Briefkasten
 
-    func sendToOutbox(name: String, data: Data, type: String) async throws {
+    func sendToOutbox(to recipient: String, name: String, data: Data, type: String) async throws {
         let safe = name.replacingOccurrences(of: "/", with: "-")
             .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? "seite"
-        _ = try await request("PUT", "/api/outbox/\(safe)", body: data, contentType: type)
+        _ = try await request("PUT", "/api/outbox/\(recipient)/\(safe)", body: data, contentType: type)
+    }
+
+    // MARK: Live-Teilen
+
+    /// Link für Gäste (bleibt gleich, bis das Teilen beendet wird)
+    func shareLink(_ id: UUID) async throws -> URL {
+        await syncLibrary() // Dokument und PDF müssen am Server sein
+        struct Token: Decodable { var token: String }
+        let data = try await request("POST", "/api/share/\(Self.path(id))")
+        let token = try JSONDecoder().decode(Token.self, from: data).token
+        guard let url = URL(string: baseURL + "/s/" + token) else { throw SyncError.notConfigured }
+        return url
+    }
+
+    func stopSharing(_ id: UUID) async throws {
+        _ = try await request("DELETE", "/api/share/\(Self.path(id))")
+    }
+
+    /// WebSocket zum Server: meldet sofort fremde Striche und die Zahl der Gäste
+    func webSocketRequest(_ id: UUID) -> URLRequest? {
+        guard isConfigured else { return nil }
+        let wsBase = baseURL.replacingOccurrences(of: "https://", with: "wss://")
+            .replacingOccurrences(of: "http://", with: "ws://")
+        guard let url = URL(string: wsBase + "/api/doc/\(Self.path(id))/ws") else { return nil }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer " + key.trimmingCharacters(in: .whitespaces), forHTTPHeaderField: "Authorization")
+        return req
+    }
+
+    private var baseURL: String {
+        var base = serverURL.trimmingCharacters(in: .whitespaces)
+        while base.hasSuffix("/") { base.removeLast() }
+        return base
     }
 
     /// Prüft Adresse und Schlüssel; liefert die Zahl der Dokumente am Server

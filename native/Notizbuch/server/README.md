@@ -23,7 +23,10 @@ Adresse und Schlüssel trägst du dann in der App ein (Zahnrad in der Übersicht
 | POST | `/api/doc/:id/sync` | `{since, add:[{id,data}], remove:[id]}` → `{seq, changes:[{id,data\|null}]}` |
 | PUT/GET | `/api/pdf/:id` | PDF eines Dokuments |
 | POST | `/api/inbox?title=` | PDF in den Eingang → neues Dokument |
-| GET | `/api/outbox` | Liste des Ausgangs |
-| PUT/GET/DELETE | `/api/outbox/:name` | Datei im Ausgang |
+| GET | `/api/outbox` bzw. `/api/outbox/:to` | Liste des Ausgangs (alle bzw. `claude` oder `chatgpt`) |
+| PUT/GET/DELETE | `/api/outbox/:to/:name` | Datei im Ausgang eines Empfängers |
+| POST/DELETE | `/api/share/:id` | Link für Gäste erzeugen (`{token}`) bzw. Teilen beenden |
+| GET (WebSocket) | `/api/doc/:id/ws` | Live-Verbindung der App (Änderungen, Gäste, Ansicht) |
+| GET | `/s/:token` | Web-Ansicht für Gäste (ohne Schlüssel; dazu `/s/:token/data`, `/pdf`, `/ws`) |
 
 Lokal testen: `echo SECRET=test > .dev.vars && npx wrangler dev`.

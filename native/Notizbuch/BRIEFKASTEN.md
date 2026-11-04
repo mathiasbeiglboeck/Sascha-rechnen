@@ -21,20 +21,23 @@ Das PDF erscheint innerhalb von etwa 20 Sekunden als neues Dokument in der Über
 
 ## Zurückgeschickte Seiten abholen (Ausgang)
 
-In der App: Teilen-Knopf, dann „Seite an KI senden“. Jede Seite kommt als `<Titel> – Seite N.pdf` und als `.png` in den Ausgang.
+Der Ausgang ist nach Empfänger getrennt. In der App wählt Mathias im Teilen-Menü „Seite an Claude senden“ oder „Seite an ChatGPT senden“. Jede Seite kommt als `<Titel> – Seite N.pdf` und als `.png` in den Ordner dieses Empfängers.
+
+**Hole nur aus deinem eigenen Ordner:** Claude nimmt `claude`, ChatGPT/Codex nimmt `chatgpt`.
 
 ```sh
+TO=claude   # oder chatgpt
 # Liste, neueste zuerst
-curl -sS "$NOTIZBUCH_URL/api/outbox" -H "Authorization: Bearer $NOTIZBUCH_KEY"
-# → {"files":[{"name":"Übungsblatt 3 – Seite 1.png","size":…,"type":"image/png","created":…}, …]}
+curl -sS "$NOTIZBUCH_URL/api/outbox/$TO" -H "Authorization: Bearer $NOTIZBUCH_KEY"
+# → {"files":[{"to":"claude","name":"Übungsblatt 3 – Seite 1.png","size":…,"type":"image/png","created":…}, …]}
 
 # Eine Datei laden (Name URL-kodieren)
-curl -sS "$NOTIZBUCH_URL/api/outbox/<name>" -H "Authorization: Bearer $NOTIZBUCH_KEY" -o seite.png
+curl -sS "$NOTIZBUCH_URL/api/outbox/$TO/<name>" -H "Authorization: Bearer $NOTIZBUCH_KEY" -o seite.png
 
 # Danach aufräumen
-curl -sS -X DELETE "$NOTIZBUCH_URL/api/outbox/<name>" -H "Authorization: Bearer $NOTIZBUCH_KEY"
+curl -sS -X DELETE "$NOTIZBUCH_URL/api/outbox/$TO/<name>" -H "Authorization: Bearer $NOTIZBUCH_KEY"
 ```
 
-Das PNG eignet sich zum Ansehen der Handschrift, das PDF zum Weitergeben.
+Das PNG eignet sich zum Ansehen der Handschrift, das PDF zum Weitergeben. Wenn Mathias sagt „schau in den Ausgang“ oder „ich hab dir eine Seite geschickt“, ist die neueste Datei in deinem Ordner gemeint.
 
 Hinweis für Cloud-Agenten: Die Netzwerk-Freigabe der Umgebung muss den Host von `NOTIZBUCH_URL` erlauben (`*.workers.dev`).

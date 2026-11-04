@@ -9,8 +9,10 @@
 // Alle /api-Adressen brauchen den Header  Authorization: Bearer <SECRET>.
 
 import { DurableObject } from "cloudflare:workers";
+import viewerHTML from "./viewer.html";
 
 const CHUNK = 1024 * 1024;
+const RECIPIENTS = ["claude", "chatgpt"];
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
@@ -25,6 +27,14 @@ function sameSecret(a, b) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const store = env.STORE.get(env.STORE.idFromName("main"));
+    // Geteilte Dokumente: /s/<token> ist die Web-Ansicht für Gäste, der Token ist die Berechtigung
+    if (/^\/s\/[A-Za-z0-9_-]{8,}\/?$/.test(url.pathname)) {
+      return new Response(viewerHTML, {
+        headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
+    if (url.pathname.startsWith("/s/")) return store.fetch(request);
     if (!url.pathname.startsWith("/api/")) {
       return new Response("Notizbuch-Server läuft.\n", { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
@@ -32,7 +42,6 @@ export default {
     if (!env.SECRET || !sameSecret(auth, `Bearer ${env.SECRET}`)) {
       return json({ error: "Falscher oder fehlender Schlüssel" }, 401);
     }
-    const store = env.STORE.get(env.STORE.idFromName("main"));
     return store.fetch(request);
   },
 };
@@ -48,6 +57,7 @@ export class Store extends DurableObject {
                                           PRIMARY KEY (doc, id));
       CREATE INDEX IF NOT EXISTS strokes_seq ON strokes (doc, seq);
       CREATE TABLE IF NOT EXISTS blobmeta (key TEXT PRIMARY KEY, size INTEGER NOT NULL, type TEXT, created REAL NOT NULL);
+      CREATE TABLE IF NOT EXISTS shares (token TEXT PRIMARY KEY, doc TEXT NOT NULL, created REAL NOT NULL);
       CREATE TABLE IF NOT EXISTS blobs (key TEXT NOT NULL, part INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY (key, part));
     `);
   }
@@ -64,7 +74,16 @@ export class Store extends DurableObject {
     const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent); // ["api", ...]
     const method = request.method;
     try {
+      if (parts[0] === "s") return this.guest(request, parts[1], parts[2]);
       const [, area, id, sub] = parts;
+
+      if (area === "doc" && id && sub === "ws") return this.accept(request, id, "app");
+      if (area === "share" && id && method === "POST") return json({ token: this.shareToken(id) });
+      if (area === "share" && id && method === "DELETE") {
+        this.sql.exec("DELETE FROM shares WHERE doc = ?", id);
+        for (const ws of this.ctx.getWebSockets(`guest:${id}`)) ws.close(4001, "Teilen beendet");
+        return json({ ok: true });
+      }
 
       if (area === "library" && !id && method === "GET") return json({ docs: this.library() });
       if (area === "library" && id && method === "PUT") return json(this.putMeta(id, await request.json()));
@@ -79,15 +98,21 @@ export class Store extends DurableObject {
 
       if (area === "inbox" && !id && method === "POST") return json(await this.inbox(request, url));
 
-      if (area === "outbox" && !id && method === "GET") return json({ files: this.listOutbox() });
-      if (area === "outbox" && id && method === "PUT") {
-        this.putBlob(`outbox/${id}`, await request.arrayBuffer(), request.headers.get("content-type"));
-        return json({ ok: true });
-      }
-      if (area === "outbox" && id && method === "GET") return this.blobResponse(`outbox/${id}`);
-      if (area === "outbox" && id && method === "DELETE") {
-        this.deleteBlob(`outbox/${id}`);
-        return json({ ok: true });
+      // Ausgang je Empfänger: /api/outbox/claude/… und /api/outbox/chatgpt/…
+      if (area === "outbox") {
+        if (!id && method === "GET") return json({ files: this.listOutbox(null) });
+        if (!RECIPIENTS.includes(id)) return json({ error: `Empfänger muss ${RECIPIENTS.join(" oder ")} sein` }, 400);
+        if (!sub && method === "GET") return json({ files: this.listOutbox(id) });
+        const key = `outbox/${id}/${sub}`;
+        if (sub && method === "PUT") {
+          this.putBlob(key, await request.arrayBuffer(), request.headers.get("content-type"));
+          return json({ ok: true });
+        }
+        if (sub && method === "GET") return this.blobResponse(key);
+        if (sub && method === "DELETE") {
+          this.deleteBlob(key);
+          return json({ ok: true });
+        }
       }
       return json({ error: "Unbekannte Adresse" }, 404);
     } catch (e) {
@@ -132,27 +157,119 @@ export class Store extends DurableObject {
   /// body: { since, add: [{ id, data }], remove: [id] }  →  { seq, changes: [{ id, data | null }] }
   syncDoc(doc, body) {
     const since = Number(body.since) || 0;
-    this.ctx.storage.transactionSync(() => {
-      for (const s of body.add || []) {
-        if (typeof s.id !== "string" || typeof s.data !== "string") continue;
-        this.sql.exec(
-          "INSERT OR REPLACE INTO strokes (doc, id, data, alive, seq) VALUES (?, ?, ?, 1, ?)",
-          doc, s.id, s.data, this.nextSeq(),
-        );
-      }
-      for (const id of body.remove || []) {
-        if (typeof id !== "string") continue;
-        this.sql.exec(
-          "INSERT OR REPLACE INTO strokes (doc, id, data, alive, seq) VALUES (?, ?, NULL, 0, ?)",
-          doc, id, this.nextSeq(),
-        );
-      }
-    });
+    this.applyOps(doc, body.add || [], body.remove || []);
     const rows = this.sql
       .exec("SELECT id, data, alive, seq FROM strokes WHERE doc = ? AND seq > ? ORDER BY seq", doc, since)
       .toArray();
     const max = this.sql.exec("SELECT MAX(seq) AS s FROM strokes WHERE doc = ?", doc).one().s || 0;
     return { seq: max, changes: rows.map((r) => ({ id: r.id, data: r.alive ? r.data : null })) };
+  }
+
+  /// Schreibt Striche und meldet sie allen, die das Dokument gerade live offen haben
+  applyOps(doc, add, remove) {
+    const changes = [];
+    this.ctx.storage.transactionSync(() => {
+      for (const s of add) {
+        if (!s || typeof s.id !== "string" || typeof s.data !== "string" || s.data.length > 500000) continue;
+        this.sql.exec(
+          "INSERT OR REPLACE INTO strokes (doc, id, data, alive, seq) VALUES (?, ?, ?, 1, ?)",
+          doc, s.id, s.data, this.nextSeq(),
+        );
+        changes.push({ id: s.id, data: s.data });
+      }
+      for (const id of remove) {
+        if (typeof id !== "string") continue;
+        this.sql.exec(
+          "INSERT OR REPLACE INTO strokes (doc, id, data, alive, seq) VALUES (?, ?, NULL, 0, ?)",
+          doc, id, this.nextSeq(),
+        );
+        changes.push({ id, data: null });
+      }
+    });
+    if (changes.length) this.broadcast(doc, { type: "changes", changes });
+  }
+
+  // ---------- Live: WebSockets (Hibernation-API) ----------
+  // Tags: doc:<id> für alle, app:<id> bzw. guest:<id> je nach Rolle
+
+  accept(request, doc, role) {
+    if (request.headers.get("upgrade") !== "websocket") return json({ error: "WebSocket erwartet" }, 426);
+    const pair = new WebSocketPair();
+    this.ctx.acceptWebSocket(pair[1], [`doc:${doc}`, `${role}:${doc}`]);
+    if (role === "guest") {
+      if (this.lastView?.[doc]) pair[1].send(JSON.stringify(this.lastView[doc]));
+      this.presence(doc);
+    }
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  broadcast(doc, msg, tag = `doc:${doc}`) {
+    const text = JSON.stringify(msg);
+    for (const ws of this.ctx.getWebSockets(tag)) {
+      try { ws.send(text); } catch {}
+    }
+  }
+
+  presence(doc, leaving = null) {
+    const guests = this.ctx.getWebSockets(`guest:${doc}`).filter((ws) => ws !== leaving).length;
+    this.broadcast(doc, { type: "presence", guests });
+  }
+
+  webSocketMessage(ws, message) {
+    const tags = this.ctx.getTags(ws);
+    const docTag = tags.find((t) => t.startsWith("doc:"));
+    if (!docTag || typeof message !== "string") return;
+    const doc = docTag.slice(4);
+    let msg;
+    try { msg = JSON.parse(message); } catch { return; }
+    if (tags.includes(`app:${doc}`) && msg.type === "view") {
+      const view = { type: "view", y0: Number(msg.y0) || 0, y1: Number(msg.y1) || 0 };
+      this.lastView = this.lastView || {};
+      this.lastView[doc] = view;
+      this.broadcast(doc, view, `guest:${doc}`);
+    } else if (tags.includes(`guest:${doc}`) && msg.type === "add" && msg.stroke) {
+      this.applyOps(doc, [msg.stroke], []);
+    } else if (tags.includes(`guest:${doc}`) && msg.type === "remove" && typeof msg.id === "string") {
+      this.applyOps(doc, [], [msg.id]);
+    }
+  }
+
+  webSocketClose(ws) {
+    const tag = this.ctx.getTags(ws).find((t) => t.startsWith("guest:"));
+    if (tag) this.presence(tag.slice(6), ws);
+  }
+
+  webSocketError(ws) {
+    this.webSocketClose(ws);
+  }
+
+  // ---------- Teilen ----------
+
+  shareToken(doc) {
+    const existing = this.sql.exec("SELECT token FROM shares WHERE doc = ?", doc).toArray()[0];
+    if (existing) return existing.token;
+    const bytes = crypto.getRandomValues(new Uint8Array(18));
+    const token = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    this.sql.exec("INSERT INTO shares (token, doc, created) VALUES (?, ?, ?)", token, doc, Date.now() / 1000);
+    return token;
+  }
+
+  /// Gast-Zugriffe: /s/<token>/data, /s/<token>/pdf, /s/<token>/ws
+  guest(request, token, what) {
+    const share = this.sql.exec("SELECT doc FROM shares WHERE token = ?", token || "").toArray()[0];
+    if (!share) return json({ error: "Dieser Link ist nicht (mehr) gültig." }, 404);
+    const doc = share.doc;
+    if (what === "ws") return this.accept(request, doc, "guest");
+    if (what === "pdf") return this.blobResponse(`pdf/${doc}`);
+    if (what === "data") {
+      const row = this.sql.exec("SELECT meta FROM docs WHERE id = ?", doc).toArray()[0];
+      const meta = row ? JSON.parse(row.meta) : { title: "Notizbuch", kind: "notebook", pageCount: 1 };
+      const strokes = this.sql
+        .exec("SELECT id, data FROM strokes WHERE doc = ? AND alive = 1 ORDER BY seq", doc)
+        .toArray();
+      return json({ title: meta.title, kind: meta.kind, pageCount: meta.pageCount || 1, strokes });
+    }
+    return json({ error: "Unbekannte Adresse" }, 404);
   }
 
   // ---------- Briefkasten ----------
@@ -170,11 +287,16 @@ export class Store extends DurableObject {
     return { id, title };
   }
 
-  listOutbox() {
+  listOutbox(to) {
+    const prefix = to ? `outbox/${to}/` : "outbox/";
     return this.sql
-      .exec("SELECT key, size, type, created FROM blobmeta WHERE key LIKE 'outbox/%' ORDER BY created DESC")
+      .exec("SELECT key, size, type, created FROM blobmeta WHERE substr(key, 1, ?) = ? ORDER BY created DESC",
+        prefix.length, prefix)
       .toArray()
-      .map((r) => ({ name: r.key.slice("outbox/".length), size: r.size, type: r.type, created: r.created }));
+      .map((r) => {
+        const [, recipient, ...rest] = r.key.split("/");
+        return { to: recipient, name: rest.join("/"), size: r.size, type: r.type, created: r.created };
+      });
   }
 
   // ---------- Dateien in Stücken ----------
