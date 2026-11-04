@@ -604,6 +604,8 @@ enum ShareKind {
     case pagePDF, pageImage, documentPDF
     /// Seite in den Ausgang für einen Empfänger: "claude" oder "chatgpt"
     case sendTo(String)
+    /// Ganzes Dokument als ein PDF in den Ausgang (höchstens `maxPagesToAI` Seiten)
+    case sendDocumentTo(String)
 }
 
 extension CanvasController {
@@ -623,10 +625,14 @@ extension CanvasController {
             sendPage(i, ink: ink, to: recipient)
             return
         }
+        if case .sendDocumentTo(let recipient) = kind {
+            sendDocument(ink: ink, to: recipient)
+            return
+        }
         let name: String
         let data: Data
         switch kind {
-        case .sendTo:
+        case .sendTo, .sendDocumentTo:
             return
         case .pagePDF:
             name = "\(doc.title) – Seite \(i + 1).pdf"
@@ -653,6 +659,31 @@ extension CanvasController {
     }
 
     /// Legt die Seite als PDF und als Bild in den Ausgang des Briefkastens, wo Claude oder Codex sie abholen
+    static let maxPagesToAI = 80
+
+    /// Ganzes Dokument (Hintergrund und Notizen) als ein PDF an Claude oder ChatGPT
+    private func sendDocument(ink: PKDrawing, to recipient: String) {
+        guard sync.isConfigured else {
+            onFlash("Erst den Server einrichten (Zahnrad in der Übersicht)")
+            return
+        }
+        let count = min(layout.frames.count, Self.maxPagesToAI)
+        let cut = layout.frames.count > count
+        let pdf = pdfData(pages: Array(0..<count), ink: ink, inkScale: 2)
+        let name = cut ? "\(doc.title) – Seiten 1-\(count).pdf" : "\(doc.title).pdf"
+        let who = recipient == "claude" ? "Claude" : "ChatGPT"
+        onFlash("Wird gesendet …")
+        let sync = self.sync
+        Task { [weak self] in
+            do {
+                try await sync.sendToOutbox(to: recipient, name: name, data: pdf, type: "application/pdf")
+                self?.onFlash(cut ? "Seiten 1–\(count) liegen bereit für \(who)" : "Ganzes Dokument liegt bereit für \(who)")
+            } catch {
+                self?.onFlash("Senden fehlgeschlagen: \(error.localizedDescription)")
+            }
+        }
+    }
+
     private func sendPage(_ i: Int, ink: PKDrawing, to recipient: String) {
         guard sync.isConfigured else {
             onFlash("Erst den Server einrichten (Zahnrad in der Übersicht)")
@@ -679,7 +710,7 @@ extension CanvasController {
     }
 
     /// PDF in echter Größe: Notizbuchseiten als A4, PDF-Seiten in ihrer Originalgröße
-    private func pdfData(pages: [Int], ink: PKDrawing) -> Data {
+    private func pdfData(pages: [Int], ink: PKDrawing, inkScale: CGFloat = 4) -> Data {
         let renderer = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 595.28, height: 841.89))
         return renderer.pdfData { c in
             for i in pages {
@@ -692,13 +723,13 @@ extension CanvasController {
                 let s = outWidth / frame.width
                 c.beginPage(withBounds: CGRect(x: 0, y: 0, width: outWidth, height: frame.height * s), pageInfo: [:])
                 c.cgContext.scaleBy(x: s, y: s)
-                drawPage(i, ink: ink, in: c.cgContext)
+                drawPage(i, ink: ink, in: c.cgContext, inkScale: inkScale)
             }
         }
     }
 
     /// Zeichnet Seite `i` (Hintergrund und Tinte) in Seitenpunkten ab (0, 0)
-    private func drawPage(_ i: Int, ink: PKDrawing, in ctx: CGContext) {
+    private func drawPage(_ i: Int, ink: PKDrawing, in ctx: CGContext, inkScale: CGFloat = 4) {
         let frame = layout.frames[i]
         let rect = CGRect(origin: .zero, size: frame.size)
         ctx.setFillColor(UIColor.white.cgColor)
@@ -709,7 +740,7 @@ extension CanvasController {
             PageView.drawGrid(in: ctx, rect: rect, lineWidth: 0.5)
         }
         UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
-            ink.image(from: frame, scale: 4).draw(in: rect)
+            ink.image(from: frame, scale: inkScale).draw(in: rect)
         }
     }
 }

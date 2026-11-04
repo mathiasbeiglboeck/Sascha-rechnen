@@ -175,8 +175,14 @@ struct ToolBar: View {
             Button { share(.pageImage) } label: { Label("Diese Seite als Bild", systemImage: "photo") }
             Button { share(.documentPDF) } label: { Label("Alles als PDF", systemImage: "doc.on.doc") }
             Divider()
-            Button { share(.sendTo("claude")) } label: { Label("Seite an Claude senden", systemImage: "tray.and.arrow.up") }
-            Button { share(.sendTo("chatgpt")) } label: { Label("Seite an ChatGPT senden", systemImage: "tray.and.arrow.up") }
+            Menu {
+                Button { share(.sendTo("claude")) } label: { Label("Diese Seite", systemImage: "doc") }
+                Button { share(.sendDocumentTo("claude")) } label: { Label("Ganzes Dokument", systemImage: "doc.on.doc") }
+            } label: { Label("An Claude senden", systemImage: "tray.and.arrow.up") }
+            Menu {
+                Button { share(.sendTo("chatgpt")) } label: { Label("Diese Seite", systemImage: "doc") }
+                Button { share(.sendDocumentTo("chatgpt")) } label: { Label("Ganzes Dokument", systemImage: "doc.on.doc") }
+            } label: { Label("An ChatGPT senden", systemImage: "tray.and.arrow.up") }
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "square.and.arrow.up")

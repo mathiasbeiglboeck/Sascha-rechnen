@@ -21,7 +21,7 @@ Das PDF erscheint innerhalb von etwa 20 Sekunden als neues Dokument in der Über
 
 ## Zurückgeschickte Seiten abholen (Ausgang)
 
-Der Ausgang ist nach Empfänger getrennt. In der App wählt Mathias im Teilen-Menü „Seite an Claude senden“ oder „Seite an ChatGPT senden“. Jede Seite kommt als `<Titel> – Seite N.pdf` und als `.png` in den Ordner dieses Empfängers.
+Der Ausgang ist nach Empfänger getrennt. In der App wählt Mathias im Teilen-Menü „Seite an Claude senden“ oder „Seite an ChatGPT senden“. Eine einzelne Seite kommt als `<Titel> – Seite N.pdf` und als `.png`, ein ganzes Dokument („Ganzes Dokument“, höchstens 80 Seiten) als `<Titel>.pdf` bzw. `<Titel> – Seiten 1-80.pdf` in den Ordner dieses Empfängers.
 
 **Hole nur aus deinem eigenen Ordner:** Claude nimmt `claude`, ChatGPT/Codex nimmt `chatgpt`.
 
