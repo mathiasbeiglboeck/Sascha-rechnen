@@ -82,6 +82,14 @@ struct LibraryView: View {
             }
             // PDFs, die aus einer anderen App (Dateien, Mail, AirDrop …) mit „Notizbuch“ geöffnet werden
             .onOpenURL { url in
+                // Einrichtungslink: notizbuch://setup?url=https://…&key=…
+                if url.scheme == "notizbuch", url.host == "setup",
+                   let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems {
+                    if let server = items.first(where: { $0.name == "url" })?.value { sync.serverURL = server }
+                    if let key = items.first(where: { $0.name == "key" })?.value { sync.key = key }
+                    showSettings = true
+                    return
+                }
                 guard url.pathExtension.lowercased() == "pdf" else { return }
                 do {
                     let doc = try store.importPDF(from: url)
