@@ -199,6 +199,9 @@ export class Store extends DurableObject {
     if (role === "guest") {
       if (this.lastView?.[doc]) pair[1].send(JSON.stringify(this.lastView[doc]));
       this.presence(doc);
+    } else {
+      // Die App erfährt die Gästezahl auch, wenn sie ein schon geteiltes Dokument neu öffnet
+      pair[1].send(JSON.stringify({ type: "presence", guests: this.ctx.getWebSockets(`guest:${doc}`).length }));
     }
     return new Response(null, { status: 101, webSocket: pair[0] });
   }

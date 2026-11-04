@@ -64,26 +64,31 @@ struct EditorView: View {
     @StateObject private var tools = ToolState()
 
     var body: some View {
-        ZStack(alignment: .top) {
-            CanvasRepresentable(doc: doc, store: store, sync: sync, tools: tools)
-                .ignoresSafeArea()
+        // Leiste als Overlay: Wird sie breiter, darf das nie die Größe der Leinwand ändern
+        Color.clear
+            .overlay(alignment: .top) {
+                ZStack(alignment: .top) {
+                    if !tools.menusHidden {
+                        ToolBar(tools: tools, onClose: { dismiss() })
+                            .padding(.top, 6)
+                            .padding(.horizontal, 12)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
 
-            if !tools.menusHidden {
-                ToolBar(tools: tools, onClose: { dismiss() })
-                    .padding(.top, 6)
-                    .padding(.horizontal, 12)
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                    if let flash = tools.flash {
+                        Text(flash)
+                            .font(.callout.weight(.medium))
+                            .padding(.horizontal, 14).padding(.vertical, 7)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .padding(.top, tools.menusHidden ? 10 : 64)
+                            .transition(.opacity)
+                    }
+                }
             }
-
-            if let flash = tools.flash {
-                Text(flash)
-                    .font(.callout.weight(.medium))
-                    .padding(.horizontal, 14).padding(.vertical, 7)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .padding(.top, tools.menusHidden ? 10 : 64)
-                    .transition(.opacity)
+            .background {
+                CanvasRepresentable(doc: doc, store: store, sync: sync, tools: tools)
+                    .ignoresSafeArea()
             }
-        }
         .statusBarHidden(tools.menusHidden)
         .persistentSystemOverlays(tools.menusHidden ? .hidden : .automatic)
         .animation(.easeOut(duration: 0.2), value: tools.menusHidden)
@@ -122,7 +127,7 @@ struct ToolBar: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
-        HStack(spacing: sizeClass == .compact ? 10 : 14) {
+        HStack(spacing: sizeClass == .compact ? 8 : 14) {
             Button(action: onClose) {
                 Image(systemName: "chevron.left").font(.body.weight(.semibold))
             }
@@ -163,6 +168,17 @@ struct ToolBar: View {
     }
 
     private var shareMenu: some View {
+        HStack(spacing: 4) {
+            shareMenuButton
+            // Außerhalb des Menüs: dessen Beschriftung zeigt nur Symbole, die Zahl fehlte sonst
+            if let n = tools.guests, n > 0 {
+                Image(systemName: "eye").font(.caption)
+                Text("\(n)").font(.caption.weight(.semibold))
+            }
+        }
+    }
+
+    private var shareMenuButton: some View {
         Menu {
             Button { tools.canvas?.startLiveSharing() } label: { Label("Live teilen (Link)", systemImage: "link") }
             if tools.guests != nil {
@@ -184,12 +200,7 @@ struct ToolBar: View {
                 Button { share(.sendDocumentTo("chatgpt")) } label: { Label("Ganzes Dokument", systemImage: "doc.on.doc") }
             } label: { Label("An ChatGPT senden", systemImage: "tray.and.arrow.up") }
         } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "square.and.arrow.up")
-                if let n = tools.guests, n > 0 {
-                    Label("\(n)", systemImage: "eye").labelStyle(.titleAndIcon).font(.caption.weight(.semibold))
-                }
-            }
+            Image(systemName: "square.and.arrow.up")
         }
     }
 

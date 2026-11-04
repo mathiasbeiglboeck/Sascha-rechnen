@@ -150,8 +150,25 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             canvas.undoManager?.removeAllActions()
             k = newK
             updateContentSize()
+            redrawInkSoon()
         }
         applyTool()
+    }
+
+    /// PencilKit behält beim Drehen die alten Kacheln der Tinte; nach der Animation neu aufbauen lassen
+    private var redrawWork: DispatchWorkItem?
+    private func redrawInkSoon() {
+        redrawWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            // Nicht mitten in einem Strich, sonst ginge er verloren
+            if self.usingTool { self.redrawInkSoon(); return }
+            let drawing = self.canvas.drawing
+            self.setDrawing(PKDrawing())
+            self.setDrawing(drawing)
+        }
+        redrawWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
     }
 
     override func viewWillDisappear(_ animated: Bool) {
