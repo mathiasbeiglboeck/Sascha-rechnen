@@ -174,37 +174,60 @@ function notebookPagesNeeded() {
 function buildPages() {
   const holder = document.getElementById("pages");
   scale = Math.min(holder.clientWidth || innerWidth, 1100) / W;
-  const dpr = devicePixelRatio || 1;
   while (els.length < frames.length) {
     const div = document.createElement("div"); div.className = "page";
     const bg = document.createElement("canvas"), ink = document.createElement("canvas"); ink.className = "ink";
+    for (const c of [bg, ink]) { c.width = 0; c.height = 0; }
     div.append(bg, ink); holder.appendChild(div);
-    const el = { div, bg, ink, rendered: 0, index: els.length };
+    const el = { div, bg, ink, rendered: 0, live: false, index: els.length };
     els.push(el); attachDrawing(el); observer.observe(div);
   }
   els.forEach((el, i) => {
     const f = frames[i];
     el.div.style.width = W * scale + "px"; el.div.style.height = f.h * scale + "px";
-    for (const c of [el.bg, el.ink]) { c.width = Math.round(W * scale * dpr); c.height = Math.round(f.h * scale * dpr); }
-    el.rendered = 0;
-    drawInk(i);
+    if (el.live) { el.live = false; wake(el); }
   });
-  els.forEach((el) => { if (isVisible(el.div)) renderBackground(el); });
+  els.forEach((el) => { if (isVisible(el.div)) wake(el); });
 }
-function isVisible(div) { const r = div.getBoundingClientRect(); return r.bottom > -400 && r.top < innerHeight + 400; }
+function isVisible(div) { const r = div.getBoundingClientRect(); return r.bottom > -800 && r.top < innerHeight + 800; }
+
+// Nur Seiten in Sichtweite bekommen Bildspeicher. Sonst geht Safari am iPad
+// bei vielen Seiten der Speicher aus („Diese Seite kann nicht geöffnet werden“).
+function pixelRatio() { return Math.min(devicePixelRatio || 1, 2); }
+function wake(el) {
+  if (!el || el.live) return;
+  const f = frames[el.index], r = pixelRatio();
+  el.task?.cancel();
+  for (const c of [el.bg, el.ink]) { c.width = Math.round(W * scale * r); c.height = Math.round(f.h * scale * r); }
+  el.live = true; el.rendered = 0;
+  renderBackground(el);
+  drawInk(el.index);
+}
+function sleep(el) {
+  if (!el || !el.live) return;
+  el.task?.cancel();
+  for (const c of [el.bg, el.ink]) { c.width = 0; c.height = 0; }
+  el.live = false; el.rendered = 0;
+}
 const observer = new IntersectionObserver((entries) => {
-  for (const e of entries) if (e.isIntersecting) renderBackground(els.find(el => el.div === e.target));
-}, { rootMargin: "400px" });
+  for (const e of entries) {
+    const el = els.find(x => x.div === e.target);
+    if (e.isIntersecting) wake(el); else sleep(el);
+  }
+}, { rootMargin: "800px 0px" });
 
 async function renderBackground(el) {
-  if (!el || el.rendered) return;
+  if (!el || !el.live || el.rendered) return;
   el.rendered = 1;
   const ctx = el.bg.getContext("2d"), s = el.bg.width / W;
   ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, el.bg.width, el.bg.height);
   if (pdf) {
     const page = await pdf.getPage(el.index + 1);
     const vp = page.getViewport({ scale: el.bg.width / page.getViewport({ scale: 1 }).width });
-    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    if (!el.live) return;
+    el.task = page.render({ canvasContext: ctx, viewport: vp });
+    try { await el.task.promise; } catch {} // abgebrochen, weil die Seite aus dem Blick ist
+    el.task = null;
   } else {
     ctx.strokeStyle = "#d1d1d1"; ctx.lineWidth = Math.max(1, 0.5 * s);
     ctx.beginPath();
@@ -233,7 +256,7 @@ function drawWire(ctx, wire, s, offY) {
 }
 function drawInk(i) {
   const el = els[i], f = frames[i];
-  if (!el) return;
+  if (!el || !el.live) return;
   const ctx = el.ink.getContext("2d"), s = el.ink.width / W;
   ctx.clearRect(0, 0, el.ink.width, el.ink.height);
   for (const id of order) {
