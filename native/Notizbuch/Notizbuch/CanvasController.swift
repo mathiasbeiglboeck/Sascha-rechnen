@@ -141,10 +141,14 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         saveNow()
     }
 
+    /// Stand der Zeichnung nach dem Laden bzw. letzten Speichern; gleicher Stand wird nicht erneut gespeichert
+    private var savedData: Data?
+
     private func setDrawing(_ drawing: PKDrawing) {
         settingDrawing = true
         canvas.drawing = drawing
         settingDrawing = false
+        savedData = canvas.drawing.dataRepresentation()
     }
 
     // MARK: Werkzeuge
@@ -368,6 +372,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         pendingSave = nil
         guard dirty, k > 0 else { return }
         dirty = false
+        // Bloßes Öffnen (PencilKit meldet manchmal verspätet eine „Änderung“) soll nichts speichern
+        let current = canvas.drawing.dataRepresentation()
+        guard current != savedData else { return }
+        savedData = current
         let pageUnits = canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k))
         store.saveDrawing(pageUnits, for: doc.id, pageCount: pageCount)
     }
