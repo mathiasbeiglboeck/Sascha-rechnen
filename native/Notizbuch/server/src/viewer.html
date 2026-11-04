@@ -25,8 +25,12 @@ html,body { margin:0; background:var(--bg); color:var(--text); font-family:var(-
 #pages { max-width:1100px; margin:0 auto; padding:6px 0 40px; }
 .page { position:relative; background:#fff; margin:0 auto 6px; }
 .page canvas { position:absolute; inset:0; width:100%; height:100%; }
-.page canvas.ink { touch-action:pan-y; }
+.page canvas.ink { touch-action:pan-y; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
 body.drawing .page canvas.ink { cursor:crosshair; }
+body.erasing .page canvas.ink { cursor:none; }
+#eraser-cursor { position:fixed; z-index:6; pointer-events:none; border:1.5px solid rgba(0,0,0,.55); border-radius:50%;
+  background:rgba(255,255,255,.35); display:none; transform:translate(-50%,-50%); }
+body.erasing #eraser-cursor.show { display:block; }
 #msg { max-width:520px; margin:80px auto; text-align:center; color:var(--muted); line-height:1.5; padding:0 16px; }
 </style>
 </head>
@@ -35,12 +39,14 @@ body.drawing .page canvas.ink { cursor:crosshair; }
   <span id="title">Notizbuch</span>
   <span id="colors"></span>
   <span id="widths"></span>
-  <button id="undo" title="Meinen letzten Strich zurücknehmen">↶</button>
+  <button id="eraser" title="Radierer: löscht jeden Strich, den er berührt (Taste E)">Radierer</button>
+  <button id="undo" title="Meinen letzten Schritt zurücknehmen">↶</button>
   <button id="follow" class="on" title="Mitscrollen, wo gerade geschrieben wird">Folgen</button>
   <span id="status">verbinde …</span>
 </div>
 <div id="pages"></div>
 <div id="msg" hidden></div>
+<div id="eraser-cursor"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script>
@@ -49,7 +55,8 @@ const W = 768, GAP = 6, A4H = W * 297 / 210, GRID = W / 30;
 const base = location.pathname.replace(/\/$/, "");
 const COLORS = [[0.8,0.17,0.15],[0.12,0.27,0.64],[0.13,0.52,0.29],[0.1,0.1,0.11]];
 const WIDTHS = [1.6, 2.6, 4.5];
-let color = 0, width = 1, follow = true;
+const ERASER_PX = 8;      // Radius am Bildschirm, wie in der App
+let color = 0, width = 1, follow = true, erasing = false;
 
 let doc = null;           // {title, kind, pageCount}
 let pdf = null;           // pdf.js-Dokument
@@ -57,7 +64,7 @@ let pageHeights = [];     // in Seitenpunkten
 let frames = [];          // {y, h}
 const strokes = new Map(); // id -> {data, wire, bbox}
 let order = [];           // ids in Reihenfolge
-const mine = [];          // eigene Strich-IDs (für Rückgängig)
+const history = [];       // eigene Schritte: {add: id} oder {erased: [{id, data}]}
 let ws = null, scale = 1;
 const els = [];           // je Seite {div, bg, ink, rendered}
 
@@ -66,27 +73,56 @@ const colorsEl = document.getElementById("colors"), widthsEl = document.getEleme
 COLORS.forEach((c, i) => {
   const b = document.createElement("button");
   b.className = "dot"; b.style.background = `rgb(${c.map(v => v * 255).join(",")})`;
-  b.onclick = () => { color = i; tools(); };
+  b.onclick = () => { color = i; erasing = false; tools(); };
   colorsEl.appendChild(b);
 });
 WIDTHS.forEach((w, i) => {
   const b = document.createElement("span");
   b.className = "w"; b.innerHTML = `<span style="width:${4 + i * 4}px;height:${4 + i * 4}px"></span>`;
-  b.onclick = () => { width = i; tools(); };
+  b.onclick = () => { width = i; erasing = false; tools(); };
   widthsEl.appendChild(b);
 });
 function tools() {
-  [...colorsEl.children].forEach((b, i) => b.classList.toggle("on", i === color));
-  [...widthsEl.children].forEach((b, i) => b.classList.toggle("on", i === width));
+  [...colorsEl.children].forEach((b, i) => b.classList.toggle("on", !erasing && i === color));
+  [...widthsEl.children].forEach((b, i) => b.classList.toggle("on", !erasing && i === width));
+  document.getElementById("eraser").classList.toggle("on", erasing);
+  document.body.classList.toggle("erasing", erasing);
 }
+document.getElementById("eraser").onclick = () => { erasing = !erasing; tools(); };
+addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) {
+    if ((e.key === "z" || e.key === "Z") && !e.shiftKey) { e.preventDefault(); undo(); }
+    return;
+  }
+  if (e.key === "e" || e.key === "E") { erasing = !erasing; tools(); }
+});
+const cursorEl = document.getElementById("eraser-cursor");
+addEventListener("pointermove", (e) => {
+  if (!erasing || e.pointerType === "touch") return;
+  const d = ERASER_PX * 2;
+  cursorEl.style.width = cursorEl.style.height = d + "px";
+  cursorEl.style.left = e.clientX + "px"; cursorEl.style.top = e.clientY + "px";
+  cursorEl.classList.toggle("show", !!e.target.closest?.(".page"));
+});
 tools();
 document.getElementById("follow").onclick = (e) => { follow = !follow; e.target.classList.toggle("on", follow); };
-document.getElementById("undo").onclick = () => {
-  const id = mine.pop();
-  if (!id) return;
-  removeStroke(id);
-  send({ type: "remove", id });
-};
+function undo() {
+  const step = history.pop();
+  if (!step) return;
+  if (step.add) {
+    if (!strokes.has(step.add)) return undo(); // schon von jemand anderem gelöscht
+    removeStroke(step.add);
+    send({ type: "remove", id: step.add });
+  } else if (step.erased) {
+    for (const s of step.erased) {
+      if (strokes.has(s.id)) continue;
+      const r = addStroke(s.id, s.data);
+      if (r) redrawRange(r.y0, r.y1);
+      send({ type: "add", stroke: s });
+    }
+  }
+}
+document.getElementById("undo").onclick = undo;
 const status = (t) => (document.getElementById("status").textContent = t);
 function fail(text) {
   document.getElementById("pages").hidden = true;
@@ -111,7 +147,7 @@ function addStroke(id, data) {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (const p of wire.p) { x0 = Math.min(x0, p[0] - p[3]); x1 = Math.max(x1, p[0] + p[3]); y0 = Math.min(y0, p[1] - p[3]); y1 = Math.max(y1, p[1] + p[3]); }
   if (!strokes.has(id)) order.push(id);
-  strokes.set(id, { wire, bbox: { x0, y0, x1, y1 } });
+  strokes.set(id, { wire, data, bbox: { x0, y0, x1, y1 } });
   return { y0, y1 };
 }
 function removeStroke(id) {
@@ -213,35 +249,91 @@ function ensurePages() {
   if (n !== pageHeights.length) { pageHeights = Array(n).fill(A4H); layout(); buildPages(); }
 }
 
+// ---------- Radieren: ganze Striche, die der Kreis berührt ----------
+function segDist(px, py, a, b) {
+  const dx = b[0] - a[0], dy = b[1] - a[1], l = dx * dx + dy * dy;
+  const t = l ? Math.max(0, Math.min(1, ((px - a[0]) * dx + (py - a[1]) * dy) / l)) : 0;
+  return Math.hypot(px - a[0] - t * dx, py - a[1] - t * dy);
+}
+function hits(st, x, y, r) {
+  const b = st.bbox;
+  if (x < b.x0 - r || x > b.x1 + r || y < b.y0 - r || y > b.y1 + r) return false;
+  const p = st.wire.p;
+  if (p.length === 1) return Math.hypot(x - p[0][0], y - p[0][1]) <= r + p[0][3] / 2;
+  for (let i = 1; i < p.length; i++) {
+    if (segDist(x, y, p[i - 1], p[i]) <= r + Math.max(p[i - 1][3], p[i][3]) / 2) return true;
+  }
+  return false;
+}
+function eraseAt(x, y, erased) {
+  const r = ERASER_PX / scale;
+  for (const id of [...order]) {
+    const st = strokes.get(id);
+    if (!st || !hits(st, x, y, r)) continue;
+    erased.push({ id, data: st.data });
+    removeStroke(id);
+    send({ type: "remove", id });
+  }
+}
+
 // ---------- Mitzeichnen ----------
+// Mit dem Stift (Pencil) wird die Linie bei mehr Druck etwas breiter, mit der Maus bleibt sie gleich
+function penWidth(w, e) {
+  if (e.pointerType !== "pen" || !e.pressure) return w;
+  return Math.round(w * (0.55 + 0.9 * Math.min(e.pressure, 1)) * 100) / 100;
+}
 function attachDrawing(el) {
-  let cur = null, t0 = 0;
+  let cur = null, t0 = 0, rub = null;
   const pt = (e) => {
     const r = el.ink.getBoundingClientRect();
     const x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale + frames[el.index].y;
     return [Math.round(x * 100) / 100, Math.round(y * 100) / 100];
   };
+  // iPad-Safari: Der Pencil würde sonst wie ein Finger scrollen und den Strich abbrechen.
+  // Nur Stift-Berührungen werden hier abgefangen, Finger scrollen weiter (auch die Handfläche).
+  const stylus = (e) => [...e.changedTouches].some(t => t.touchType === "stylus");
+  for (const type of ["touchstart", "touchmove"]) {
+    el.ink.addEventListener(type, (e) => { if (stylus(e)) e.preventDefault(); }, { passive: false });
+  }
   el.ink.addEventListener("pointerdown", (e) => {
     if (e.pointerType === "touch" || !ws || ws.readyState !== 1) return; // Finger scrollt
     e.preventDefault(); el.ink.setPointerCapture(e.pointerId);
+    if (erasing) {
+      rub = { erased: [], last: pt(e) };
+      eraseAt(...rub.last, rub.erased);
+      return;
+    }
     document.body.classList.add("drawing");
     t0 = performance.now();
     const w = WIDTHS[width];
-    cur = { el, w, pts: [[...pt(e), 0, w, w, 1, 1, 0, 1.571]] };
+    cur = { el, w, pen: e.pointerType === "pen", pts: [[...pt(e), 0, penWidth(w, e), w, 1, 1, 0, 1.571]] };
   });
   el.ink.addEventListener("pointermove", (e) => {
+    if (rub) {
+      // Zwischenschritte, damit schnelle Bewegungen keine Striche überspringen
+      const [x, y] = pt(e), [lx, ly] = rub.last;
+      const step = Math.max(1, ERASER_PX / scale / 2), n = Math.ceil(Math.hypot(x - lx, y - ly) / step);
+      for (let i = 1; i <= n; i++) eraseAt(lx + (x - lx) * i / n, ly + (y - ly) * i / n, rub.erased);
+      rub.last = [x, y];
+      return;
+    }
     if (!cur) return;
     const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
     for (const ev of (evs.length ? evs : [e])) {
       const [x, y] = pt(ev), last = cur.pts[cur.pts.length - 1];
       if (Math.hypot(x - last[0], y - last[1]) < 1.5) continue;
       const t = Math.round((performance.now() - t0)) / 1000;
-      cur.pts.push([x, y, t, cur.w, cur.w, 1, 1, 0, 1.571]);
+      cur.pts.push([x, y, t, cur.pen ? penWidth(cur.w, ev) : cur.w, cur.w, 1, 1, 0, 1.571]);
     }
     const ctx = el.ink.getContext("2d");
     drawWire(ctx, { c: [...COLORS[color], 1], p: cur.pts.slice(-3) }, el.ink.width / W, frames[el.index].y);
   });
   const end = async () => {
+    if (rub) {
+      if (rub.erased.length) history.push({ erased: rub.erased });
+      rub = null;
+      return;
+    }
     if (!cur) return;
     const done = cur; cur = null;
     document.body.classList.remove("drawing");
@@ -249,7 +341,7 @@ function attachDrawing(el) {
     const id = await strokeID(wire);
     const data = JSON.stringify(wire);
     const r = addStroke(id, data);
-    mine.push(id);
+    history.push({ add: id });
     redrawRange(r.y0, r.y1);
     send({ type: "add", stroke: { id, data } });
   };
