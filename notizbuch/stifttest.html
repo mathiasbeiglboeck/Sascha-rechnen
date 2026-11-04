@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#fffdf8">
+<title>Stifttest</title>
+<style>
+/* Testblatt: prüft, wie sich der Apple Pencil in Safari anfühlt */
+:root { --paper:#fffdf8; --line:#e6e0d2; --text:#23302a; --muted:#7b847e; --chip:#ece7da; --ink:#1d2b4f;
+  --f:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif; }
+html,body { margin:0; height:100%; background:var(--paper); color:var(--text); font-family:var(--f);
+  overflow:hidden; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+#bar { position:fixed; top:0; left:0; right:0; display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+  padding:calc(env(safe-area-inset-top) + 8px) 12px 8px; background:var(--paper); border-bottom:1px solid var(--line); z-index:2; }
+#bar button { font:inherit; font-size:15px; border:0; border-radius:9px; padding:7px 12px; background:var(--chip); color:var(--text); }
+#bar button.on { background:var(--text); color:var(--paper); }
+#info { font-size:13px; color:var(--muted); margin-left:auto; }
+canvas { position:fixed; inset:0; touch-action:none; display:block;
+  background-image:repeating-linear-gradient(to bottom, transparent 0 31px, var(--line) 31px 32px); }
+</style>
+</head>
+<body>
+<div id="bar">
+  <button id="pen" class="on">Stift</button>
+  <button id="eraser">Radierer</button>
+  <button id="finger">Finger zeichnet: aus</button>
+  <button id="clear">Leeren</button>
+  <span id="info">Mit dem Pencil schreiben</span>
+</div>
+<canvas id="c"></canvas>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const info = document.getElementById('info');
+let strokes = [], cur = null, tool = 'pen', fingerDraws = false, dpr = 1;
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  cv.width = innerWidth * dpr; cv.height = innerHeight * dpr;
+  cv.style.width = innerWidth + 'px'; cv.style.height = innerHeight + 'px';
+  redraw();
+}
+
+// Strichbreite aus dem Druck; Maus und Finger haben keinen Druck (0.5)
+const width = p => 0.8 + 3.2 * (p || 0.5);
+
+function seg(a, b) {
+  ctx.lineWidth = width((a.p + b.p) / 2) * dpr;
+  ctx.beginPath(); ctx.moveTo(a.x * dpr, a.y * dpr); ctx.lineTo(b.x * dpr, b.y * dpr); ctx.stroke();
+}
+function drawStroke(s) {
+  ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--ink');
+  ctx.lineCap = ctx.lineJoin = 'round';
+  if (s.pts.length === 1) seg(s.pts[0], s.pts[0]);
+  for (let i = 1; i < s.pts.length; i++) seg(s.pts[i - 1], s.pts[i]);
+}
+function redraw() { ctx.clearRect(0, 0, cv.width, cv.height); strokes.forEach(drawStroke); }
+
+function accepts(e) { return e.pointerType === 'pen' || e.pointerType === 'mouse' || fingerDraws; }
+const pt = e => ({ x: e.clientX, y: e.clientY, p: e.pointerType === 'pen' ? e.pressure : 0.5 });
+
+function eraseAt(x, y) {
+  const n = strokes.length;
+  strokes = strokes.filter(s => !s.pts.some(q => Math.hypot(q.x - x, q.y - y) < 12));
+  if (strokes.length !== n) redraw();
+}
+
+cv.addEventListener('pointerdown', e => {
+  if (!accepts(e)) return;
+  e.preventDefault(); cv.setPointerCapture(e.pointerId);
+  info.textContent = 'Eingabe: ' + e.pointerType + (e.pointerType === 'pen' ? ', Druck ' + e.pressure.toFixed(2) : '');
+  if (tool === 'eraser') { cur = { erase: true, id: e.pointerId }; eraseAt(e.clientX, e.clientY); return; }
+  cur = { id: e.pointerId, pts: [pt(e)] }; strokes.push(cur); drawStroke(cur);
+});
+cv.addEventListener('pointermove', e => {
+  if (!cur || e.pointerId !== cur.id) return;
+  // Zwischenpunkte holen: der Pencil liefert bis zu 240 Punkte pro Sekunde
+  const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  for (const ev of (evs.length ? evs : [e])) {
+    if (cur.erase) { eraseAt(ev.clientX, ev.clientY); continue; }
+    const q = pt(ev), last = cur.pts[cur.pts.length - 1];
+    cur.pts.push(q); seg(last, q);
+  }
+});
+function end(e) { if (cur && e.pointerId === cur.id) cur = null; }
+cv.addEventListener('pointerup', end);
+cv.addEventListener('pointercancel', end);
+
+const btn = id => document.getElementById(id);
+btn('pen').onclick = () => { tool = 'pen'; btn('pen').classList.add('on'); btn('eraser').classList.remove('on'); };
+btn('eraser').onclick = () => { tool = 'eraser'; btn('eraser').classList.add('on'); btn('pen').classList.remove('on'); };
+btn('finger').onclick = () => { fingerDraws = !fingerDraws; btn('finger').textContent = 'Finger zeichnet: ' + (fingerDraws ? 'an' : 'aus'); };
+btn('clear').onclick = () => { strokes = []; redraw(); };
+addEventListener('resize', resize);
+resize();
+</script>
+</body>
+</html>
