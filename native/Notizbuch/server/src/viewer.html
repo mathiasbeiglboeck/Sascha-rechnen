@@ -173,6 +173,7 @@ function notebookPagesNeeded() {
 }
 function buildPages() {
   const holder = document.getElementById("pages");
+  lastWidth = holder.clientWidth;
   scale = Math.min(holder.clientWidth || innerWidth, 1100) / W;
   while (els.length < frames.length) {
     const div = document.createElement("div"); div.className = "page";
@@ -225,9 +226,11 @@ async function renderBackground(el) {
     const page = await pdf.getPage(el.index + 1);
     const vp = page.getViewport({ scale: el.bg.width / page.getViewport({ scale: 1 }).width });
     if (!el.live) return;
-    el.task = page.render({ canvasContext: ctx, viewport: vp });
-    try { await el.task.promise; } catch {} // abgebrochen, weil die Seite aus dem Blick ist
-    el.task = null;
+    const task = page.render({ canvasContext: ctx, viewport: vp });
+    el.task = task;
+    try { await task.promise; } catch {} // abgebrochen, weil die Seite aus dem Blick ist
+    if (el.task === task) el.task = null;
+    page.cleanup(); // pdf.js hält sonst Daten jeder je gezeigten Seite
   } else {
     ctx.strokeStyle = "#d1d1d1"; ctx.lineWidth = Math.max(1, 0.5 * s);
     ctx.beginPath();
@@ -432,7 +435,15 @@ async function load(reload) {
 }
 
 let resizeTimer;
-addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(buildPages, 200); });
+// Safari am iPad meldet „resize“ auch, wenn nur die Leisten einklappen: dann nichts neu anlegen
+let lastWidth = 0;
+addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    const w = document.getElementById("pages").clientWidth;
+    if (w !== lastWidth) { lastWidth = w; buildPages(); }
+  }, 200);
+});
 load(false).then(connect).catch(() => {});
 </script>
 </body>
