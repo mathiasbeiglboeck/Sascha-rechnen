@@ -42,9 +42,9 @@ struct LibraryView: View {
                 }
             }
             .refreshable { await sync.syncLibrary() }
-            // Bibliothek alle 20 Sekunden abgleichen, solange die Übersicht sichtbar ist
-            .task(id: openDoc == nil) {
-                guard openDoc == nil else { return }
+            // Bibliothek alle 20 Sekunden abgleichen, auch während ein Dokument offen ist
+            // (sonst erfährt das andere Gerät erst nach dem Schließen von einem neuen Dokument)
+            .task {
                 while !Task.isCancelled {
                     await sync.syncLibrary()
                     try? await Task.sleep(for: .seconds(20))
@@ -70,12 +70,16 @@ struct LibraryView: View {
                 }
                 ToolbarItemGroup(placement: .primaryAction) {
                     Button { importing = true } label: { Label("PDF importieren", systemImage: "doc.badge.plus") }
-                    Button { openDoc = store.createNotebook() } label: { Label("Neues Notizbuch", systemImage: "square.and.pencil") }
+                    Button {
+                        openDoc = store.createNotebook()
+                        Task { await sync.syncLibrary() }
+                    } label: { Label("Neues Notizbuch", systemImage: "square.and.pencil") }
                 }
             }
             .fileImporter(isPresented: $importing, allowedContentTypes: [.pdf]) { result in
                 do {
                     openDoc = try store.importPDF(from: result.get())
+                    Task { await sync.syncLibrary() }
                 } catch {
                     importError = error.localizedDescription
                 }
