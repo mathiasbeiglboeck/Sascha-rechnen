@@ -1,0 +1,140 @@
+import Foundation
+import PencilKit
+import PDFKit
+import UIKit
+
+enum DocKind: String, Codable {
+    case notebook, pdf
+}
+
+/// Ein Notizbuch oder ein PDF mit Notizen. Liegt als Ordner in Dokumente/Notizbuch/<id>/:
+/// meta.json, drawing.data (alle Striche über alle Seiten) und bei PDFs source.pdf.
+struct NoteDocument: Codable, Identifiable, Hashable {
+    var id: UUID
+    var title: String
+    var kind: DocKind
+    var created: Date
+    var modified: Date
+    /// Seitenzahl eines Notizbuchs; bei PDFs bestimmt das PDF die Seiten
+    var pageCount: Int
+}
+
+@MainActor
+final class DocumentStore: ObservableObject {
+    @Published private(set) var documents: [NoteDocument] = []
+    let root: URL
+    private let fm = FileManager.default
+
+    init() {
+        root = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Notizbuch", isDirectory: true)
+        try? fm.createDirectory(at: root, withIntermediateDirectories: true)
+        reload()
+    }
+
+    // MARK: Pfade
+
+    func folder(_ id: UUID) -> URL { root.appendingPathComponent(id.uuidString, isDirectory: true) }
+    func metaURL(_ id: UUID) -> URL { folder(id).appendingPathComponent("meta.json") }
+    func drawingURL(_ id: UUID) -> URL { folder(id).appendingPathComponent("drawing.data") }
+    func pdfURL(_ id: UUID) -> URL { folder(id).appendingPathComponent("source.pdf") }
+
+    // MARK: Liste
+
+    func reload() {
+        let dirs = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
+        let decoder = JSONDecoder()
+        documents = dirs.compactMap { dir in
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent("meta.json")) else { return nil }
+            return try? decoder.decode(NoteDocument.self, from: data)
+        }
+        .sorted { $0.modified > $1.modified }
+    }
+
+    func createNotebook() -> NoteDocument {
+        let now = Date()
+        let doc = NoteDocument(id: UUID(), title: "Notizen " + now.formatted(date: .abbreviated, time: .omitted),
+                               kind: .notebook, created: now, modified: now, pageCount: 1)
+        try? fm.createDirectory(at: folder(doc.id), withIntermediateDirectories: true)
+        save(doc)
+        return doc
+    }
+
+    func importPDF(from url: URL) throws -> NoteDocument {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let now = Date()
+        let doc = NoteDocument(id: UUID(), title: url.deletingPathExtension().lastPathComponent,
+                               kind: .pdf, created: now, modified: now, pageCount: 0)
+        try fm.createDirectory(at: folder(doc.id), withIntermediateDirectories: true)
+        try fm.copyItem(at: url, to: pdfURL(doc.id))
+        save(doc)
+        return doc
+    }
+
+    func save(_ doc: NoteDocument) {
+        if let data = try? JSONEncoder().encode(doc) {
+            try? data.write(to: metaURL(doc.id), options: .atomic)
+        }
+        if let i = documents.firstIndex(where: { $0.id == doc.id }) {
+            documents[i] = doc
+        } else {
+            documents.insert(doc, at: 0)
+        }
+    }
+
+    func rename(_ doc: NoteDocument, to title: String) {
+        var d = doc
+        d.title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !d.title.isEmpty else { return }
+        save(d)
+    }
+
+    func delete(_ doc: NoteDocument) {
+        try? fm.removeItem(at: folder(doc.id))
+        documents.removeAll { $0.id == doc.id }
+    }
+
+    // MARK: Zeichnung
+
+    func loadDrawing(_ id: UUID) -> PKDrawing {
+        guard let data = try? Data(contentsOf: drawingURL(id)) else { return PKDrawing() }
+        return (try? PKDrawing(data: data)) ?? PKDrawing()
+    }
+
+    func saveDrawing(_ drawing: PKDrawing, for id: UUID, pageCount: Int) {
+        try? drawing.dataRepresentation().write(to: drawingURL(id), options: .atomic)
+        guard var doc = documents.first(where: { $0.id == id }) else { return }
+        doc.modified = Date()
+        doc.pageCount = pageCount
+        save(doc)
+    }
+
+    // MARK: Vorschaubild der ersten Seite
+
+    func thumbnail(for doc: NoteDocument, width: CGFloat) -> UIImage? {
+        let pdfPage = doc.kind == .pdf ? CGPDFDocument(pdfURL(doc.id) as CFURL)?.page(at: 1) : nil
+        let layout: PageLayout
+        if let pdfPage { layout = .stack([PageLayout.height(of: pdfPage)]) } else { layout = .notebook(pages: 1) }
+        guard let page = layout.frames.first else { return nil }
+        let scale = width / page.width
+        let size = CGSize(width: width, height: page.height * scale)
+        let drawing = loadDrawing(doc.id)
+        return UIGraphicsImageRenderer(size: size).image { r in
+            let ctx = r.cgContext
+            UIColor.white.setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+            ctx.saveGState()
+            ctx.scaleBy(x: scale, y: scale)
+            if let pdfPage {
+                PageView.drawPDF(pdfPage, in: ctx, size: page.size)
+            } else {
+                PageView.drawGrid(in: ctx, rect: CGRect(origin: .zero, size: page.size), lineWidth: 1)
+            }
+            ctx.restoreGState()
+            UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
+                drawing.image(from: page, scale: scale * 2).draw(in: CGRect(origin: .zero, size: size))
+            }
+        }
+    }
+}
