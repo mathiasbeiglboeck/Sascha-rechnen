@@ -17,6 +17,8 @@ struct NoteDocument: Codable, Identifiable, Hashable {
     var modified: Date
     /// Seitenzahl eines Notizbuchs; bei PDFs bestimmt das PDF die Seiten
     var pageCount: Int
+    /// Version des Seitenlayouts, mit dem die Striche gespeichert sind (fehlt = 1)
+    var layoutVersion: Int?
 }
 
 @MainActor
@@ -54,7 +56,8 @@ final class DocumentStore: ObservableObject {
     func createNotebook() -> NoteDocument {
         let now = Date()
         let doc = NoteDocument(id: UUID(), title: "Notizen " + now.formatted(date: .abbreviated, time: .omitted),
-                               kind: .notebook, created: now, modified: now, pageCount: 1)
+                               kind: .notebook, created: now, modified: now, pageCount: 1,
+                               layoutVersion: PageLayout.currentVersion)
         try? fm.createDirectory(at: folder(doc.id), withIntermediateDirectories: true)
         save(doc)
         return doc
@@ -65,7 +68,8 @@ final class DocumentStore: ObservableObject {
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         let now = Date()
         let doc = NoteDocument(id: UUID(), title: url.deletingPathExtension().lastPathComponent,
-                               kind: .pdf, created: now, modified: now, pageCount: 0)
+                               kind: .pdf, created: now, modified: now, pageCount: 0,
+                               layoutVersion: PageLayout.currentVersion)
         try fm.createDirectory(at: folder(doc.id), withIntermediateDirectories: true)
         try fm.copyItem(at: url, to: pdfURL(doc.id))
         save(doc)
@@ -97,9 +101,26 @@ final class DocumentStore: ObservableObject {
 
     // MARK: Zeichnung
 
-    func loadDrawing(_ id: UUID) -> PKDrawing {
-        guard let data = try? Data(contentsOf: drawingURL(id)) else { return PKDrawing() }
-        return (try? PKDrawing(data: data)) ?? PKDrawing()
+    func loadDrawing(_ doc: NoteDocument) -> PKDrawing {
+        guard let data = try? Data(contentsOf: drawingURL(doc.id)),
+              let drawing = try? PKDrawing(data: data) else { return PKDrawing() }
+        guard (doc.layoutVersion ?? 1) < PageLayout.currentVersion else { return drawing }
+        // Version 1 hatte 24 Punkte Abstand zwischen den Seiten: Striche mit ihrer Seite verschieben
+        let old: PageLayout, new: PageLayout
+        if doc.kind == .pdf, let pdf = CGPDFDocument(pdfURL(doc.id) as CFURL) {
+            old = .pdf(pdf, gap: 24)
+            new = .pdf(pdf)
+        } else {
+            old = .notebook(pages: doc.pageCount, gap: 24)
+            new = .notebook(pages: doc.pageCount)
+        }
+        let migrated = new.migrate(drawing, from: old)
+        try? migrated.dataRepresentation().write(to: drawingURL(doc.id), options: .atomic)
+        var d = doc
+        d.layoutVersion = PageLayout.currentVersion
+        if let data = try? JSONEncoder().encode(d) { try? data.write(to: metaURL(d.id), options: .atomic) }
+        if let i = documents.firstIndex(where: { $0.id == d.id }) { documents[i].layoutVersion = d.layoutVersion }
+        return migrated
     }
 
     func saveDrawing(_ drawing: PKDrawing, for id: UUID, pageCount: Int) {
@@ -119,7 +140,7 @@ final class DocumentStore: ObservableObject {
         guard let page = layout.frames.first else { return nil }
         let scale = width / page.width
         let size = CGSize(width: width, height: page.height * scale)
-        let drawing = loadDrawing(doc.id)
+        let drawing = loadDrawing(doc)
         return UIGraphicsImageRenderer(size: size).image { r in
             let ctx = r.cgContext
             UIColor.white.setFill()

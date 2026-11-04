@@ -1,30 +1,47 @@
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 import PencilKit
 
 /// Die Schreibfläche: ein PKCanvasView (scrollt und zoomt selbst), darunter die Seiten.
-/// Der Finger scrollt, nur der Pencil schreibt (am iPhone schreibt auch der Finger, gescrollt wird dort mit zwei Fingern).
+/// Am iPad schreibt nur der Pencil, der Finger scrollt; am iPhone schreibt auch der Finger, gescrollt wird mit zwei.
+///
+/// Gespeichert wird in Seitenpunkten (Seite = 768 breit). Auf dem Bildschirm liegt die Zeichnung
+/// dagegen in Bildschirmpunkten (Faktor `k`), damit PencilKit bei Zoom 1 nativ und scharf rendert
+/// und nicht ein kleineres Bild hochskaliert.
 final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilInteractionDelegate {
     var onToggleMenus: () -> Void = {}
     var onToggleEraser: () -> Void = {}
 
-    private let docID: UUID
-    private let kind: DocKind
+    private let doc: NoteDocument
     private let store: DocumentStore
     private let canvas = PKCanvasView()
     private let pagesView = UIView()
     private var pdf: CGPDFDocument?
     private var pageCount: Int
     private var layout = PageLayout.notebook(pages: 1)
-    private var fitScale: CGFloat = 1
-    private var lastWidth: CGFloat = 0
+    /// Bildschirmpunkte pro Seitenpunkt bei Zoom 1 (Seite füllt die Breite)
+    private var k: CGFloat = 0
     private var pendingSave: DispatchWorkItem?
     private var dirty = false
+    private var settingDrawing = false
+
+    private var inkColor = UIColor.black
+    private var inkWidth: CGFloat = 2
+    private var erasing = false
+    private var lasso = false
+    private let eraserGesture = EraserGesture()
+    private let eraserCursor = UIView()
+    private var eraseStart: PKDrawing?
+    private var lastErasePoint: CGPoint?
+    /// Radius des Radierers in Bildschirmpunkten
+    private static let eraserRadius: CGFloat = 8
+
+    private var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
 
     init(doc: NoteDocument, store: DocumentStore) {
-        docID = doc.id
-        kind = doc.kind
-        pageCount = max(doc.pageCount, 1)
+        self.doc = doc
         self.store = store
+        pageCount = max(doc.pageCount, 1)
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -39,11 +56,20 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         canvas.backgroundColor = .clear
         canvas.isOpaque = false
         canvas.overrideUserInterfaceStyle = .light
-        canvas.drawingPolicy = UIDevice.current.userInterfaceIdiom == .pad ? .pencilOnly : .anyInput
+        canvas.drawingPolicy = isPad ? .pencilOnly : .anyInput
         canvas.alwaysBounceVertical = true
         canvas.showsHorizontalScrollIndicator = false
+        // Feste Ränder statt Safe Area: sonst springt die Seite, wenn Statusleiste und Menü ein- oder ausblenden
+        canvas.contentInsetAdjustmentBehavior = .never
+        canvas.minimumZoomScale = 1
+        canvas.maximumZoomScale = 4
         canvas.delegate = self
-        canvas.drawing = store.loadDrawing(docID)
+        if isPad {
+            // Der Pencil soll nie scrollen, nur schreiben oder radieren
+            canvas.panGestureRecognizer.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        } else {
+            canvas.panGestureRecognizer.minimumNumberOfTouches = 2
+        }
         view.addSubview(canvas)
 
         // Die Seiten liegen im Scrollbereich hinter der Tinte und werden beim Zoomen mitskaliert
@@ -51,11 +77,28 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         pagesView.layer.anchorPoint = .zero
         canvas.insertSubview(pagesView, at: 0)
 
-        if kind == .pdf {
-            pdf = CGPDFDocument(store.pdfURL(docID) as CFURL)
+        // Eigener Radierer: kleiner Kreis, löscht jeden Strich, den der Kreis berührt
+        eraserGesture.addTarget(self, action: #selector(handleErase(_:)))
+        eraserGesture.isEnabled = false
+        if isPad { eraserGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)] }
+        canvas.addGestureRecognizer(eraserGesture)
+
+        let hover = UIHoverGestureRecognizer(target: self, action: #selector(handleHover(_:)))
+        canvas.addGestureRecognizer(hover)
+
+        let d = Self.eraserRadius * 2
+        eraserCursor.frame = CGRect(x: 0, y: 0, width: d, height: d)
+        eraserCursor.layer.cornerRadius = Self.eraserRadius
+        eraserCursor.layer.borderWidth = 1.5
+        eraserCursor.layer.borderColor = UIColor(white: 0.35, alpha: 0.9).cgColor
+        eraserCursor.backgroundColor = UIColor(white: 1, alpha: 0.35)
+        eraserCursor.isUserInteractionEnabled = false
+        eraserCursor.isHidden = true
+        view.addSubview(eraserCursor)
+
+        if doc.kind == .pdf {
+            pdf = CGPDFDocument(store.pdfURL(doc.id) as CFURL)
         }
-        relayout()
-        growIfNeeded()
 
         let pencil = UIPencilInteraction()
         pencil.delegate = self
@@ -68,15 +111,29 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         let w = canvas.bounds.width
-        guard w > 0, w != lastWidth else { return }
-        // Seitenbreite = Bildschirmbreite; die relative Zoomstufe bleibt beim Drehen erhalten
-        let relative = lastWidth == 0 ? 1 : canvas.zoomScale / fitScale
-        lastWidth = w
-        fitScale = w / PageLayout.width
-        canvas.minimumZoomScale = fitScale
-        canvas.maximumZoomScale = fitScale * 4
-        canvas.zoomScale = fitScale * relative
-        updateContentSize()
+        guard w > 0 else { return }
+        let newK = w / PageLayout.width
+        guard abs(newK - k) > 0.0001 else { return }
+
+        if k == 0 {
+            // Erstes Layout: Ränder einmalig festlegen und Zeichnung laden
+            let top = view.safeAreaInsets.top + 56
+            canvas.contentInset = UIEdgeInsets(top: top, left: 0, bottom: view.safeAreaInsets.bottom + 24, right: 0)
+            canvas.verticalScrollIndicatorInsets = canvas.contentInset
+            setDrawing(store.loadDrawing(doc).transformed(using: CGAffineTransform(scaleX: newK, y: newK)))
+            k = newK
+            relayout()
+            growIfNeeded()
+            canvas.contentOffset = CGPoint(x: 0, y: -top)
+        } else {
+            // Drehen: Zeichnung auf die neue Breite umrechnen
+            let f = newK / k
+            setDrawing(canvas.drawing.transformed(using: CGAffineTransform(scaleX: f, y: f)))
+            canvas.undoManager?.removeAllActions()
+            k = newK
+            updateContentSize()
+        }
+        applyTool()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -84,18 +141,120 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         saveNow()
     }
 
+    private func setDrawing(_ drawing: PKDrawing) {
+        settingDrawing = true
+        canvas.drawing = drawing
+        settingDrawing = false
+    }
+
     // MARK: Werkzeuge
 
-    func apply(color: UIColor, width: CGFloat, eraser: Bool) {
-        if eraser {
-            if !(canvas.tool is PKEraserTool) { canvas.tool = PKEraserTool(.vector) }
+    func apply(color: UIColor, width: CGFloat, mode: ToolMode) {
+        inkColor = color
+        inkWidth = width
+        erasing = mode == .eraser
+        lasso = mode == .lasso
+        applyTool()
+    }
+
+    private func applyTool() {
+        // Lasso von PencilKit: auswählen, verschieben; Antippen der Auswahl zeigt Ausschneiden, Kopieren,
+        // Duplizieren, Löschen; Antippen einer leeren Stelle zeigt Einsetzen
+        if lasso {
+            if !(canvas.tool is PKLassoTool) { canvas.tool = PKLassoTool() }
         } else {
-            canvas.tool = PKInkingTool(.pen, color: color, width: width)
+            canvas.tool = PKInkingTool(.pen, color: inkColor, width: inkWidth * max(k, 0.5))
         }
+        canvas.drawingGestureRecognizer.isEnabled = !erasing
+        eraserGesture.isEnabled = erasing
+        if !erasing { eraserCursor.isHidden = true }
     }
 
     func undo() { canvas.undoManager?.undo() }
     func redo() { canvas.undoManager?.redo() }
+
+    // MARK: Radierer
+
+    @objc private func handleErase(_ g: EraserGesture) {
+        let p = g.location(in: canvas)
+        moveCursor(to: g.location(in: view))
+        switch g.state {
+        case .began:
+            eraseStart = canvas.drawing
+            lastErasePoint = nil
+            erase(at: p)
+        case .changed:
+            erase(at: p)
+        case .ended, .cancelled, .failed:
+            eraserCursor.isHidden = true
+            if let start = eraseStart, start.strokes.count != canvas.drawing.strokes.count {
+                canvas.undoManager?.registerUndo(withTarget: self) { $0.replaceDrawingUndoably(with: start) }
+            }
+            eraseStart = nil
+            lastErasePoint = nil
+        default:
+            break
+        }
+    }
+
+    /// Setzt eine Zeichnung und merkt sich die aktuelle für Wiederholen bzw. Rückgängig
+    private func replaceDrawingUndoably(with drawing: PKDrawing) {
+        let current = canvas.drawing
+        canvas.undoManager?.registerUndo(withTarget: self) { $0.replaceDrawingUndoably(with: current) }
+        canvas.drawing = drawing
+    }
+
+    /// `p` in Scroll-Koordinaten; die Zeichnung liegt in Koordinaten ohne Zoom
+    private func erase(at p: CGPoint) {
+        let z = canvas.zoomScale
+        let center = CGPoint(x: p.x / z, y: p.y / z)
+        let r = Self.eraserRadius / z
+        // Bei schneller Bewegung die Strecke dazwischen mit abtasten
+        var samples = [center]
+        if let last = lastErasePoint {
+            let dist = hypot(center.x - last.x, center.y - last.y)
+            let n = Int(dist / r)
+            if n > 0 {
+                samples = (1...n).map { i in
+                    let t = CGFloat(i) / CGFloat(n + 1)
+                    return CGPoint(x: last.x + (center.x - last.x) * t, y: last.y + (center.y - last.y) * t)
+                } + [center]
+            }
+        }
+        lastErasePoint = center
+
+        var strokes = canvas.drawing.strokes
+        let before = strokes.count
+        strokes.removeAll { stroke in samples.contains { Self.stroke(stroke, hits: $0, radius: r) } }
+        if strokes.count != before {
+            canvas.drawing = PKDrawing(strokes: strokes)
+        }
+    }
+
+    private static func stroke(_ stroke: PKStroke, hits c: CGPoint, radius r: CGFloat) -> Bool {
+        let box = CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r)
+        guard stroke.renderBounds.intersects(box) else { return false }
+        let t = stroke.transform
+        let scale = hypot(t.a, t.b)
+        for point in stroke.path.interpolatedPoints(by: .distance(max(r / 2, 0.5))) {
+            let q = point.location.applying(t)
+            if hypot(q.x - c.x, q.y - c.y) <= r + point.size.width * scale / 2 { return true }
+        }
+        return false
+    }
+
+    @objc private func handleHover(_ g: UIHoverGestureRecognizer) {
+        guard erasing, eraseStart == nil else { return }
+        switch g.state {
+        case .began, .changed: moveCursor(to: g.location(in: view))
+        default: eraserCursor.isHidden = true
+        }
+    }
+
+    private func moveCursor(to p: CGPoint) {
+        eraserCursor.center = p
+        eraserCursor.isHidden = false
+    }
 
     // MARK: Pencil Pro: Drücken blendet die Menüs aus, Doppeltippen wechselt zum Radierer
 
@@ -126,30 +285,24 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         for i in pagesView.subviews.count..<layout.frames.count {
             let content: PageView.Content
             if let pdf, let page = pdf.page(at: i + 1) { content = .pdf(page) } else { content = .grid }
-            let page = PageView(frame: layout.frames[i], content: content)
-            page.layer.shadowColor = UIColor.black.cgColor
-            page.layer.shadowOpacity = 0.12
-            page.layer.shadowRadius = 3
-            page.layer.shadowOffset = CGSize(width: 0, height: 1)
-            page.layer.shadowPath = UIBezierPath(rect: page.bounds).cgPath
-            pagesView.addSubview(page)
+            pagesView.addSubview(PageView(frame: layout.frames[i], content: content))
         }
         updateContentSize()
     }
 
     private func updateContentSize() {
-        let z = canvas.zoomScale
+        let s = k * canvas.zoomScale
         pagesView.transform = .identity
         pagesView.bounds = CGRect(x: 0, y: 0, width: PageLayout.width, height: layout.totalHeight)
         pagesView.layer.position = .zero
-        pagesView.transform = CGAffineTransform(scaleX: z, y: z)
-        canvas.contentSize = CGSize(width: PageLayout.width * z, height: layout.totalHeight * z)
+        pagesView.transform = CGAffineTransform(scaleX: s, y: s)
+        canvas.contentSize = CGSize(width: PageLayout.width * s, height: layout.totalHeight * s)
     }
 
     /// Im Notizbuch kommt eine neue leere Seite dazu, sobald auf der letzten geschrieben wird
     private func growIfNeeded() {
-        guard pdf == nil, !canvas.drawing.strokes.isEmpty else { return }
-        let bottom = canvas.drawing.bounds.maxY
+        guard pdf == nil, k > 0, !canvas.drawing.strokes.isEmpty else { return }
+        let bottom = canvas.drawing.bounds.maxY / k
         var grew = false
         while let last = PageLayout.notebook(pages: pageCount).frames.last, bottom > last.minY {
             pageCount += 1
@@ -161,6 +314,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     // MARK: PKCanvasViewDelegate
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
+        guard !settingDrawing else { return }
         dirty = true
         growIfNeeded()
         pendingSave?.cancel()
@@ -170,7 +324,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     }
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
-        pagesView.transform = CGAffineTransform(scaleX: scrollView.zoomScale, y: scrollView.zoomScale)
+        let s = k * scrollView.zoomScale
+        pagesView.transform = CGAffineTransform(scaleX: s, y: s)
     }
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
@@ -180,8 +335,28 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     @objc private func saveNow() {
         pendingSave?.cancel()
         pendingSave = nil
-        guard dirty else { return }
+        guard dirty, k > 0 else { return }
         dirty = false
-        store.saveDrawing(canvas.drawing, for: docID, pageCount: pageCount)
+        let pageUnits = canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k))
+        store.saveDrawing(pageUnits, for: doc.id, pageCount: pageCount)
+    }
+}
+
+/// Meldet Berührungen sofort (ohne Mindestbewegung wie beim Pan), damit auch ein kurzes Antippen radiert
+final class EraserGesture: UIGestureRecognizer {
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        state = (state == .possible && touches.count == 1) ? .began : .failed
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        state = .changed
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        state = .ended
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        state = .cancelled
     }
 }

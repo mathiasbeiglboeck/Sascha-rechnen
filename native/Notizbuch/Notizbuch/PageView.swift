@@ -38,8 +38,8 @@ final class PageView: UIView {
         }
     }
 
-    /// 5-mm-Karos: A4 ist 210 mm breit, also 42 Kästchen über die Seitenbreite
-    static let gridStep = PageLayout.width / 42
+    /// 7-mm-Karos: A4 ist 210 mm breit, also 30 Kästchen über die Seitenbreite
+    static let gridStep = PageLayout.width / 30
     static let gridColor = UIColor(white: 0.82, alpha: 1)
 
     static func drawGrid(in ctx: CGContext, rect: CGRect, lineWidth: CGFloat) {

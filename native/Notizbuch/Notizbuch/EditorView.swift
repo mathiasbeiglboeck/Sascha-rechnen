@@ -1,6 +1,10 @@
 import SwiftUI
 import UIKit
 
+enum ToolMode {
+    case pen, eraser, lasso
+}
+
 /// Stift, Farbe, Dicke und ob die Menüs sichtbar sind
 @MainActor
 final class ToolState: ObservableObject {
@@ -16,7 +20,7 @@ final class ToolState: ObservableObject {
 
     @Published var colorIndex = 0
     @Published var widthIndex = 1
-    @Published var eraser = false
+    @Published var mode = ToolMode.pen
     @Published var menusHidden = false
     /// Kurzer Hinweis, wenn bei ausgeblendeten Menüs das Werkzeug wechselt
     @Published var flash: String?
@@ -24,10 +28,11 @@ final class ToolState: ObservableObject {
     weak var canvas: CanvasController?
     private var flashTask: Task<Void, Never>?
 
+    /// Doppeltippen am Pencil: Radierer ↔ Stift (vom Lasso aus zum Radierer)
     func toggleEraser() {
-        eraser.toggle()
+        mode = mode == .eraser ? .pen : .eraser
         guard menusHidden else { return }
-        flash = eraser ? "Radierer" : "Stift"
+        flash = mode == .eraser ? "Radierer" : "Stift"
         flashTask?.cancel()
         flashTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(0.9))
@@ -87,7 +92,7 @@ struct CanvasRepresentable: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: CanvasController, context: Context) {
         controller.apply(color: ToolState.colors[tools.colorIndex],
                          width: ToolState.widths[tools.widthIndex],
-                         eraser: tools.eraser)
+                         mode: tools.mode)
     }
 }
 
@@ -111,13 +116,8 @@ struct ToolBar: View {
                 widthButtons
             }
             divider
-            Button {
-                tools.eraser.toggle()
-            } label: {
-                Image(systemName: "eraser")
-                    .padding(5)
-                    .background(tools.eraser ? Color.primary.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 7))
-            }
+            modeButton(.eraser, symbol: "eraser")
+            modeButton(.lasso, symbol: "lasso")
             Button { tools.canvas?.undo() } label: { Image(systemName: "arrow.uturn.backward") }
             Button { tools.canvas?.redo() } label: { Image(systemName: "arrow.uturn.forward") }
         }
@@ -129,13 +129,23 @@ struct ToolBar: View {
         .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
     }
 
+    private func modeButton(_ mode: ToolMode, symbol: String) -> some View {
+        Button {
+            tools.mode = tools.mode == mode ? .pen : mode
+        } label: {
+            Image(systemName: symbol)
+                .padding(5)
+                .background(tools.mode == mode ? Color.primary.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 7))
+        }
+    }
+
     private var divider: some View {
         Rectangle().fill(Color.primary.opacity(0.15)).frame(width: 1, height: 20)
     }
 
     private var colorButtons: some View {
         ForEach(ToolState.colors.indices, id: \.self) { i in
-            let selected = !tools.eraser && tools.colorIndex == i
+            let selected = tools.mode == .pen && tools.colorIndex == i
             Circle()
                 .fill(Color(uiColor: ToolState.colors[i]))
                 .frame(width: 20, height: 20)
@@ -144,7 +154,7 @@ struct ToolBar: View {
                 .contentShape(Circle())
                 .onTapGesture {
                     tools.colorIndex = i
-                    tools.eraser = false
+                    tools.mode = .pen
                 }
         }
     }
@@ -159,7 +169,7 @@ struct ToolBar: View {
                 .contentShape(Rectangle())
                 .onTapGesture {
                     tools.widthIndex = i
-                    tools.eraser = false
+                    tools.mode = .pen
                 }
         }
     }
@@ -171,7 +181,7 @@ struct ToolBar: View {
                 ForEach(ToolState.colors.indices, id: \.self) { i in
                     Button {
                         tools.colorIndex = i
-                        tools.eraser = false
+                        tools.mode = .pen
                     } label: {
                         Label(["Schwarz", "Blau", "Rot", "Grün", "Orange"][i], systemImage: "circle.fill")
                     }
@@ -183,7 +193,7 @@ struct ToolBar: View {
                 ForEach(ToolState.widths.indices, id: \.self) { i in
                     Button("Dicke \(i + 1)") {
                         tools.widthIndex = i
-                        tools.eraser = false
+                        tools.mode = .pen
                     }
                 }
             } label: {
