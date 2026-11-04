@@ -57,3 +57,14 @@ struct PageLayout {
         return PKDrawing(strokes: strokes)
     }
 }
+
+extension PageLayout {
+    /// Seitenzahl eines Notizbuchs, damit alle Striche (Seitenpunkte) auf einer Seite liegen
+    static func pagesNeeded(for drawing: PKDrawing, kind: DocKind, current: Int) -> Int {
+        guard kind == .notebook, !drawing.strokes.isEmpty else { return current }
+        let bottom = drawing.bounds.maxY
+        var n = max(current, 1)
+        while let last = notebook(pages: n).frames.last, bottom > last.minY { n += 1 }
+        return n
+    }
+}

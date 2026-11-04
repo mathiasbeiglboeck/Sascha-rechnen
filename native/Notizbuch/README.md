@@ -8,7 +8,7 @@ Handschriftliche Notizen auf dünn grau kariertem A4 und Notizen auf PDFs, mit P
 - Apple Pencil Pro: **Drücken** blendet alle Menüs aus und wieder ein, **Doppeltippen** wechselt zwischen Stift und Radierer.
 - Daten: `Dokumente/Notizbuch/<id>/` mit `meta.json`, `drawing.data` (PKDrawing über alle Seiten, 768 Punkte breites Seitenkoordinatensystem) und bei PDFs `source.pdf`. Der Ordner ist in der Dateien-App unter „Auf meinem iPad > Notizbuch“ sichtbar.
 
-Geplant: Sync iPhone ↔ iPad und Teilen per Link über einen Cloudflare-Server.
+Sync zwischen iPad und iPhone und der Briefkasten für KI-Agenten laufen über den Server in `server/` (Einrichtung dort im README, Nutzung in `BRIEFKASTEN.md`).
 
 ## Bauen und installieren (AltStore)
 1. `./build-ipa.sh` baut `build/Notizbuch.ipa` ohne Signatur.

@@ -29,6 +29,16 @@ final class ToolState: ObservableObject {
     private var flashTask: Task<Void, Never>?
 
     /// Doppeltippen am Pencil: Radierer ↔ Stift (vom Lasso aus zum Radierer)
+    func show(_ message: String, seconds: Double = 1.6) {
+        flash = message
+        flashTask?.cancel()
+        flashTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled else { return }
+            self?.flash = nil
+        }
+    }
+
     func toggleEraser() {
         mode = mode == .eraser ? .pen : .eraser
         guard menusHidden else { return }
@@ -45,12 +55,13 @@ final class ToolState: ObservableObject {
 struct EditorView: View {
     let doc: NoteDocument
     @EnvironmentObject private var store: DocumentStore
+    @EnvironmentObject private var sync: SyncEngine
     @Environment(\.dismiss) private var dismiss
     @StateObject private var tools = ToolState()
 
     var body: some View {
         ZStack(alignment: .top) {
-            CanvasRepresentable(doc: doc, store: store, tools: tools)
+            CanvasRepresentable(doc: doc, store: store, sync: sync, tools: tools)
                 .ignoresSafeArea()
 
             if !tools.menusHidden {
@@ -65,7 +76,7 @@ struct EditorView: View {
                     .font(.callout.weight(.medium))
                     .padding(.horizontal, 14).padding(.vertical, 7)
                     .background(.ultraThinMaterial, in: Capsule())
-                    .padding(.top, 10)
+                    .padding(.top, tools.menusHidden ? 10 : 64)
                     .transition(.opacity)
             }
         }
@@ -79,10 +90,12 @@ struct EditorView: View {
 struct CanvasRepresentable: UIViewControllerRepresentable {
     let doc: NoteDocument
     let store: DocumentStore
+    let sync: SyncEngine
     @ObservedObject var tools: ToolState
 
     func makeUIViewController(context: Context) -> CanvasController {
-        let controller = CanvasController(doc: doc, store: store)
+        let controller = CanvasController(doc: doc, store: store, sync: sync)
+        controller.onFlash = { [weak tools] in tools?.show($0) }
         controller.onToggleMenus = { [weak tools] in tools?.menusHidden.toggle() }
         controller.onToggleEraser = { [weak tools] in tools?.toggleEraser() }
         tools.canvas = controller
@@ -125,6 +138,8 @@ struct ToolBar: View {
                 Button { share(.pagePDF) } label: { Label("Diese Seite als PDF", systemImage: "doc") }
                 Button { share(.pageImage) } label: { Label("Diese Seite als Bild", systemImage: "photo") }
                 Button { share(.documentPDF) } label: { Label("Alles als PDF", systemImage: "doc.on.doc") }
+                Divider()
+                Button { share(.sendToAI) } label: { Label("Seite an KI senden", systemImage: "tray.and.arrow.up") }
             } label: {
                 Image(systemName: "square.and.arrow.up")
             }

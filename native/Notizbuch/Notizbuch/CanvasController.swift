@@ -11,9 +11,11 @@ import PencilKit
 final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilInteractionDelegate {
     var onToggleMenus: () -> Void = {}
     var onToggleEraser: () -> Void = {}
+    var onFlash: (String) -> Void = { _ in }
 
     let doc: NoteDocument
     private let store: DocumentStore
+    private let sync: SyncEngine
     let canvas = PKCanvasView()
     private let pagesView = UIView()
     private(set) var pdf: CGPDFDocument?
@@ -38,9 +40,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     private var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
 
-    init(doc: NoteDocument, store: DocumentStore) {
+    init(doc: NoteDocument, store: DocumentStore, sync: SyncEngine) {
         self.doc = doc
         self.store = store
+        self.sync = sync
         pageCount = max(doc.pageCount, 1)
         super.init(nibName: nil, bundle: nil)
     }
@@ -106,6 +109,18 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
         NotificationCenter.default.addObserver(self, selector: #selector(saveNow),
                                                name: UIApplication.willResignActiveNotification, object: nil)
+
+        // Ab jetzt landen entfernte Änderungen an diesem Dokument hier statt in der Datei
+        sync.openController = self
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        syncTimer?.invalidate()
+        syncTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.syncCycle() }
+        }
+        syncCycle()
     }
 
     override func viewDidLayoutSubviews() {
@@ -138,7 +153,60 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        syncTimer?.invalidate()
+        syncTimer = nil
+        applyPending()
         saveNow()
+        if sync.openController === self { sync.openController = nil }
+        let sync = self.sync, id = doc.id
+        Task { await sync.syncClosed(id) }
+    }
+
+    // MARK: Sync: alle 3 Sekunden eigene Änderungen schicken und fremde holen
+
+    private var syncTimer: Timer?
+    private var localChanged = true
+    private var usingTool = false
+    private var pending = RemoteChanges()
+
+    private func pageDrawing() -> PKDrawing {
+        canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k))
+    }
+
+    private func syncCycle() {
+        guard sync.isConfigured, k > 0, !sync.isBusy(doc.id), UIApplication.shared.applicationState == .active else { return }
+        // Fremde Änderungen müssen drin sein, bevor der eigene Stand verglichen wird
+        if !pending.isEmpty {
+            guard !usingTool else { return }
+            applyPending()
+        }
+        let snapshot = localChanged ? pageDrawing() : nil
+        localChanged = false
+        let sync = self.sync, id = doc.id
+        Task { [weak self] in
+            let ok = await sync.syncStrokes(id, snapshot: snapshot)
+            if !ok, snapshot != nil { self?.localChanged = true }
+        }
+    }
+
+    /// Entfernte Änderungen; während der Pencil schreibt, warten sie, bis er absetzt
+    func enqueue(_ changes: RemoteChanges) {
+        pending.merge(changes)
+        if !usingTool { applyPending() }
+    }
+
+    private func applyPending() {
+        guard !pending.isEmpty, k > 0 else { return }
+        let changes = pending
+        pending = RemoteChanges()
+        guard let merged = StrokeCodec.apply(changes, to: pageDrawing()) else { return }
+        setDrawing(merged.transformed(using: CGAffineTransform(scaleX: k, y: k)))
+        // Alte Rückgängig-Schritte würden fremde Striche wieder entfernen
+        canvas.undoManager?.removeAllActions()
+        growIfNeeded()
+        dirty = false
+        pendingSave?.cancel()
+        store.saveDrawing(merged, for: doc.id, pageCount: pageCount)
     }
 
     /// Stand der Zeichnung nach dem Laden bzw. letzten Speichern; gleicher Stand wird nicht erneut gespeichert
@@ -184,6 +252,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         moveCursor(to: g.location(in: view))
         switch g.state {
         case .began:
+            usingTool = true
             lockScrolling()
             eraseStart = canvas.drawing
             lastErasePoint = nil
@@ -191,6 +260,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         case .changed:
             erase(at: p)
         case .ended, .cancelled, .failed:
+            usingTool = false
             unlockScrollingSoon()
             eraserCursor.isHidden = true
             if let start = eraseStart, start.strokes.count != canvas.drawing.strokes.count {
@@ -283,8 +353,16 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
     }
 
-    func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) { lockScrolling() }
-    func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) { unlockScrollingSoon() }
+    func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
+        usingTool = true
+        lockScrolling()
+    }
+
+    func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
+        usingTool = false
+        unlockScrollingSoon()
+        applyPending()
+    }
 
     private func moveCursor(to p: CGPoint) {
         eraserCursor.center = p
@@ -351,6 +429,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
         guard !settingDrawing else { return }
         dirty = true
+        localChanged = true
         growIfNeeded()
         pendingSave?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.saveNow() }
@@ -403,7 +482,7 @@ final class EraserGesture: UIGestureRecognizer {
 // MARK: Teilen: Seite oder ganzes Dokument als PDF oder Bild
 
 enum ShareKind {
-    case pagePDF, pageImage, documentPDF
+    case pagePDF, pageImage, documentPDF, sendToAI
 }
 
 extension CanvasController {
@@ -419,9 +498,15 @@ extension CanvasController {
         saveNow()
         let ink = canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k))
         let i = currentPageIndex
+        if kind == .sendToAI {
+            sendPageToAI(i, ink: ink)
+            return
+        }
         let name: String
         let data: Data
         switch kind {
+        case .sendToAI:
+            return
         case .pagePDF:
             name = "\(doc.title) – Seite \(i + 1).pdf"
             data = pdfData(pages: [i], ink: ink)
@@ -444,6 +529,32 @@ extension CanvasController {
         sheet.popoverPresentationController?.sourceView = view
         sheet.popoverPresentationController?.sourceRect = sourceRect
         present(sheet, animated: true)
+    }
+
+    /// Legt die Seite als PDF und als Bild in den Ausgang des Briefkastens, wo Claude oder Codex sie abholen
+    private func sendPageToAI(_ i: Int, ink: PKDrawing) {
+        guard sync.isConfigured else {
+            onFlash("Erst den Server einrichten (Zahnrad in der Übersicht)")
+            return
+        }
+        let base = "\(doc.title) – Seite \(i + 1)"
+        let pdf = pdfData(pages: [i], ink: ink)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 2
+        let png = UIGraphicsImageRenderer(size: layout.frames[i].size, format: format).pngData { c in
+            drawPage(i, ink: ink, in: c.cgContext)
+        }
+        onFlash("Wird gesendet …")
+        let sync = self.sync
+        Task { [weak self] in
+            do {
+                try await sync.sendToOutbox(name: base + ".pdf", data: pdf, type: "application/pdf")
+                try await sync.sendToOutbox(name: base + ".png", data: png, type: "image/png")
+                self?.onFlash("Seite \(i + 1) liegt im Ausgang")
+            } catch {
+                self?.onFlash("Senden fehlgeschlagen: \(error.localizedDescription)")
+            }
+        }
     }
 
     /// PDF in echter Größe: Notizbuchseiten als A4, PDF-Seiten in ihrer Originalgröße
