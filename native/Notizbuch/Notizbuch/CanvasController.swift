@@ -180,12 +180,14 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         moveCursor(to: g.location(in: view))
         switch g.state {
         case .began:
+            lockScrolling()
             eraseStart = canvas.drawing
             lastErasePoint = nil
             erase(at: p)
         case .changed:
             erase(at: p)
         case .ended, .cancelled, .failed:
+            unlockScrollingSoon()
             eraserCursor.isHidden = true
             if let start = eraseStart, start.strokes.count != canvas.drawing.strokes.count {
                 canvas.undoManager?.registerUndo(withTarget: self) { $0.replaceDrawingUndoably(with: start) }
@@ -244,12 +246,41 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     }
 
     @objc private func handleHover(_ g: UIHoverGestureRecognizer) {
-        guard erasing, eraseStart == nil else { return }
         switch g.state {
-        case .began, .changed: moveCursor(to: g.location(in: view))
-        default: eraserCursor.isHidden = true
+        case .began, .changed:
+            lockScrolling()
+            if erasing && eraseStart == nil { moveCursor(to: g.location(in: view)) }
+        default:
+            unlockScrollingSoon()
+            if eraseStart == nil { eraserCursor.isHidden = true }
         }
     }
+
+    // MARK: Handballen: solange der Pencil schwebt oder schreibt, bewegt sich die Seite nicht
+
+    private var unlockWork: DispatchWorkItem?
+
+    private func lockScrolling() {
+        unlockWork?.cancel()
+        unlockWork = nil
+        guard canvas.isScrollEnabled else { return }
+        canvas.isScrollEnabled = false
+        canvas.pinchGestureRecognizer?.isEnabled = false
+    }
+
+    /// Kurz warten: zwischen Schweben und Aufsetzen (und zwischen zwei Wörtern) soll nichts freigegeben werden
+    private func unlockScrollingSoon() {
+        unlockWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.canvas.isScrollEnabled = true
+            self?.canvas.pinchGestureRecognizer?.isEnabled = true
+        }
+        unlockWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+    }
+
+    func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) { lockScrolling() }
+    func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) { unlockScrollingSoon() }
 
     private func moveCursor(to p: CGPoint) {
         eraserCursor.center = p
