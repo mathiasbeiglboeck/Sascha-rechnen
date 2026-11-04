@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Notizbuch</title>
+<style>
+/* Web-Ansicht für Gäste: dieselben Seiten wie in der App, live, und mit der Maus mitzeichnen */
+:root { --bg:#e6e6e1; --bar:#fbfaf6; --text:#23302a; --muted:#7b847e; --line:#dcd8cc; --chip:#ece7da; --accent:#2f6b4f;
+  --f:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",system-ui,sans-serif; }
+* { box-sizing:border-box; }
+html,body { margin:0; background:var(--bg); color:var(--text); font-family:var(--f); }
+#bar { position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  padding:8px 14px; background:var(--bar); border-bottom:1px solid var(--line); }
+#title { font-weight:600; margin-right:auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:40vw; }
+#bar button { font:inherit; font-size:14px; border:0; border-radius:8px; padding:6px 10px; background:var(--chip); color:var(--text); cursor:pointer; }
+#bar button.on { background:var(--text); color:var(--bar); }
+.dot { width:22px; height:22px; border-radius:50%; border:2px solid transparent; cursor:pointer; padding:0; }
+.dot.on { border-color:var(--text); }
+.w { width:26px; height:26px; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; border-radius:6px; }
+.w span { background:var(--muted); border-radius:50%; display:block; }
+.w.on span { background:var(--text); }
+#status { font-size:13px; color:var(--muted); }
+#pages { max-width:1100px; margin:0 auto; padding:6px 0 40px; }
+.page { position:relative; background:#fff; margin:0 auto 6px; }
+.page canvas { position:absolute; inset:0; width:100%; height:100%; }
+.page canvas.ink { touch-action:pan-y; }
+body.drawing .page canvas.ink { cursor:crosshair; }
+#msg { max-width:520px; margin:80px auto; text-align:center; color:var(--muted); line-height:1.5; padding:0 16px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <span id="title">Notizbuch</span>
+  <span id="colors"></span>
+  <span id="widths"></span>
+  <button id="undo" title="Meinen letzten Strich zurücknehmen">↶</button>
+  <button id="follow" class="on" title="Mitscrollen, wo gerade geschrieben wird">Folgen</button>
+  <span id="status">verbinde …</span>
+</div>
+<div id="pages"></div>
+<div id="msg" hidden></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+"use strict";
+const W = 768, GAP = 6, A4H = W * 297 / 210, GRID = W / 30;
+const base = location.pathname.replace(/\/$/, "");
+const COLORS = [[0.8,0.17,0.15],[0.12,0.27,0.64],[0.13,0.52,0.29],[0.1,0.1,0.11]];
+const WIDTHS = [1.6, 2.6, 4.5];
+let color = 0, width = 1, follow = true;
+
+let doc = null;           // {title, kind, pageCount}
+let pdf = null;           // pdf.js-Dokument
+let pageHeights = [];     // in Seitenpunkten
+let frames = [];          // {y, h}
+const strokes = new Map(); // id -> {data, wire, bbox}
+let order = [];           // ids in Reihenfolge
+const mine = [];          // eigene Strich-IDs (für Rückgängig)
+let ws = null, scale = 1;
+const els = [];           // je Seite {div, bg, ink, rendered}
+
+// ---------- Werkzeugleiste ----------
+const colorsEl = document.getElementById("colors"), widthsEl = document.getElementById("widths");
+COLORS.forEach((c, i) => {
+  const b = document.createElement("button");
+  b.className = "dot"; b.style.background = `rgb(${c.map(v => v * 255).join(",")})`;
+  b.onclick = () => { color = i; tools(); };
+  colorsEl.appendChild(b);
+});
+WIDTHS.forEach((w, i) => {
+  const b = document.createElement("span");
+  b.className = "w"; b.innerHTML = `<span style="width:${4 + i * 4}px;height:${4 + i * 4}px"></span>`;
+  b.onclick = () => { width = i; tools(); };
+  widthsEl.appendChild(b);
+});
+function tools() {
+  [...colorsEl.children].forEach((b, i) => b.classList.toggle("on", i === color));
+  [...widthsEl.children].forEach((b, i) => b.classList.toggle("on", i === width));
+}
+tools();
+document.getElementById("follow").onclick = (e) => { follow = !follow; e.target.classList.toggle("on", follow); };
+document.getElementById("undo").onclick = () => {
+  const id = mine.pop();
+  if (!id) return;
+  removeStroke(id);
+  send({ type: "remove", id });
+};
+const status = (t) => (document.getElementById("status").textContent = t);
+function fail(text) {
+  document.getElementById("pages").hidden = true;
+  const m = document.getElementById("msg"); m.hidden = false; m.textContent = text;
+  status("");
+}
+
+// ---------- Striche: gleiches Format und gleiche IDs wie in der App ----------
+function swiftNumber(v) {
+  if (Object.is(v, -0)) return "-0.0";
+  return Number.isInteger(v) ? v.toFixed(1) : String(v);
+}
+async function strokeID(wire) {
+  const geometry = JSON.stringify([wire.ink, ...wire.p.map(p => p.map(swiftNumber).join(","))]);
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(geometry)));
+  return [...hash.slice(0, 12)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+function addStroke(id, data) {
+  let wire;
+  try { wire = JSON.parse(data); } catch { return; }
+  if (!wire.p || !wire.p.length) return;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const p of wire.p) { x0 = Math.min(x0, p[0] - p[3]); x1 = Math.max(x1, p[0] + p[3]); y0 = Math.min(y0, p[1] - p[3]); y1 = Math.max(y1, p[1] + p[3]); }
+  if (!strokes.has(id)) order.push(id);
+  strokes.set(id, { wire, bbox: { x0, y0, x1, y1 } });
+  return { y0, y1 };
+}
+function removeStroke(id) {
+  const s = strokes.get(id);
+  if (!s) return;
+  strokes.delete(id);
+  order = order.filter(o => o !== id);
+  redrawRange(s.bbox.y0, s.bbox.y1);
+}
+
+// ---------- Seiten ----------
+function layout() {
+  frames = []; let y = GAP;
+  for (const h of pageHeights) { frames.push({ y, h }); y += h + GAP; }
+}
+function notebookPagesNeeded() {
+  let maxY = 0; for (const s of strokes.values()) maxY = Math.max(maxY, s.bbox.y1);
+  let n = Math.max(doc.pageCount || 1, 1);
+  while (GAP + (n - 1) * (A4H + GAP) < maxY - 2) n++;
+  return n;
+}
+function buildPages() {
+  const holder = document.getElementById("pages");
+  scale = Math.min(holder.clientWidth || innerWidth, 1100) / W;
+  const dpr = devicePixelRatio || 1;
+  while (els.length < frames.length) {
+    const div = document.createElement("div"); div.className = "page";
+    const bg = document.createElement("canvas"), ink = document.createElement("canvas"); ink.className = "ink";
+    div.append(bg, ink); holder.appendChild(div);
+    const el = { div, bg, ink, rendered: 0, index: els.length };
+    els.push(el); attachDrawing(el); observer.observe(div);
+  }
+  els.forEach((el, i) => {
+    const f = frames[i];
+    el.div.style.width = W * scale + "px"; el.div.style.height = f.h * scale + "px";
+    for (const c of [el.bg, el.ink]) { c.width = Math.round(W * scale * dpr); c.height = Math.round(f.h * scale * dpr); }
+    el.rendered = 0;
+    drawInk(i);
+  });
+  els.forEach((el) => { if (isVisible(el.div)) renderBackground(el); });
+}
+function isVisible(div) { const r = div.getBoundingClientRect(); return r.bottom > -400 && r.top < innerHeight + 400; }
+const observer = new IntersectionObserver((entries) => {
+  for (const e of entries) if (e.isIntersecting) renderBackground(els.find(el => el.div === e.target));
+}, { rootMargin: "400px" });
+
+async function renderBackground(el) {
+  if (!el || el.rendered) return;
+  el.rendered = 1;
+  const ctx = el.bg.getContext("2d"), s = el.bg.width / W;
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, el.bg.width, el.bg.height);
+  if (pdf) {
+    const page = await pdf.getPage(el.index + 1);
+    const vp = page.getViewport({ scale: el.bg.width / page.getViewport({ scale: 1 }).width });
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+  } else {
+    ctx.strokeStyle = "#d1d1d1"; ctx.lineWidth = Math.max(1, 0.5 * s);
+    ctx.beginPath();
+    for (let x = GRID; x < W; x += GRID) { ctx.moveTo(x * s, 0); ctx.lineTo(x * s, el.bg.height); }
+    for (let y = GRID; y < frames[el.index].h; y += GRID) { ctx.moveTo(0, y * s); ctx.lineTo(el.bg.width, y * s); }
+    ctx.stroke();
+  }
+}
+
+function drawWire(ctx, wire, s, offY) {
+  const c = wire.c || [0, 0, 0, 1], p = wire.p;
+  ctx.strokeStyle = ctx.fillStyle = `rgba(${c[0] * 255},${c[1] * 255},${c[2] * 255},${c[3] ?? 1})`;
+  ctx.lineCap = ctx.lineJoin = "round";
+  if (p.length === 1) { ctx.beginPath(); ctx.arc(p[0][0] * s, (p[0][1] - offY) * s, Math.max(p[0][3] * s / 2, 0.5), 0, 7); ctx.fill(); return; }
+  // Glatte Kurve durch die Mittelpunkte der Kontrollpunkte, Breite je Abschnitt
+  for (let i = 1; i < p.length; i++) {
+    const a = p[i - 1], b = p[i];
+    const m0 = i === 1 ? a : [(p[i - 2][0] + a[0]) / 2, (p[i - 2][1] + a[1]) / 2];
+    const m1 = i === p.length - 1 ? b : [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+    ctx.lineWidth = Math.max(((a[3] + b[3]) / 2) * s, 0.6);
+    ctx.beginPath();
+    ctx.moveTo(m0[0] * s, (m0[1] - offY) * s);
+    ctx.quadraticCurveTo(a[0] * s, (a[1] - offY) * s, m1[0] * s, (m1[1] - offY) * s);
+    ctx.stroke();
+  }
+}
+function drawInk(i) {
+  const el = els[i], f = frames[i];
+  if (!el) return;
+  const ctx = el.ink.getContext("2d"), s = el.ink.width / W;
+  ctx.clearRect(0, 0, el.ink.width, el.ink.height);
+  for (const id of order) {
+    const st = strokes.get(id);
+    if (st.bbox.y1 < f.y || st.bbox.y0 > f.y + f.h) continue;
+    drawWire(ctx, st.wire, s, f.y);
+  }
+}
+function redrawRange(y0, y1) {
+  frames.forEach((f, i) => { if (y1 >= f.y && y0 <= f.y + f.h) drawInk(i); });
+}
+function ensurePages() {
+  if (pdf || !doc) return;
+  const n = notebookPagesNeeded();
+  if (n !== pageHeights.length) { pageHeights = Array(n).fill(A4H); layout(); buildPages(); }
+}
+
+// ---------- Mitzeichnen ----------
+function attachDrawing(el) {
+  let cur = null, t0 = 0;
+  const pt = (e) => {
+    const r = el.ink.getBoundingClientRect();
+    const x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale + frames[el.index].y;
+    return [Math.round(x * 100) / 100, Math.round(y * 100) / 100];
+  };
+  el.ink.addEventListener("pointerdown", (e) => {
+    if (e.pointerType === "touch" || !ws || ws.readyState !== 1) return; // Finger scrollt
+    e.preventDefault(); el.ink.setPointerCapture(e.pointerId);
+    document.body.classList.add("drawing");
+    t0 = performance.now();
+    const w = WIDTHS[width];
+    cur = { el, w, pts: [[...pt(e), 0, w, w, 1, 1, 0, 1.571]] };
+  });
+  el.ink.addEventListener("pointermove", (e) => {
+    if (!cur) return;
+    const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+    for (const ev of (evs.length ? evs : [e])) {
+      const [x, y] = pt(ev), last = cur.pts[cur.pts.length - 1];
+      if (Math.hypot(x - last[0], y - last[1]) < 1.5) continue;
+      const t = Math.round((performance.now() - t0)) / 1000;
+      cur.pts.push([x, y, t, cur.w, cur.w, 1, 1, 0, 1.571]);
+    }
+    const ctx = el.ink.getContext("2d");
+    drawWire(ctx, { c: [...COLORS[color], 1], p: cur.pts.slice(-3) }, el.ink.width / W, frames[el.index].y);
+  });
+  const end = async () => {
+    if (!cur) return;
+    const done = cur; cur = null;
+    document.body.classList.remove("drawing");
+    const wire = { c: [...COLORS[color], 1], ink: "com.apple.ink.pen", p: done.pts };
+    const id = await strokeID(wire);
+    const data = JSON.stringify(wire);
+    const r = addStroke(id, data);
+    mine.push(id);
+    redrawRange(r.y0, r.y1);
+    send({ type: "add", stroke: { id, data } });
+  };
+  el.ink.addEventListener("pointerup", end);
+  el.ink.addEventListener("pointercancel", end);
+}
+
+// ---------- Verbindung ----------
+function send(msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
+
+function connect() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + base + "/ws");
+  ws.onopen = () => status("live");
+  ws.onclose = (e) => {
+    if (e.code === 4001) return fail("Das Teilen wurde beendet.");
+    status("Verbindung unterbrochen …");
+    setTimeout(async () => { await load(true); connect(); }, 3000);
+  };
+  ws.onmessage = (e) => {
+    let msg; try { msg = JSON.parse(e.data); } catch { return; }
+    if (msg.type === "changes") {
+      let y0 = Infinity, y1 = -Infinity;
+      for (const c of msg.changes) {
+        if (c.data) {
+          if (strokes.has(c.id)) continue;
+          const r = addStroke(c.id, c.data); if (r) { y0 = Math.min(y0, r.y0); y1 = Math.max(y1, r.y1); }
+        } else {
+          removeStroke(c.id);
+        }
+      }
+      ensurePages();
+      if (y0 <= y1) redrawRange(y0, y1);
+    } else if (msg.type === "view" && follow) {
+      const target = (msg.y0 * scale) + document.getElementById("pages").offsetTop - document.getElementById("bar").offsetHeight;
+      scrollTo({ top: Math.max(0, target), behavior: "smooth" });
+    } else if (msg.type === "presence") {
+      status(msg.guests > 1 ? `live · ${msg.guests} Gäste` : "live");
+    }
+  };
+}
+
+async function load(reload) {
+  const res = await fetch(base + "/data", { cache: "no-store" });
+  if (!res.ok) { fail("Dieser Link ist nicht (mehr) gültig."); throw new Error("ungültig"); }
+  const data = await res.json();
+  if (reload) { strokes.clear(); order = []; }
+  doc = data;
+  document.getElementById("title").textContent = data.title || "Notizbuch";
+  document.title = (data.title || "Notizbuch") + " · live";
+  for (const s of data.strokes) addStroke(s.id, s.data);
+  if (data.kind === "pdf" && !pdf) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+    pdf = await pdfjsLib.getDocument(base + "/pdf").promise;
+    pageHeights = [];
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const vp = (await pdf.getPage(i)).getViewport({ scale: 1 });
+      pageHeights.push(W * vp.height / vp.width);
+    }
+  } else if (!pdf) {
+    pageHeights = Array(notebookPagesNeeded()).fill(A4H);
+  }
+  layout(); buildPages();
+}
+
+let resizeTimer;
+addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(buildPages, 200); });
+load(false).then(connect).catch(() => {});
+</script>
+</body>
+</html>

@@ -21,9 +21,13 @@ final class ToolState: ObservableObject {
     @Published var colorIndex = 0
     @Published var widthIndex = 1
     @Published var mode = ToolMode.pen
+    /// Am iPhone startet jedes Dokument im Nur-Sehen-Modus
+    @Published var viewOnly = UIDevice.current.userInterfaceIdiom == .phone
     @Published var menusHidden = false
     /// Kurzer Hinweis, wenn bei ausgeblendeten Menüs das Werkzeug wechselt
     @Published var flash: String?
+    /// Zahl der Gäste, die gerade live zusehen (nil = nicht geteilt)
+    @Published var guests: Int?
 
     weak var canvas: CanvasController?
     private var flashTask: Task<Void, Never>?
@@ -60,26 +64,31 @@ struct EditorView: View {
     @StateObject private var tools = ToolState()
 
     var body: some View {
-        ZStack(alignment: .top) {
-            CanvasRepresentable(doc: doc, store: store, sync: sync, tools: tools)
-                .ignoresSafeArea()
+        // Leiste als Overlay: Wird sie breiter, darf das nie die Größe der Leinwand ändern
+        Color.clear
+            .overlay(alignment: .top) {
+                ZStack(alignment: .top) {
+                    if !tools.menusHidden {
+                        ToolBar(tools: tools, onClose: { dismiss() })
+                            .padding(.top, 6)
+                            .padding(.horizontal, 12)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
 
-            if !tools.menusHidden {
-                ToolBar(tools: tools, onClose: { dismiss() })
-                    .padding(.top, 6)
-                    .padding(.horizontal, 12)
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                    if let flash = tools.flash {
+                        Text(flash)
+                            .font(.callout.weight(.medium))
+                            .padding(.horizontal, 14).padding(.vertical, 7)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .padding(.top, tools.menusHidden ? 10 : 64)
+                            .transition(.opacity)
+                    }
+                }
             }
-
-            if let flash = tools.flash {
-                Text(flash)
-                    .font(.callout.weight(.medium))
-                    .padding(.horizontal, 14).padding(.vertical, 7)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .padding(.top, tools.menusHidden ? 10 : 64)
-                    .transition(.opacity)
+            .background {
+                CanvasRepresentable(doc: doc, store: store, sync: sync, tools: tools)
+                    .ignoresSafeArea()
             }
-        }
         .statusBarHidden(tools.menusHidden)
         .persistentSystemOverlays(tools.menusHidden ? .hidden : .automatic)
         .animation(.easeOut(duration: 0.2), value: tools.menusHidden)
@@ -96,6 +105,7 @@ struct CanvasRepresentable: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> CanvasController {
         let controller = CanvasController(doc: doc, store: store, sync: sync)
         controller.onFlash = { [weak tools] in tools?.show($0) }
+        controller.onGuests = { [weak tools] in tools?.guests = $0 }
         controller.onToggleMenus = { [weak tools] in tools?.menusHidden.toggle() }
         controller.onToggleEraser = { [weak tools] in tools?.toggleEraser() }
         tools.canvas = controller
@@ -105,7 +115,8 @@ struct CanvasRepresentable: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: CanvasController, context: Context) {
         controller.apply(color: ToolState.colors[tools.colorIndex],
                          width: ToolState.widths[tools.widthIndex],
-                         mode: tools.mode)
+                         mode: tools.mode,
+                         viewOnly: tools.viewOnly)
     }
 }
 
@@ -116,11 +127,18 @@ struct ToolBar: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: sizeClass == .compact ? 8 : 14) {
             Button(action: onClose) {
                 Image(systemName: "chevron.left").font(.body.weight(.semibold))
             }
             divider
+            if tools.viewOnly {
+                shareMenu
+                divider
+                Button { tools.viewOnly = false } label: {
+                    Label("Bearbeiten", systemImage: "pencil.tip").labelStyle(.titleAndIcon)
+                }
+            } else {
             if sizeClass == .compact {
                 compactPickers
             } else {
@@ -134,14 +152,11 @@ struct ToolBar: View {
             Button { tools.canvas?.undo() } label: { Image(systemName: "arrow.uturn.backward") }
             Button { tools.canvas?.redo() } label: { Image(systemName: "arrow.uturn.forward") }
             divider
-            Menu {
-                Button { share(.pagePDF) } label: { Label("Diese Seite als PDF", systemImage: "doc") }
-                Button { share(.pageImage) } label: { Label("Diese Seite als Bild", systemImage: "photo") }
-                Button { share(.documentPDF) } label: { Label("Alles als PDF", systemImage: "doc.on.doc") }
-                Divider()
-                Button { share(.sendToAI) } label: { Label("Seite an KI senden", systemImage: "tray.and.arrow.up") }
-            } label: {
-                Image(systemName: "square.and.arrow.up")
+            shareMenu
+            if UIDevice.current.userInterfaceIdiom == .phone {
+                divider
+                Button { tools.viewOnly = true } label: { Image(systemName: "eye") }
+            }
             }
         }
         .font(.body)
@@ -150,6 +165,43 @@ struct ToolBar: View {
         .padding(.vertical, 8)
         .background(.regularMaterial, in: Capsule())
         .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+    }
+
+    private var shareMenu: some View {
+        HStack(spacing: 4) {
+            shareMenuButton
+            // Außerhalb des Menüs: dessen Beschriftung zeigt nur Symbole, die Zahl fehlte sonst
+            if let n = tools.guests, n > 0 {
+                Image(systemName: "eye").font(.caption)
+                Text("\(n)").font(.caption.weight(.semibold))
+            }
+        }
+    }
+
+    private var shareMenuButton: some View {
+        Menu {
+            Button { tools.canvas?.startLiveSharing() } label: { Label("Live teilen (Link)", systemImage: "link") }
+            if tools.guests != nil {
+                Button(role: .destructive) { tools.canvas?.stopLiveSharing() } label: {
+                    Label("Live-Teilen beenden", systemImage: "xmark.circle")
+                }
+            }
+            Divider()
+            Button { share(.pagePDF) } label: { Label("Diese Seite als PDF", systemImage: "doc") }
+            Button { share(.pageImage) } label: { Label("Diese Seite als Bild", systemImage: "photo") }
+            Button { share(.documentPDF) } label: { Label("Alles als PDF", systemImage: "doc.on.doc") }
+            Divider()
+            Menu {
+                Button { share(.sendTo("claude")) } label: { Label("Diese Seite", systemImage: "doc") }
+                Button { share(.sendDocumentTo("claude")) } label: { Label("Ganzes Dokument", systemImage: "doc.on.doc") }
+            } label: { Label("An Claude senden", systemImage: "tray.and.arrow.up") }
+            Menu {
+                Button { share(.sendTo("chatgpt")) } label: { Label("Diese Seite", systemImage: "doc") }
+                Button { share(.sendDocumentTo("chatgpt")) } label: { Label("Ganzes Dokument", systemImage: "doc.on.doc") }
+            } label: { Label("An ChatGPT senden", systemImage: "tray.and.arrow.up") }
+        } label: {
+            Image(systemName: "square.and.arrow.up")
+        }
     }
 
     private func share(_ kind: ShareKind) {
