@@ -2,7 +2,7 @@
 <html lang="de">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -64,6 +64,12 @@
     padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
     background: var(--desk);
     -webkit-text-size-adjust: 100%;
+    /* Kein Zoomen per Doppeltipp, kein Markieren/Kopieren, kein Lupen-Menü */
+    touch-action: manipulation;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
   }
   body {
     height: 100%;
@@ -233,6 +239,8 @@
   }
   .pill.is-down .cap { transform: translateY(1px); background: var(--key-lo); }
   .pill.is-off .lbl { opacity: 0.6; }
+  .pill.vib { display: none; }
+  .vib-switch { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); opacity: 0; pointer-events: none; }
 
   /* ---------- D-pad ---------- */
   .pad { grid-area: pad; position: relative; margin: 12px; }
@@ -359,16 +367,20 @@
   }
   @media (hover: none) and (pointer: coarse) {
     .keys { display: none; }
+    .pill.vib { display: flex; }
+    .pills { gap: 8px; }
     /* Handy: größeres Steuerkreuz, mehr Platz zwischen A und D */
-    .cross { --k: 50px; }
-    .dir::before { width: 14px; height: 11px; margin: -5px 0 0 -7px; }
+    .cross { --k: 56px; }
+    .dir::before { width: 16px; height: 12px; margin: -6px 0 0 -8px; }
     .pad { margin: 14px 10px; }
-    .btns { gap: 30px; padding: 8px 2px 4px; }
+    .btns { gap: 26px; padding: 8px 2px 4px; }
     .rb.d { margin-bottom: 40px; }
     .rb .disc { width: 58px; height: 58px; }
   }
   @media (hover: none) and (pointer: coarse) and (max-width: 374px) {
-    .cross { --k: 42px; }
+    .cross { --k: 44px; }
+    .pills { gap: 4px; }
+    .pill .lbl { min-width: 0; letter-spacing: 0.08em; }
     .pad { margin: 12px 8px; }
     .btns { gap: 18px; }
     .rb.d { margin-bottom: 32px; }
@@ -381,6 +393,7 @@
 </style>
 </head>
 <body>
+<label class="vib-switch" id="vibTick" aria-hidden="true"><input type="checkbox" switch tabindex="-1"></label>
 <main class="desk">
   <div class="console" id="console" data-mode="portrait">
     <section class="screen" aria-label="Bildschirm">
@@ -397,6 +410,7 @@
         <button class="pill" type="button" tabindex="-1" data-act="hold" aria-label="Halten (Taste C)"><span class="cap"></span><span class="lbl">Halten</span></button>
         <button class="pill" type="button" tabindex="-1" data-act="start" aria-label="Start oder Pause (Enter)"><span class="cap"></span><span class="lbl">Start</span></button>
         <button class="pill" type="button" tabindex="-1" data-act="sound" id="soundBtn" aria-label="Ton an oder aus (Taste M)" aria-pressed="true"><span class="cap"></span><span class="lbl" id="soundLbl">Ton an</span></button>
+        <button class="pill vib" type="button" tabindex="-1" data-act="vib" id="vibBtn" aria-label="Vibration: aus, bei allen Tasten oder nur beim Drehen"><span class="cap"></span><span class="lbl" id="vibLbl">Vibr. aus</span></button>
       </div>
     </div>
 
@@ -575,6 +589,33 @@
     soundBtn.setAttribute('aria-pressed', String(soundOn));
     soundBtn.classList.toggle('is-off', !soundOn);
   }
+  // ---------- Vibration ----------
+  // Android: navigator.vibrate. iPhone (ab iOS 18): Safari kennt kein vibrate, gibt aber beim
+  // Umschalten eines Schalters (<input switch>) ein leichtes Klicken; das löst ein unsichtbarer Schalter aus.
+  const VIB_MODES = ['aus', 'alle', 'drehen'];
+  const VIB_LBL = { aus: 'Vibr. aus', alle: 'Vibr. alle', drehen: 'Vibr. A/D' };
+  let vibMode = load('kloetzchen.vibration', 'aus');
+  if (!VIB_MODES.includes(vibMode)) vibMode = 'aus';
+  const vibBtn = $('vibBtn'), vibLbl = $('vibLbl'), vibTick = $('vibTick');
+  function tick() {
+    if (navigator.vibrate) { try { navigator.vibrate(8); } catch (e) {} return; }
+    try { vibTick.click(); } catch (e) {}
+  }
+  function haptic(a) {
+    if (a === 'vib') return; // das Umschalten selbst gibt in cycleVib() Rückmeldung
+    if (vibMode === 'alle' || (vibMode === 'drehen' && (a === 'cw' || a === 'ccw'))) tick();
+  }
+  function updateVibUI() {
+    vibLbl.textContent = VIB_LBL[vibMode];
+    vibBtn.classList.toggle('is-off', vibMode === 'aus');
+  }
+  function cycleVib() {
+    vibMode = VIB_MODES[(VIB_MODES.indexOf(vibMode) + 1) % VIB_MODES.length];
+    save('kloetzchen.vibration', vibMode);
+    updateVibUI();
+    if (vibMode !== 'aus') tick();
+  }
+
   function toggleSound() {
     soundOn = !soundOn;
     save('kloetzchen.ton', soundOn ? '1' : '0');
@@ -1178,6 +1219,7 @@
         break;
       case 'pause': if (G.mode === 'paused') resume(); else pause(); break;
       case 'sound': toggleSound(); break;
+      case 'vib': cycleVib(); break;
     }
   }
 
@@ -1210,6 +1252,7 @@
           e.preventDefault();
           ensureAudio();
           try { b.setPointerCapture(e.pointerId); } catch (err) {}
+          haptic(a);
           act(a, true);
         });
         const up = () => { if (b.classList.contains('is-down')) act(a, false); };
@@ -1225,6 +1268,18 @@
       if (G.mode === 'title' || G.mode === 'over') advance();
       else if (G.mode === 'paused') resume();
     });
+
+    // Zoomen (Zwei-Finger, Doppeltipp) und Markieren abschalten; iOS beachtet user-scalable=no nicht immer
+    for (const ev of ['gesturestart', 'gesturechange', 'gestureend', 'dblclick', 'selectstart', 'contextmenu']) {
+      document.addEventListener(ev, e => e.preventDefault(), { passive: false });
+    }
+    document.addEventListener('touchmove', e => { if (e.touches.length > 1 || (e.scale && e.scale !== 1)) e.preventDefault(); }, { passive: false });
+    let lastTouchEnd = 0;
+    document.addEventListener('touchend', e => {
+      const now = Date.now();
+      if (now - lastTouchEnd < 350) e.preventDefault();
+      lastTouchEnd = now;
+    }, { passive: false });
 
     window.addEventListener('blur', () => { releaseAll(); pause(); });
     document.addEventListener('visibilitychange', () => { if (document.hidden) { releaseAll(); pause(); } });
@@ -1250,6 +1305,7 @@
   function start() {
     readColors();
     updateSoundUI();
+    updateVibUI();
     adoptOld();
     recomputeHi();
     setMode('title');
