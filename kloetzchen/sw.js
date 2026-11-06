@@ -1,5 +1,5 @@
 // Offline: App-Dateien vorab speichern, Schriften beim ersten Laden mitnehmen. Die Bestenliste liegt im Gerät (localStorage).
-const CACHE = "kloetzchen-v2";
+const CACHE = "kloetzchen-v3";
 const FILES = ["./", "index.html", "manifest.webmanifest", "icon-180.png", "icon-192.png", "icon-512.png"];
 self.addEventListener("install", e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener("activate", e => {
@@ -10,8 +10,8 @@ self.addEventListener("fetch", e => {
   if (e.request.method !== "GET") return;
   const url = new URL(e.request.url);
   if (url.origin === location.origin) {
-    // Netz zuerst, damit Updates ankommen; offline aus dem Speicher
-    e.respondWith(fetch(e.request).then(r => { const c = r.clone(); caches.open(CACHE).then(x => x.put(e.request, c)); return r; })
+    // Netz zuerst und am Browser-Zwischenspeicher vorbei (GitHub Pages hält Dateien 10 min), damit Updates sofort ankommen; offline aus dem Speicher
+    e.respondWith(fetch(e.request, { cache: 'no-cache' }).then(r => { const c = r.clone(); caches.open(CACHE).then(x => x.put(e.request, c)); return r; })
       .catch(() => caches.match(e.request, { ignoreSearch: true }).then(r => r || caches.match("index.html"))));
   } else if (/fonts\.(googleapis|gstatic)\.com$/.test(url.hostname)) {
     e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).then(res => { const c = res.clone(); caches.open(CACHE).then(x => x.put(e.request, c)); return res; })));
