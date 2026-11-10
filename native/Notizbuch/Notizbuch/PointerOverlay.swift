@@ -67,7 +67,7 @@ final class PointerOverlay: UIView {
 
     private func fade(_ author: String) {
         fades[author] = nil
-        let ids = lines.filter { $0.value.author == author }.map(\.key)
+        let ids = Array(lines.filter { $0.value.author == author }.keys)
         let layers = ids.compactMap { lines[$0] }.flatMap { [$0.halo, $0.core] }
         for id in ids { lines[id] = nil }
         CATransaction.begin()
