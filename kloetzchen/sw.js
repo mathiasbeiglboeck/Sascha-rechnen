@@ -1,5 +1,5 @@
 // Offline: App-Dateien vorab speichern, Schriften beim ersten Laden mitnehmen. Die Bestenliste liegt im Gerät (localStorage).
-const CACHE = "kloetzchen-v3";
+const CACHE = "kloetzchen-v4";
 const FILES = ["./", "index.html", "manifest.webmanifest", "icon-180.png", "icon-192.png", "icon-512.png"];
 self.addEventListener("install", e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener("activate", e => {
