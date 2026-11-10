@@ -67,6 +67,20 @@ struct PageExport: @unchecked Sendable {
         }
     }
 
+    /// Kleines Vorschaubild einer Seite, `pixelWidth` Pixel breit
+    func thumbnail(page i: Int, pixelWidth: CGFloat) -> UIImage {
+        let frame = frames[i]
+        let s = pixelWidth / frame.width
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let size = CGSize(width: pixelWidth.rounded(), height: (frame.height * s).rounded())
+        return UIGraphicsImageRenderer(size: size, format: format).image { c in
+            c.cgContext.scaleBy(x: s, y: s)
+            drawPage(i, in: c.cgContext, inkScale: s)
+        }
+    }
+
     /// Im Hintergrund ausführen, damit die App nicht einfriert
     static func run<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
         try await Task.detached(priority: .userInitiated) { try work() }.value

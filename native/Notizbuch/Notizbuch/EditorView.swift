@@ -3,6 +3,8 @@ import UIKit
 
 enum ToolMode {
     case pen, eraser, lasso
+    /// Zeigestift: leuchtet, verschwindet nach etwa zehn Sekunden, wird nicht gespeichert
+    case pointer
 }
 
 /// Stift, Farbe, Dicke und ob die Menüs sichtbar sind
@@ -28,6 +30,8 @@ final class ToolState: ObservableObject {
     @Published var flash: String?
     /// Zahl der Gäste, die gerade live zusehen (nil = nicht geteilt)
     @Published var guests: Int?
+    /// Seitenübersicht (drei Spalten) ist offen
+    @Published var overviewShown = false
 
     weak var canvas: CanvasController?
     private var flashTask: Task<Void, Never>?
@@ -89,6 +93,11 @@ struct EditorView: View {
                 CanvasRepresentable(doc: doc, store: store, sync: sync, tools: tools)
                     .ignoresSafeArea()
             }
+        .fullScreenCover(isPresented: $tools.overviewShown) {
+            if let canvas = tools.canvas {
+                PageOverview(controller: canvas) { tools.overviewShown = false }
+            }
+        }
         .statusBarHidden(tools.menusHidden)
         .persistentSystemOverlays(tools.menusHidden ? .hidden : .automatic)
         .animation(.easeOut(duration: 0.2), value: tools.menusHidden)
@@ -132,6 +141,7 @@ struct ToolBar: View {
             Button(action: onClose) {
                 Image(systemName: "chevron.left").font(.body.weight(.semibold))
             }
+            Button { tools.overviewShown = true } label: { Image(systemName: "square.grid.3x3") }
             divider
             if tools.viewOnly {
                 shareMenu
@@ -148,6 +158,7 @@ struct ToolBar: View {
                 widthButtons
             }
             divider
+            modeButton(.pointer, symbol: "scribble", tint: Color(uiColor: PointerOverlay.color))
             modeButton(.eraser, symbol: "eraser")
             modeButton(.lasso, symbol: "lasso")
             Button { tools.canvas?.undo() } label: { Image(systemName: "arrow.uturn.backward") }
@@ -211,11 +222,12 @@ struct ToolBar: View {
         canvas.share(kind, from: CGRect(x: b.midX, y: 60, width: 1, height: 1))
     }
 
-    private func modeButton(_ mode: ToolMode, symbol: String) -> some View {
+    private func modeButton(_ mode: ToolMode, symbol: String, tint: Color? = nil) -> some View {
         Button {
             tools.mode = tools.mode == mode ? .pen : mode
         } label: {
             Image(systemName: symbol)
+                .foregroundStyle(tint ?? Color.primary)
                 .padding(5)
                 .background(tools.mode == mode ? Color.primary.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 7))
         }

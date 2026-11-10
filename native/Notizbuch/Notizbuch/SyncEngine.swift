@@ -13,6 +13,7 @@ struct RemoteMeta: Codable {
     var strokeSeq: Int?
     var hasPDF: Bool?
     var folder: String?
+    var pdfVersion: Int?
 }
 
 /// Was dieses Gerät über den Sync-Stand eines Dokuments weiß (liegt als sync.json im Dokumentordner)
@@ -55,6 +56,8 @@ final class SyncEngine: ObservableObject {
 
     private var busy = Set<UUID>()
     private var librarySyncing = false
+    /// Während eines Abgleichs angefragt: danach gleich noch einmal
+    private var libraryAgain = false
     private let session: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 20
@@ -208,9 +211,21 @@ final class SyncEngine: ObservableObject {
     // MARK: Bibliothek
 
     func syncLibrary() async {
-        guard isConfigured, !librarySyncing else { return }
+        guard isConfigured else { return }
+        guard !librarySyncing else {
+            libraryAgain = true
+            return
+        }
         librarySyncing = true
-        defer { librarySyncing = false }
+        await syncLibraryOnce()
+        while libraryAgain {
+            libraryAgain = false
+            await syncLibraryOnce()
+        }
+        librarySyncing = false
+    }
+
+    private func syncLibraryOnce() async {
         do {
             // 1. Lokal gelöschte Dokumente als Grabstein hochladen
             for idString in pendingDeletes {
@@ -238,9 +253,22 @@ final class SyncEngine: ObservableObject {
                         var merged = local
                         merged.title = r.title
                         merged.folder = r.folder
-                        merged.pageCount = max(local.pageCount, r.pageCount)
+                        // Neuere Seitenzahl gilt, auch wenn sie kleiner ist (Seiten gelöscht);
+                        // Seiten mit Notizen bleiben trotzdem, das prüft das Laden bzw. die offene Leinwand
+                        merged.pageCount = max(r.pageCount, 1)
                         merged.modified = r.modified
+                        // Das PDF selbst hat sich geändert (Seiten gelöscht oder eingefügt): neu laden
+                        var pdfChanged = false
+                        if r.kind == .pdf, r.hasPDF == true, (r.pdfVersion ?? 0) > (local.pdfVersion ?? 0) {
+                            let pdf = try await request("GET", "/api/pdf/\(Self.path(r.id))")
+                            try pdf.write(to: store.pdfURL(r.id), options: .atomic)
+                            merged.pdfVersion = r.pdfVersion
+                            pdfChanged = true
+                        }
                         store.save(merged)
+                        if let c = openController, c.doc.id == r.id, pdfChanged || merged.pageCount != local.pageCount {
+                            c.remoteStructureChanged(pageCount: merged.pageCount, pdfChanged: pdfChanged)
+                        }
                     }
                 } else {
                     if r.kind == .pdf {
@@ -254,7 +282,8 @@ final class SyncEngine: ObservableObject {
                     // Striche auf dem Server liegen immer im aktuellen Seitenlayout
                     store.save(NoteDocument(id: r.id, title: r.title, kind: r.kind, created: r.created,
                                             modified: r.modified, pageCount: max(r.pageCount, 1),
-                                            layoutVersion: PageLayout.currentVersion, folder: r.folder))
+                                            layoutVersion: PageLayout.currentVersion, folder: r.folder,
+                                            pdfVersion: r.pdfVersion))
                 }
             }
 
@@ -262,7 +291,7 @@ final class SyncEngine: ObservableObject {
             for local in store.documents {
                 let r = remoteByID[local.id]
                 guard r == nil || local.modified.timeIntervalSince1970 > r!.modified.timeIntervalSince1970 + 0.001 else { continue }
-                if local.kind == .pdf, r?.hasPDF != true {
+                if local.kind == .pdf, r?.hasPDF != true || (local.pdfVersion ?? 0) > (r?.pdfVersion ?? 0) {
                     let pdf = try Data(contentsOf: store.pdfURL(local.id))
                     _ = try await request("PUT", "/api/pdf/\(Self.path(local.id))", body: pdf, contentType: "application/pdf")
                 }

@@ -25,6 +25,11 @@ html,body { margin:0; background:var(--bg); color:var(--text); font-family:var(-
 #pages { max-width:1100px; margin:0 auto; padding:6px 0 40px; }
 .page { position:relative; background:#fff; margin:0 auto 6px; }
 .page canvas { position:absolute; inset:0; width:100%; height:100%; }
+.page svg.ptr { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; overflow:hidden; }
+.page svg.ptr path { fill:none; stroke-linecap:round; stroke-linejoin:round; }
+body.pointing .page canvas.ink { cursor:crosshair; }
+#pointer { color:#d1006b !important; }
+#pointer.on { background:#ff1f8f !important; color:#fff !important; }
 .page canvas.ink { touch-action:pan-y; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
 body.drawing .page canvas.ink { cursor:crosshair; }
 body.erasing .page canvas.ink { cursor:none; }
@@ -46,6 +51,7 @@ body.lassoing .page canvas.ink { cursor:crosshair; }
   <span id="title">BetterNotes</span>
   <span id="colors"></span>
   <span id="widths"></span>
+  <button id="pointer" title="Zeigestift: leuchtet und verschwindet nach etwa zehn Sekunden (Taste P)">Zeigen</button>
   <button id="eraser" title="Radierer: löscht jeden Strich, den er berührt (Taste E)">Radierer</button>
   <button id="lasso" title="Lasso: Striche umkreisen, dann verschieben, kopieren oder löschen (Taste L)">Lasso</button>
   <button id="paste" hidden title="Kopierte Striche einfügen (Strg/Cmd+V)">Einfügen</button>
@@ -71,7 +77,7 @@ const COLORS = [[0.8,0.17,0.15],[0.12,0.27,0.64],[0.13,0.52,0.29],[0.1,0.1,0.11]
 // Die beiden dünnsten wirken am iPhone (PencilKit, kleiner Maßstab) blass, am iPad und im Browser normal
 const WIDTHS = [1.8, 2.5, 3.2, 4.2, 6.5];
 const ERASER_PX = 8;      // Radius am Bildschirm, wie in der App
-let color = 0, width = 2, follow = true, erasing = false, lassoing = false;
+let color = 0, width = 2, follow = true, erasing = false, lassoing = false, pointing = false;
 let sel = null;    // Lasso-Auswahl {ids: Set, bbox}
 let drag = null;   // {ids, dx, dy} während des Verschiebens
 let clip = null;   // kopierte Striche (wire-Objekte)
@@ -93,27 +99,30 @@ const colorsEl = document.getElementById("colors"), widthsEl = document.getEleme
 COLORS.forEach((c, i) => {
   const b = document.createElement("button");
   b.className = "dot"; b.style.background = `rgb(${c.map(v => v * 255).join(",")})`;
-  b.onclick = () => { color = i; erasing = lassoing = false; tools(); };
+  b.onclick = () => { color = i; erasing = lassoing = pointing = false; tools(); };
   colorsEl.appendChild(b);
 });
 WIDTHS.forEach((w, i) => {
   const b = document.createElement("span");
   b.className = "w"; b.innerHTML = `<span style="width:${3 + i * 3}px;height:${3 + i * 3}px"></span>`;
-  b.onclick = () => { width = i; erasing = lassoing = false; tools(); };
+  b.onclick = () => { width = i; erasing = lassoing = pointing = false; tools(); };
   widthsEl.appendChild(b);
 });
 function tools() {
-  const pen = !erasing && !lassoing;
+  const pen = !erasing && !lassoing && !pointing;
   [...colorsEl.children].forEach((b, i) => b.classList.toggle("on", pen && i === color));
   [...widthsEl.children].forEach((b, i) => b.classList.toggle("on", pen && i === width));
   document.getElementById("eraser").classList.toggle("on", erasing);
   document.getElementById("lasso").classList.toggle("on", lassoing);
   document.body.classList.toggle("erasing", erasing);
   document.body.classList.toggle("lassoing", lassoing);
+  document.getElementById("pointer").classList.toggle("on", pointing);
+  document.body.classList.toggle("pointing", pointing);
   if (!lassoing) select(null);
 }
-document.getElementById("eraser").onclick = () => { erasing = !erasing; lassoing = false; tools(); };
-document.getElementById("lasso").onclick = () => { lassoing = !lassoing; erasing = false; tools(); };
+document.getElementById("eraser").onclick = () => { erasing = !erasing; lassoing = pointing = false; tools(); };
+document.getElementById("lasso").onclick = () => { lassoing = !lassoing; erasing = pointing = false; tools(); };
+document.getElementById("pointer").onclick = () => { pointing = !pointing; erasing = lassoing = false; tools(); };
 addEventListener("keydown", (e) => {
   if (e.metaKey || e.ctrlKey || e.altKey) {
     const k = e.key.toLowerCase();
@@ -123,8 +132,9 @@ addEventListener("keydown", (e) => {
     else if (k === "v" && clip) { e.preventDefault(); paste(); }
     return;
   }
-  if (e.key === "e" || e.key === "E") { erasing = !erasing; lassoing = false; tools(); }
-  else if (e.key === "l" || e.key === "L") { lassoing = !lassoing; erasing = false; tools(); }
+  if (e.key === "e" || e.key === "E") { erasing = !erasing; lassoing = pointing = false; tools(); }
+  else if (e.key === "l" || e.key === "L") { lassoing = !lassoing; erasing = pointing = false; tools(); }
+  else if (e.key === "p" || e.key === "P") { pointing = !pointing; erasing = lassoing = false; tools(); }
   else if ((e.key === "Backspace" || e.key === "Delete") && sel) { e.preventDefault(); deleteSel(); }
   else if (e.key === "Escape") select(null);
 });
@@ -205,17 +215,25 @@ function buildPages() {
   const holder = document.getElementById("pages");
   lastWidth = holder.clientWidth;
   scale = Math.min(holder.clientWidth || innerWidth, 1100) / W;
+  // Weniger Seiten als vorher (gelöscht): überzählige entfernen
+  while (els.length > frames.length) {
+    const el = els.pop();
+    el.task?.cancel(); observer.unobserve(el.div); el.div.remove();
+  }
   while (els.length < frames.length) {
     const div = document.createElement("div"); div.className = "page";
     const bg = document.createElement("canvas"), ink = document.createElement("canvas"); ink.className = "ink";
     for (const c of [bg, ink]) { c.width = 0; c.height = 0; }
-    div.append(bg, ink); holder.appendChild(div);
-    const el = { div, bg, ink, rendered: 0, live: false, index: els.length };
+    const ptr = document.createElementNS(SVGNS, "svg"); ptr.setAttribute("class", "ptr");
+    ptr.setAttribute("preserveAspectRatio", "none");
+    div.append(bg, ink, ptr); holder.appendChild(div);
+    const el = { div, bg, ink, ptr, rendered: 0, live: false, index: els.length };
     els.push(el); attachDrawing(el); observer.observe(div);
   }
   els.forEach((el, i) => {
     const f = frames[i];
     el.div.style.width = W * scale + "px"; el.div.style.height = f.h * scale + "px";
+    el.ptr.setAttribute("viewBox", `0 ${f.y} ${W} ${f.h}`);
     if (el.live) { el.live = false; wake(el); }
   });
   els.forEach((el) => { if (isVisible(el.div)) wake(el); });
@@ -486,7 +504,7 @@ function penWidth(w, e) {
   return Math.round(w * (0.95 + 0.5 * Math.min(e.pressure, 1)) * 100) / 100;
 }
 function attachDrawing(el) {
-  let cur = null, t0 = 0, rub = null, loop = null;
+  let cur = null, t0 = 0, rub = null, loop = null, ptr = null;
   const pt = (e) => {
     const r = el.ink.getBoundingClientRect();
     const x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale + frames[el.index].y;
@@ -501,6 +519,12 @@ function attachDrawing(el) {
   el.ink.addEventListener("pointerdown", (e) => {
     if (e.pointerType === "touch" || !ws || ws.readyState !== 1) return; // Finger scrollt
     e.preventDefault(); el.ink.setPointerCapture(e.pointerId);
+    if (pointing) {
+      ptr = { id: CLIENT + "-" + (++pointerCount), unsent: [pt(e)], last: 0 };
+      pointerAdd(ptr.id, CLIENT, ptr.unsent, false);
+      sendPointer(ptr, false);
+      return;
+    }
     if (lassoing) {
       select(null);
       loop = { poly: [pt(e)], screen: [[e.clientX, e.clientY]] };
@@ -517,6 +541,14 @@ function attachDrawing(el) {
     cur = { el, w, pen: e.pointerType === "pen", pts: [[...pt(e), 0, penWidth(w, e), w, 1, 1, 0, 1.571]] };
   });
   el.ink.addEventListener("pointermove", (e) => {
+    if (ptr) {
+      const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+      const pts = (evs.length ? evs : [e]).map(pt);
+      pointerAdd(ptr.id, CLIENT, pts, false);
+      ptr.unsent.push(...pts);
+      if (performance.now() - ptr.last > 30) sendPointer(ptr, false);
+      return;
+    }
     if (loop) {
       loop.poly.push(pt(e)); loop.screen.push([e.clientX, e.clientY]);
       lassoPath.setAttribute("d", "M" + loop.screen.map(p => p.join(" ")).join(" L") + " Z");
@@ -542,6 +574,7 @@ function attachDrawing(el) {
     drawWire(ctx, { c: [...COLORS[color], 1], p: cur.pts.slice(-3) }, el.ink.width / W, frames[el.index].y);
   });
   const end = async () => {
+    if (ptr) { pointerAdd(ptr.id, CLIENT, [], true); sendPointer(ptr, true); ptr = null; return; }
     if (loop) { const poly = loop.poly; loop = null; finishLasso(poly); return; }
     if (rub) {
       if (rub.erased.length) history.push({ added: [], erased: rub.erased });
@@ -561,6 +594,61 @@ function attachDrawing(el) {
   };
   el.ink.addEventListener("pointerup", end);
   el.ink.addEventListener("pointercancel", end);
+}
+
+// ---------- Zeigestift ----------
+// Leuchtende Linien, nur live weitergereicht und nie gespeichert. Etwa zehn Sekunden nachdem jemand
+// den Stift abgesetzt hat, verblassen alle seine Linien (zeigt er gleich weiter, bleiben sie so lange).
+const SVGNS = "http://www.w3.org/2000/svg";
+const CLIENT = Math.random().toString(36).slice(2, 10);
+const PTR_COLOR = "#ff1f8f", PTR_W = 4.5, PTR_FADE = 10000;
+const ptrs = new Map();     // id -> {from, pts, groups: Map(Seite -> <g>)}
+const ptrFade = new Map();  // from -> Timer
+let pointerCount = 0;
+function sendPointer(p, end) {
+  p.last = performance.now();
+  send({ type: "pointer", from: CLIENT, id: p.id, end, pts: p.unsent.map(q => [Math.round(q[0] * 10) / 10, Math.round(q[1] * 10) / 10]) });
+  p.unsent = [];
+}
+function pointerAdd(id, from, pts, end) {
+  let p = ptrs.get(id);
+  if (!p) { p = { from, pts: [], groups: new Map() }; ptrs.set(id, p); }
+  p.pts.push(...pts);
+  drawPointer(p);
+  clearTimeout(ptrFade.get(from));
+  ptrFade.set(from, setTimeout(() => fadePointers(from), end ? PTR_FADE : 2 * PTR_FADE));
+}
+function drawPointer(p) {
+  if (!p.pts.length) return;
+  let y0 = Infinity, y1 = -Infinity;
+  for (const q of p.pts) { y0 = Math.min(y0, q[1]); y1 = Math.max(y1, q[1]); }
+  const d = "M" + p.pts[0][0] + " " + p.pts[0][1] + " L" + p.pts.map(q => q[0] + " " + q[1]).join(" L");
+  els.forEach((el, i) => {
+    const f = frames[i];
+    if (!f || f.y > y1 + 20 || f.y + f.h < y0 - 20) return;
+    let g = p.groups.get(i);
+    if (!g || !g.isConnected) {
+      g = document.createElementNS(SVGNS, "g");
+      for (const [w, a] of [[PTR_W * 3.2, 0.22], [PTR_W, 1]]) {
+        const path = document.createElementNS(SVGNS, "path");
+        path.setAttribute("stroke", PTR_COLOR); path.setAttribute("stroke-opacity", a); path.setAttribute("stroke-width", w);
+        g.appendChild(path);
+      }
+      el.ptr.appendChild(g); p.groups.set(i, g);
+    }
+    for (const path of g.children) path.setAttribute("d", d);
+  });
+}
+function fadePointers(from) {
+  ptrFade.delete(from);
+  for (const [id, p] of ptrs) {
+    if (p.from !== from) continue;
+    ptrs.delete(id);
+    for (const g of p.groups.values()) {
+      g.style.transition = "opacity .8s"; g.style.opacity = 0;
+      setTimeout(() => g.remove(), 900);
+    }
+  }
 }
 
 // ---------- Verbindung ----------
@@ -591,6 +679,11 @@ function connect() {
     } else if (msg.type === "view" && follow) {
       const target = (msg.y0 * scale) + document.getElementById("pages").offsetTop - document.getElementById("bar").offsetHeight;
       scrollTo({ top: Math.max(0, target), behavior: "smooth" });
+    } else if (msg.type === "pointer") {
+      pointerAdd(msg.id, msg.from, msg.pts || [], !!msg.end);
+    } else if (msg.type === "pages") {
+      // Seiten gelöscht oder eingefügt: alles neu laden (Striche, Seiten, PDF)
+      load(true).catch(() => {});
     } else if (msg.type === "presence") {
       status(msg.guests > 1 ? `live · ${msg.guests} Gäste` : "live");
     }
@@ -601,14 +694,16 @@ async function load(reload) {
   const res = await fetch(base + "/data", { cache: "no-store" });
   if (!res.ok) { fail("Dieser Link ist nicht (mehr) gültig."); throw new Error("ungültig"); }
   const data = await res.json();
-  if (reload) { strokes.clear(); order = []; }
+  if (reload) { strokes.clear(); order = []; if (sel) select(null); }
+  // Das PDF selbst wurde geändert (Seiten gelöscht oder eingefügt): neu laden
+  if (pdf && (data.pdfVersion || 0) !== (doc?.pdfVersion || 0)) { pdf.destroy(); pdf = null; }
   doc = data;
   document.getElementById("title").textContent = data.title || "BetterNotes";
   document.title = (data.title || "BetterNotes") + " · live";
   for (const s of data.strokes) addStroke(s.id, s.data);
   if (data.kind === "pdf" && !pdf) {
     pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-    pdf = await pdfjsLib.getDocument(base + "/pdf").promise;
+    pdf = await pdfjsLib.getDocument(base + "/pdf?v=" + (data.pdfVersion || 0)).promise;
     pageHeights = [];
     for (let i = 1; i <= pdf.numPages; i++) {
       const vp = (await pdf.getPage(i)).getViewport({ scale: 1 });

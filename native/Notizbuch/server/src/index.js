@@ -150,6 +150,12 @@ export class Store extends DurableObject {
     if (clean.deleted) {
       this.sql.exec("DELETE FROM strokes WHERE doc = ?", id);
       this.deleteBlob(`pdf/${id}`);
+    } else if (existing) {
+      // Seiten gelöscht oder eingefügt: offene Ansichten bauen ihre Seiten neu auf
+      const before = JSON.parse(existing.meta);
+      if ((clean.pdfVersion || 0) !== (before.pdfVersion || 0) || (Number(clean.pageCount) || 0) < (Number(before.pageCount) || 0)) {
+        this.broadcast(id, { type: "pages" });
+      }
     }
     return clean;
   }
@@ -230,6 +236,17 @@ export class Store extends DurableObject {
       this.lastView = this.lastView || {};
       this.lastView[doc] = view;
       this.broadcast(doc, view, `guest:${doc}`);
+    } else if (msg.type === "pointer" && typeof msg.id === "string" && Array.isArray(msg.pts)) {
+      // Zeigestift: nur weiterreichen, nie speichern
+      const pts = msg.pts.slice(0, 4000)
+        .filter((p) => Array.isArray(p) && p.length >= 2)
+        .map((p) => [Number(p[0]) || 0, Number(p[1]) || 0]);
+      const out = JSON.stringify({
+        type: "pointer", id: msg.id.slice(0, 64), from: String(msg.from || "").slice(0, 64), end: !!msg.end, pts,
+      });
+      for (const other of this.ctx.getWebSockets(docTag)) {
+        if (other !== ws) try { other.send(out); } catch {}
+      }
     } else if (tags.includes(`guest:${doc}`) && msg.type === "add" && msg.stroke) {
       this.applyOps(doc, [msg.stroke], []);
     } else if (tags.includes(`guest:${doc}`) && msg.type === "remove" && typeof msg.id === "string") {
@@ -270,7 +287,7 @@ export class Store extends DurableObject {
       const strokes = this.sql
         .exec("SELECT id, data FROM strokes WHERE doc = ? AND alive = 1 ORDER BY seq", doc)
         .toArray();
-      return json({ title: meta.title, kind: meta.kind, pageCount: meta.pageCount || 1, strokes });
+      return json({ title: meta.title, kind: meta.kind, pageCount: meta.pageCount || 1, pdfVersion: meta.pdfVersion || 0, strokes });
     }
     return json({ error: "Unbekannte Adresse" }, 404);
   }

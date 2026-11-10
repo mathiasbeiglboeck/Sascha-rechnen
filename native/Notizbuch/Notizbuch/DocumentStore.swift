@@ -21,6 +21,8 @@ struct NoteDocument: Codable, Identifiable, Hashable {
     var layoutVersion: Int?
     /// Ordner in der Übersicht (nil = oberste Ebene)
     var folder: String?
+    /// Stand des PDFs selbst (Zeitpunkt in ms); ändert sich, wenn Seiten gelöscht oder eingefügt werden
+    var pdfVersion: Int? = nil
 }
 
 @MainActor
@@ -153,6 +155,14 @@ final class DocumentStore: ObservableObject {
         guard var doc = documents.first(where: { $0.id == id }) else { return }
         doc.modified = Date()
         doc.pageCount = pageCount
+        save(doc)
+    }
+
+    /// Das PDF selbst wurde geändert: andere Geräte sollen es neu laden
+    func notePDFChanged(_ id: UUID) {
+        guard var doc = documents.first(where: { $0.id == id }) else { return }
+        doc.pdfVersion = Int(Date().timeIntervalSince1970 * 1000)
+        doc.modified = Date()
         save(doc)
     }
 

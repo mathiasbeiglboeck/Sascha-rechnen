@@ -1,6 +1,7 @@
 import UIKit
 import UIKit.UIGestureRecognizerSubclass
 import PencilKit
+import PDFKit
 
 /// Die Schreibfläche: ein PKCanvasView (scrollt und zoomt selbst), darunter die Seiten.
 /// Am iPad schreibt nur der Pencil, der Finger scrollt; am iPhone schreibt auch der Finger, gescrollt wird mit zwei.
@@ -34,6 +35,15 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private var inkWidth: CGFloat = 2
     private var erasing = false
     private var lasso = false
+    private var pointing = false
+    private let pointerGesture = PointerGesture()
+    private let pointerOverlay = PointerOverlay()
+    /// Kennung dieses Geräts für Zeigestift-Linien (gilt bis zum Schließen)
+    private let pointerAuthor = String(UUID().uuidString.prefix(8))
+    private var pointerCount = 0
+    private var pointerLine: String?
+    private var pointerUnsent: [CGPoint] = []
+    private var lastPointerSend = Date.distantPast
     private var viewOnly = false
     private let eraserGesture = EraserGesture()
     private let eraserCursor = UIView()
@@ -89,6 +99,15 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         eraserGesture.isEnabled = false
         if isPad { eraserGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)] }
         canvas.addGestureRecognizer(eraserGesture)
+
+        // Zeigestift: leuchtende Linien über allem, verblassen nach etwa zehn Sekunden
+        pointerOverlay.layer.anchorPoint = .zero
+        canvas.addSubview(pointerOverlay)
+        pointerGesture.space = pointerOverlay
+        pointerGesture.addTarget(self, action: #selector(handlePointer(_:)))
+        pointerGesture.isEnabled = false
+        if isPad { pointerGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)] }
+        canvas.addGestureRecognizer(pointerGesture)
 
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(handleHover(_:)))
         canvas.addGestureRecognizer(hover)
@@ -199,6 +218,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private var toolBusy: Bool { usingTool || Date().timeIntervalSince(lastToolEnd) < 0.5 }
     private var pendingWork: DispatchWorkItem?
     private var pending = RemoteChanges()
+    /// Seitenzahl, die ein anderes Gerät nach Löschen oder Einfügen gemeldet hat (nur Notizbücher)
+    private var remotePageTarget: Int?
+    /// Stand vor der letzten Seitenänderung in der Übersicht
+    private var pageUndo: PageUndo?
 
     private func pageDrawing() -> PKDrawing {
         canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k))
@@ -267,6 +290,16 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         switch type {
         case "changes":
             syncSoon()
+        case "pointer":
+            guard let id = obj["id"] as? String, let author = obj["from"] as? String,
+                  let pts = obj["pts"] as? [[Double]] else { return }
+            let points = pts.compactMap { $0.count >= 2 ? CGPoint(x: $0[0], y: $0[1]) : nil }
+            canvas.bringSubviewToFront(pointerOverlay)
+            pointerOverlay.add(id: id, author: author, points: points, end: obj["end"] as? Bool ?? false)
+        case "pages":
+            // Ein anderes Gerät hat Seiten gelöscht oder eingefügt
+            let sync = self.sync
+            Task { await sync.syncLibrary() }
         case "presence":
             guests = obj["guests"] as? Int ?? 0
             onGuests(shared || guests > 0 ? guests : nil)
@@ -357,6 +390,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         if wasEmpty { redrawInkSoon() }
         // Alte Rückgängig-Schritte würden fremde Striche wieder entfernen
         canvas.undoManager?.removeAllActions()
+        fitToRemotePageCount()
         growIfNeeded()
         dirty = false
         pendingSave?.cancel()
@@ -381,6 +415,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         inkWidth = width
         erasing = mode == .eraser
         lasso = mode == .lasso
+        pointing = mode == .pointer
         applyTool()
     }
 
@@ -393,14 +428,51 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             canvas.tool = PKInkingTool(.pen, color: inkColor, width: inkWidth * max(k, 0.5))
         }
         // Nur-Sehen-Modus (am iPhone Standard): nichts zeichnet, ein Finger scrollt
-        canvas.drawingGestureRecognizer.isEnabled = !erasing && !viewOnly
+        canvas.drawingGestureRecognizer.isEnabled = !erasing && !pointing && !viewOnly
         eraserGesture.isEnabled = erasing && !viewOnly
+        pointerGesture.isEnabled = pointing && !viewOnly
         if !isPad { canvas.panGestureRecognizer.minimumNumberOfTouches = viewOnly ? 1 : 2 }
         if !erasing { eraserCursor.isHidden = true }
     }
 
     func undo() { canvas.undoManager?.undo() }
     func redo() { canvas.undoManager?.redo() }
+
+    // MARK: Zeigestift
+
+    @objc private func handlePointer(_ g: PointerGesture) {
+        let points = g.takeSamples()
+        switch g.state {
+        case .began:
+            lockScrolling()
+            pointerCount += 1
+            pointerLine = "\(pointerAuthor)-\(pointerCount)"
+            pointerUnsent = []
+            canvas.bringSubviewToFront(pointerOverlay)
+            addPointer(points, end: false)
+        case .changed:
+            addPointer(points, end: false)
+        case .ended, .cancelled, .failed:
+            addPointer(points, end: true)
+            pointerLine = nil
+            unlockScrollingSoon()
+        default:
+            break
+        }
+    }
+
+    /// Zeichnet die Punkte und schickt sie höchstens alle 30 ms an die anderen (am Ende sofort)
+    private func addPointer(_ points: [CGPoint], end: Bool) {
+        guard let id = pointerLine else { return }
+        pointerOverlay.add(id: id, author: pointerAuthor, points: points, end: end)
+        pointerUnsent += points
+        guard end || Date().timeIntervalSince(lastPointerSend) > 0.03, let socket else { return }
+        lastPointerSend = Date()
+        let coords = pointerUnsent.map { "[\(Double(($0.x * 10).rounded()) / 10),\(Double(($0.y * 10).rounded()) / 10)]" }
+        pointerUnsent = []
+        let text = "{\"type\":\"pointer\",\"from\":\"\(pointerAuthor)\",\"id\":\"\(id)\",\"end\":\(end),\"pts\":[\(coords.joined(separator: ","))]}"
+        socket.send(.string(text)) { _ in }
+    }
 
     // MARK: Radierer
 
@@ -566,6 +638,12 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         updateContentSize()
     }
 
+    /// Alle Seiten neu anlegen, wenn sich Reihenfolge oder Inhalt der Seiten geändert hat
+    private func rebuildPages() {
+        for v in pagesView.subviews { v.removeFromSuperview() }
+        relayout()
+    }
+
     private func updatePixelScale() {
         for case let page as PageView in pagesView.subviews { page.pixelScale = k }
     }
@@ -576,6 +654,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         pagesView.bounds = CGRect(x: 0, y: 0, width: PageLayout.width, height: layout.totalHeight)
         pagesView.layer.position = .zero
         pagesView.transform = CGAffineTransform(scaleX: s, y: s)
+        pointerOverlay.transform = .identity
+        pointerOverlay.bounds = pagesView.bounds
+        pointerOverlay.layer.position = .zero
+        pointerOverlay.transform = CGAffineTransform(scaleX: s, y: s)
         canvas.contentSize = CGSize(width: PageLayout.width * s, height: layout.totalHeight * s)
     }
 
@@ -608,6 +690,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
         let s = k * scrollView.zoomScale
         pagesView.transform = CGAffineTransform(scaleX: s, y: s)
+        pointerOverlay.transform = CGAffineTransform(scaleX: s, y: s)
     }
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
@@ -774,5 +857,243 @@ extension CanvasController {
                 self?.onFlashTimed("Senden fehlgeschlagen: \(error.localizedDescription)", 3)
             }
         }
+    }
+}
+
+// MARK: Seiten löschen und einfügen (Seitenübersicht)
+
+/// Stand vor der letzten Seitenänderung, für „Rückgängig“ in der Übersicht
+struct PageUndo {
+    /// Zeichnung in Seitenpunkten
+    let drawing: PKDrawing
+    let pageCount: Int
+    /// Kopie des PDFs vor der Änderung (nur bei PDF-Dokumenten)
+    let pdfBackup: URL?
+}
+
+struct PageEditError: LocalizedError {
+    let errorDescription: String?
+}
+
+extension CanvasController {
+    /// Momentaufnahme aller Seiten für die Vorschaubilder der Übersicht
+    func overviewSnapshot() -> PageExport {
+        applyPending()
+        saveNow()
+        return exporter
+    }
+
+    var canUndoPageChange: Bool { pageUndo != nil }
+
+    /// Springt so, dass Seite `i` oben unter der Leiste beginnt
+    func scrollToPage(_ i: Int) {
+        guard k > 0, layout.frames.indices.contains(i) else { return }
+        let s = k * canvas.zoomScale
+        let top = canvas.contentInset.top
+        let maxY = max(canvas.contentSize.height + canvas.contentInset.bottom - canvas.bounds.height, -top)
+        let y = min(max((layout.frames[i].minY - layout.gap) * s - top, -top), maxY)
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: y), animated: false)
+        sendView(force: true)
+    }
+
+    /// Seite, auf der ein Strich liegt (nach seiner Mitte)
+    private static func page(of stroke: PKStroke, in layout: PageLayout) -> Int {
+        let midY = stroke.renderBounds.midY
+        return layout.frames.lastIndex { $0.minY - layout.gap <= midY } ?? 0
+    }
+
+    /// Löscht Seiten samt ihren Notizen; die Seiten darunter rücken nach
+    func deletePages(_ pages: Set<Int>, done: @escaping (String?) -> Void) {
+        let gone = pages.filter { layout.frames.indices.contains($0) }
+        guard !gone.isEmpty else { done(nil); return }
+        if pdf != nil, gone.count >= layout.frames.count {
+            done("Mindestens eine Seite muss bleiben")
+            return
+        }
+        let sorted = gone.sorted()
+        let mapping: (Int) -> Int? = { i in
+            gone.contains(i) ? nil : i - sorted.filter { $0 < i }.count
+        }
+        var edit: (@Sendable (PDFDocument) throws -> Void)?
+        if pdf != nil {
+            edit = { doc in
+                for i in sorted.reversed() { doc.removePage(at: i) }
+            }
+        }
+        restructure(mapping: mapping, notebookPages: max(pageCount - gone.count, 1), pdfEdit: edit, done: done)
+    }
+
+    /// Fügt eine leere karierte Seite ein, sodass sie Seite `index` wird
+    func insertBlankPage(at index: Int, done: @escaping (String?) -> Void) {
+        let j = min(max(index, 0), layout.frames.count)
+        let mapping: (Int) -> Int? = { i in i >= j ? i + 1 : i }
+        var edit: (@Sendable (PDFDocument) throws -> Void)?
+        if pdf != nil { edit = { doc in
+            // So breit wie die Nachbarseite, im Format A4
+            let neighbor = doc.page(at: max(j - 1, 0))
+            var width: CGFloat = 595.28
+            if let neighbor {
+                let box = neighbor.bounds(for: .cropBox)
+                width = abs(neighbor.rotation) % 180 == 90 ? box.height : box.width
+            }
+            guard let page = PDFDocument(data: Self.gridPagePDF(width: width))?.page(at: 0) else {
+                throw PageEditError(errorDescription: "Leere Seite konnte nicht erstellt werden")
+            }
+            doc.insert(page, at: j)
+        } }
+        restructure(mapping: mapping, notebookPages: pageCount + 1, pdfEdit: edit, done: done)
+    }
+
+    /// Eine karierte Seite als einseitiges PDF (für das Einfügen in PDF-Dokumente)
+    nonisolated static func gridPagePDF(width: CGFloat) -> Data {
+        let height = width * 297 / 210
+        let renderer = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: width, height: height))
+        return renderer.pdfData { c in
+            c.beginPage()
+            let s = width / PageLayout.width
+            c.cgContext.scaleBy(x: s, y: s)
+            PageView.drawGrid(in: c.cgContext, rect: CGRect(x: 0, y: 0, width: PageLayout.width, height: PageLayout.a4Height),
+                              lineWidth: 0.5)
+        }
+    }
+
+    /// Macht die letzte Seitenänderung rückgängig
+    func undoPageChange(done: @escaping (String?) -> Void) {
+        guard let undo = pageUndo else { done(nil); return }
+        pageUndo = nil
+        applyPending()
+        if let backup = undo.pdfBackup {
+            let url = store.pdfURL(doc.id)
+            do {
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: backup)
+            } catch {
+                done("Rückgängig fehlgeschlagen: \(error.localizedDescription)")
+                return
+            }
+            pdf = CGPDFDocument(url as CFURL)
+        }
+        commitPages(undo.drawing, pageCount: undo.pageCount, pdfChanged: undo.pdfBackup != nil)
+        done(nil)
+    }
+
+    /// Beim Schließen der Übersicht: Kopie für Rückgängig aufräumen
+    func discardPageUndo() {
+        if let backup = pageUndo?.pdfBackup { try? FileManager.default.removeItem(at: backup) }
+        pageUndo = nil
+    }
+
+    /// Ordnet Seiten neu: `mapping` sagt für jede alte Seite, welche neue Seite sie wird (nil = fällt weg).
+    /// Bei PDFs wird zuerst das PDF selbst geändert (im Hintergrund), dann rücken die Notizen mit.
+    private func restructure(mapping: @escaping (Int) -> Int?, notebookPages: Int,
+                             pdfEdit: (@Sendable (PDFDocument) throws -> Void)?, done: @escaping (String?) -> Void) {
+        applyPending()
+        saveNow()
+        discardPageUndo()
+        let url = store.pdfURL(doc.id)
+        let backup: URL? = {
+            guard pdfEdit != nil else { return nil }
+            let b = url.deletingLastPathComponent().appendingPathComponent("source-undo.pdf")
+            try? FileManager.default.removeItem(at: b)
+            return (try? FileManager.default.copyItem(at: url, to: b)) != nil ? b : nil
+        }()
+        let undo = PageUndo(drawing: pageDrawing(), pageCount: pageCount, pdfBackup: backup)
+
+        let finish: (CGPDFDocument?) -> Void = { [weak self] newPDF in
+            guard let self else { return }
+            // Was inzwischen von anderen Geräten kam, liegt noch im alten Layout: erst einfügen, dann verschieben
+            self.applyPending()
+            let old = self.layout
+            let strokes = self.pageDrawing().strokes
+            let new: PageLayout
+            if let newPDF {
+                self.pdf = newPDF
+                new = .pdf(newPDF)
+            } else {
+                new = .notebook(pages: notebookPages)
+            }
+            let moved = strokes.compactMap { stroke -> PKStroke? in
+                let i = Self.page(of: stroke, in: old)
+                guard i < old.frames.count, let j = mapping(i), j < new.frames.count else {
+                    // Notizen unter der letzten Seite (sollte es nicht geben) bleiben, wo sie sind
+                    return i < old.frames.count ? nil : stroke
+                }
+                var s = stroke
+                s.transform = s.transform.concatenating(
+                    CGAffineTransform(translationX: 0, y: new.frames[j].minY - old.frames[i].minY))
+                return s
+            }
+            self.pageUndo = undo
+            self.commitPages(PKDrawing(strokes: moved), pageCount: notebookPages, pdfChanged: newPDF != nil)
+            done(nil)
+        }
+
+        guard let pdfEdit else {
+            finish(nil)
+            return
+        }
+        Task {
+            do {
+                try await PageExport.run {
+                    guard let doc = PDFDocument(url: url) else {
+                        throw PageEditError(errorDescription: "PDF lässt sich nicht öffnen")
+                    }
+                    try pdfEdit(doc)
+                    let tmp = url.deletingLastPathComponent().appendingPathComponent("source-new.pdf")
+                    try? FileManager.default.removeItem(at: tmp)
+                    guard doc.write(to: tmp) else {
+                        throw PageEditError(errorDescription: "PDF lässt sich nicht speichern")
+                    }
+                    _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+                }
+                guard let newPDF = CGPDFDocument(url as CFURL) else {
+                    throw PageEditError(errorDescription: "Geändertes PDF lässt sich nicht öffnen")
+                }
+                finish(newPDF)
+            } catch {
+                if let backup { try? FileManager.default.removeItem(at: backup) }
+                done("Seiten ändern fehlgeschlagen: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Übernimmt eine neue Seitenordnung: Zeichnung (Seitenpunkte), Seiten neu anlegen, speichern, abgleichen
+    private func commitPages(_ drawing: PKDrawing, pageCount newCount: Int, pdfChanged: Bool) {
+        remotePageTarget = nil
+        if pdf == nil { pageCount = max(newCount, 1) }
+        setDrawing(drawing.transformed(using: CGAffineTransform(scaleX: k, y: k)))
+        canvas.undoManager?.removeAllActions()
+        rebuildPages()
+        growIfNeeded()
+        redrawInkSoon()
+        dirty = false
+        pendingSave?.cancel()
+        store.saveDrawing(drawing, for: doc.id, pageCount: pageCount)
+        if pdfChanged { store.notePDFChanged(doc.id) }
+        localChanged = true
+        syncSoon()
+        let sync = self.sync
+        Task { await sync.syncLibrary() }
+    }
+
+    /// Ein anderes Gerät hat Seiten gelöscht oder eingefügt: neue Seitenzahl bzw. neues PDF übernehmen
+    func remoteStructureChanged(pageCount n: Int, pdfChanged: Bool) {
+        if pdfChanged, doc.kind == .pdf {
+            pdf = CGPDFDocument(store.pdfURL(doc.id) as CFURL)
+            discardPageUndo()
+            if k > 0 { rebuildPages() }
+        }
+        if doc.kind == .notebook {
+            remotePageTarget = max(n, 1)
+            fitToRemotePageCount()
+        }
+    }
+
+    /// Notizbuch auf die gemeldete Seitenzahl bringen, aber nie eine Seite mit Notizen abschneiden
+    private func fitToRemotePageCount() {
+        guard let target = remotePageTarget, pdf == nil, k > 0 else { return }
+        let want = PageLayout.pagesNeeded(for: pageDrawing(), kind: .notebook, current: target)
+        guard want != pageCount else { return }
+        pageCount = want
+        rebuildPages()
     }
 }
