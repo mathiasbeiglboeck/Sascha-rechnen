@@ -417,30 +417,30 @@
     <div class="pad">
       <div class="cross">
         <span class="hub"></span>
-        <button class="dir up" type="button" tabindex="-1" data-act="up" aria-label="Sofort ablegen (Pfeil hoch)"></button>
-        <button class="dir left" type="button" tabindex="-1" data-act="left" aria-label="Nach links (Pfeil links)"></button>
-        <button class="dir right" type="button" tabindex="-1" data-act="right" aria-label="Nach rechts (Pfeil rechts)"></button>
-        <button class="dir down" type="button" tabindex="-1" data-act="soft" aria-label="Schneller fallen (Pfeil runter)"></button>
+        <button class="dir up" type="button" tabindex="-1" data-act="up" aria-label="Sofort ablegen (Taste W)"></button>
+        <button class="dir left" type="button" tabindex="-1" data-act="left" aria-label="Nach links (Taste A)"></button>
+        <button class="dir right" type="button" tabindex="-1" data-act="right" aria-label="Nach rechts (Taste D)"></button>
+        <button class="dir down" type="button" tabindex="-1" data-act="soft" aria-label="Schneller fallen (Taste S)"></button>
       </div>
     </div>
 
     <div class="btns">
-      <button class="rb a" type="button" tabindex="-1" data-act="ccw" aria-label="Nach links drehen (Taste A)"><span class="disc">A</span><span>↺ links</span></button>
-      <button class="rb d" type="button" tabindex="-1" data-act="cw" aria-label="Nach rechts drehen (Taste D)"><span class="disc">D</span><span>↻ rechts</span></button>
+      <button class="rb a" type="button" tabindex="-1" data-act="ccw" aria-label="Nach links drehen (Pfeil links)"><span class="disc">↺</span><span>links</span></button>
+      <button class="rb d" type="button" tabindex="-1" data-act="cw" aria-label="Nach rechts drehen (Pfeil rechts)"><span class="disc">↻</span><span>rechts</span></button>
     </div>
 
     <div class="grille" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div>
   </div>
 
   <p class="keys" id="keys">
-    <span><kbd>←</kbd><kbd>→</kbd> bewegen</span>
-    <span><kbd>A</kbd><kbd>D</kbd> drehen</span>
-    <span><kbd>↓</kbd> schneller</span>
-    <span><kbd>↑</kbd> oder <kbd>Leertaste</kbd> ablegen</span>
+    <span><kbd>A</kbd><kbd>D</kbd> bewegen</span>
+    <span><kbd>←</kbd><kbd>→</kbd> drehen</span>
+    <span><kbd>S</kbd> schneller</span>
+    <span><kbd>W</kbd> oder <kbd>Leertaste</kbd> ablegen</span>
     <span><kbd>C</kbd> halten</span>
     <span><kbd>P</kbd> Pause</span>
     <span><kbd>M</kbd> Ton</span>
-    <span>Vor dem Start: <kbd>←</kbd><kbd>→</kbd> Level wählen</span>
+    <span>Vor dem Start: <kbd>A</kbd><kbd>D</kbd> oder <kbd>←</kbd><kbd>→</kbd> Level wählen</span>
   </p>
 </main>
 <p class="sr-only" id="live" aria-live="polite"></p>
@@ -593,7 +593,7 @@
   // Android: navigator.vibrate. iPhone (ab iOS 18): Safari kennt kein vibrate, gibt aber beim
   // Umschalten eines Schalters (<input switch>) ein leichtes Klicken; das löst ein unsichtbarer Schalter aus.
   const VIB_MODES = ['aus', 'alle', 'drehen'];
-  const VIB_LBL = { aus: 'Vibr. aus', alle: 'Vibr. alle', drehen: 'Vibr. A/D' };
+  const VIB_LBL = { aus: 'Vibr. aus', alle: 'Vibr. alle', drehen: 'Vibr. ↺↻' };
   let vibMode = load('kloetzchen.vibration', 'aus');
   if (!VIB_MODES.includes(vibMode)) vibMode = 'aus';
   const vibBtn = $('vibBtn'), vibLbl = $('vibLbl'), vibTick = $('vibTick');
@@ -1179,8 +1179,8 @@
 
   function act(a, down) {
     setPressed(a, down);
-    if (G.mode === 'title' && down && (a === 'left' || a === 'right' || a === 'up' || a === 'soft')) {
-      setStartLevel(G.startLevel + (a === 'right' || a === 'up' ? 1 : -1));
+    if (G.mode === 'title' && down && (a === 'left' || a === 'right' || a === 'up' || a === 'soft' || a === 'ccw' || a === 'cw')) {
+      setStartLevel(G.startLevel + (a === 'right' || a === 'up' || a === 'cw' ? 1 : -1));
       return;
     }
     if (a === 'left' || a === 'right') {
@@ -1224,8 +1224,8 @@
   }
 
   const KEYMAP = {
-    ArrowLeft: 'left', ArrowRight: 'right', ArrowDown: 'soft', ArrowUp: 'up', ' ': 'drop',
-    a: 'ccw', d: 'cw', c: 'hold', Shift: 'hold', p: 'pause', Escape: 'pause', Enter: 'start', m: 'sound',
+    a: 'left', d: 'right', s: 'soft', w: 'up', ' ': 'drop',
+    ArrowLeft: 'ccw', ArrowRight: 'cw', ArrowDown: 'soft', ArrowUp: 'up', c: 'hold', Shift: 'hold', p: 'pause', Escape: 'pause', Enter: 'start', m: 'sound',
   };
   const keyAct = e => KEYMAP[e.key && e.key.length === 1 ? e.key.toLowerCase() : e.key];
 
