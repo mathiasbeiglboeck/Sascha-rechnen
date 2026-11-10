@@ -148,7 +148,7 @@ final class SyncEngine: ObservableObject {
         if let snapshot {
             let encoded = StrokeCodec.encodeAll(snapshot.strokes)
             let current = Set(encoded.map(\.id))
-            add = encoded.filter { !ids.contains($0.id) }.map { ["id": $0.id, "data": $0.data] }
+            add = encoded.filter { !ids.contains($0.id) }.map { ["id": $0.id, "data": StrokeCodec.data($0.stroke)] }
             remove = Array(ids.subtracting(current))
             ids = current
         }

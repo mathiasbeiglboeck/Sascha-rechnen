@@ -5,13 +5,19 @@ import UIKit
 /// Ein Strich als JSON für den Server (und später die Web-Ansicht für Gäste).
 /// Koordinaten in Seitenpunkten (Seite = 768 breit), die Transformation ist eingerechnet.
 /// p: je Kontrollpunkt [x, y, Zeit, Breite, Höhe, Deckkraft, Druck, Azimut, Neigung, Zweitskala]
-/// Die Zweitskala (secondaryScale, seit iOS 17) bestimmt, wie dick PencilKit den Strich tatsächlich
-/// zeichnet. Fehlte sie, kam jeder übertragene Strich dicker an als das Original. Die ID hängt nur
-/// an den ersten neun Werten, damit bestehende Striche ihre IDs behalten.
+/// Die ID hängt nur an den ersten neun Werten, damit bestehende Striche ihre IDs behalten.
+///
+/// pk: der Strich im Originalformat von PencilKit (Base64). Aus den Punkten neu aufgebaut zeichnet
+/// PencilKit einen Strich etwa doppelt so dick wie das Original; mit pk sieht er überall gleich aus.
+/// Die Punkte bleiben für den Browser und für Striche ohne pk (aus dem Browser).
+/// dx, dy: Verschiebung, die der Browser per Lasso angebracht hat (pk selbst kann er nicht ändern).
 struct WireStroke: Codable {
     var ink: String
     var c: [Double]
     var p: [[Double]]
+    var pk: String?
+    var dx: Double?
+    var dy: Double?
 }
 
 /// Entfernte Änderungen an einem Dokument: neue Striche (in Server-Reihenfolge) und gelöschte IDs
@@ -39,7 +45,7 @@ enum StrokeCodec {
 
     private static let inkTypes: [PKInk.InkType] = [.pen, .pencil, .marker, .monoline, .fountainPen, .watercolor, .crayon]
 
-    static func wire(_ stroke: PKStroke) -> WireStroke {
+    static func wire(_ stroke: PKStroke, withPK: Bool = true) -> WireStroke {
         let t = stroke.transform
         let s = Double(sqrt(abs(t.a * t.d - t.b * t.c)))
         let points = stroke.path.map { pt -> [Double] in
@@ -54,28 +60,43 @@ enum StrokeCodec {
         stroke.ink.color.resolvedColor(with: UITraitCollection(userInterfaceStyle: .light))
             .getRed(&red, green: &green, blue: &blue, alpha: &alpha)
         let color = [red, green, blue, alpha].map { r(Double($0), 1000) }
-        return WireStroke(ink: stroke.ink.inkType.rawValue, c: color, p: points)
+        let pk = withPK ? PKDrawing(strokes: [stroke]).dataRepresentation().base64EncodedString() : nil
+        return WireStroke(ink: stroke.ink.inkType.rawValue, c: color, p: points, pk: pk)
     }
 
     /// Kodiert alle Striche; die ID hängt nur von Form und Tintenart ab, gleiche Striche zählen mit (#2, #3 …)
-    static func encodeAll(_ strokes: [PKStroke]) -> [(id: String, data: String)] {
+    /// JSON eines Strichs für den Server (mit PencilKit-Original); nur für Striche, die hochgeladen werden
+    static func data(_ stroke: PKStroke) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return (try? encoder.encode(wire(stroke))).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    }
+
+    /// IDs aller Striche (ohne das teure JSON); `data(_:)` liefert bei Bedarf den Inhalt
+    static func encodeAll(_ strokes: [PKStroke]) -> [(id: String, stroke: PKStroke)] {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
         var seen: [String: Int] = [:]
         return strokes.map { stroke in
-            let w = wire(stroke)
+            let w = wire(stroke, withPK: false)
             let geometry = (try? encoder.encode([w.ink] + w.p.map { $0.prefix(9).map { String($0) }.joined(separator: ",") })) ?? Data()
             let digest = SHA256.hash(data: geometry).prefix(12).map { String(format: "%02x", $0) }.joined()
             let n = (seen[digest] ?? 0) + 1
             seen[digest] = n
             let id = n == 1 ? digest : "\(digest)#\(n)"
-            let data = (try? encoder.encode(w)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-            return (id, data)
+            return (id, stroke)
         }
     }
 
     static func decode(_ json: String) -> PKStroke? {
         guard let w = try? JSONDecoder().decode(WireStroke.self, from: Data(json.utf8)), !w.p.isEmpty else { return nil }
+        if let pk = w.pk, let data = Data(base64Encoded: pk),
+           var stroke = (try? PKDrawing(data: data))?.strokes.first {
+            if w.dx != nil || w.dy != nil {
+                stroke.transform = stroke.transform.concatenating(CGAffineTransform(translationX: w.dx ?? 0, y: w.dy ?? 0))
+            }
+            return stroke
+        }
         let points = w.p.compactMap { a -> PKStrokePoint? in
             guard a.count >= 9 else { return nil }
             if a.count >= 10 {

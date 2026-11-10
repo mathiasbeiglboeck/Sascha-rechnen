@@ -271,17 +271,20 @@ async function renderBackground(el) {
   }
 }
 
+// Gezeichnete Breite: Striche aus der App tragen als 10. Wert die Zweitskala von PencilKit;
+// am iPad erscheinen sie etwa Breite × Zweitskala × 2 dick (im Simulator gemessen)
+const pw = (q) => q.length > 9 ? q[3] * q[9] * 2 : q[3];
 function drawWire(ctx, wire, s, offY) {
   const c = wire.c || [0, 0, 0, 1], p = wire.p;
   ctx.strokeStyle = ctx.fillStyle = `rgba(${c[0] * 255},${c[1] * 255},${c[2] * 255},${c[3] ?? 1})`;
   ctx.lineCap = ctx.lineJoin = "round";
-  if (p.length === 1) { ctx.beginPath(); ctx.arc(p[0][0] * s, (p[0][1] - offY) * s, Math.max(p[0][3] * s / 2, 0.5), 0, 7); ctx.fill(); return; }
+  if (p.length === 1) { ctx.beginPath(); ctx.arc(p[0][0] * s, (p[0][1] - offY) * s, Math.max(pw(p[0]) * s / 2, 0.5), 0, 7); ctx.fill(); return; }
   // Glatte Kurve durch die Mittelpunkte der Kontrollpunkte, Breite je Abschnitt
   for (let i = 1; i < p.length; i++) {
     const a = p[i - 1], b = p[i];
     const m0 = i === 1 ? a : [(p[i - 2][0] + a[0]) / 2, (p[i - 2][1] + a[1]) / 2];
     const m1 = i === p.length - 1 ? b : [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
-    ctx.lineWidth = Math.max(((a[3] + b[3]) / 2) * s, 0.6);
+    ctx.lineWidth = Math.max(((pw(a) + pw(b)) / 2) * s, 0.6);
     ctx.beginPath();
     ctx.moveTo(m0[0] * s, (m0[1] - offY) * s);
     ctx.quadraticCurveTo(a[0] * s, (a[1] - offY) * s, m1[0] * s, (m1[1] - offY) * s);
@@ -408,7 +411,12 @@ async function replaceStrokes(oldIds, wires) {
   history.push({ added, erased });
   return added;
 }
-const shifted = (wire, dx, dy) => ({ ...wire, p: wire.p.map(q => [Math.round((q[0] + dx) * 100) / 100, Math.round((q[1] + dy) * 100) / 100, ...q.slice(2)]) });
+// Verschiebt die Punkte; ein Strich aus der App (mit PencilKit-Original pk) bekommt die Verschiebung zusätzlich als dx/dy
+const shifted = (wire, dx, dy) => ({
+  ...wire,
+  ...(wire.pk ? { dx: Math.round(((wire.dx || 0) + dx) * 100) / 100, dy: Math.round(((wire.dy || 0) + dy) * 100) / 100 } : {}),
+  p: wire.p.map(q => [Math.round((q[0] + dx) * 100) / 100, Math.round((q[1] + dy) * 100) / 100, ...q.slice(2)]),
+});
 
 function copySel() {
   if (!sel) return;
