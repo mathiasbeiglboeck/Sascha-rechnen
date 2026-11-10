@@ -166,7 +166,12 @@ final class SyncEngine: ObservableObject {
             let data = try await request("POST", "/api/doc/\(Self.path(id))/sync", body: body)
             let response = try JSONDecoder().decode(Response.self, from: data)
             var changes = RemoteChanges()
+            // Das eigene Echo (was diese Anfrage gerade hochgeladen oder gelöscht hat) nicht zurück an die
+            // Leinwand geben: Hat sich die Zeichnung inzwischen geändert (z. B. Seiten eingefügt, Striche
+            // verschoben), würde ein alter Strich sonst wieder auftauchen
+            let own = Set(add.compactMap { $0["id"] }).union(remove)
             for c in response.changes {
+                if own.contains(c.id) { continue }
                 if let d = c.data {
                     changes.added.append((c.id, d))
                     ids.insert(c.id)
