@@ -151,6 +151,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             setDrawing(canvas.drawing.transformed(using: CGAffineTransform(scaleX: f, y: f)))
             canvas.undoManager?.removeAllActions()
             k = newK
+            updatePixelScale()
             updateContentSize()
             redrawInkSoon()
         }
@@ -542,7 +543,12 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             if let pdf, let page = pdf.page(at: i + 1) { content = .pdf(page) } else { content = .grid }
             pagesView.addSubview(PageView(frame: layout.frames[i], content: content))
         }
+        updatePixelScale()
         updateContentSize()
+    }
+
+    private func updatePixelScale() {
+        for case let page as PageView in pagesView.subviews { page.pixelScale = k }
     }
 
     private func updateContentSize() {
