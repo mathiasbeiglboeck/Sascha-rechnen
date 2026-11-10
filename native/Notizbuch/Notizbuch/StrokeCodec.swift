@@ -4,7 +4,10 @@ import UIKit
 
 /// Ein Strich als JSON für den Server (und später die Web-Ansicht für Gäste).
 /// Koordinaten in Seitenpunkten (Seite = 768 breit), die Transformation ist eingerechnet.
-/// p: je Kontrollpunkt [x, y, Zeit, Breite, Höhe, Deckkraft, Druck, Azimut, Neigung]
+/// p: je Kontrollpunkt [x, y, Zeit, Breite, Höhe, Deckkraft, Druck, Azimut, Neigung, Zweitskala]
+/// Die Zweitskala (secondaryScale, seit iOS 17) bestimmt, wie dick PencilKit den Strich tatsächlich
+/// zeichnet. Fehlte sie, kam jeder übertragene Strich dicker an als das Original. Die ID hängt nur
+/// an den ersten neun Werten, damit bestehende Striche ihre IDs behalten.
 struct WireStroke: Codable {
     var ink: String
     var c: [Double]
@@ -44,7 +47,8 @@ enum StrokeCodec {
             return [r(Double(q.x), 100), r(Double(q.y), 100), r(pt.timeOffset, 1000),
                     r(Double(pt.size.width) * s, 100), r(Double(pt.size.height) * s, 100),
                     r(Double(pt.opacity), 1000), r(Double(pt.force), 1000),
-                    r(Double(pt.azimuth), 1000), r(Double(pt.altitude), 1000)]
+                    r(Double(pt.azimuth), 1000), r(Double(pt.altitude), 1000),
+                    r(Double(pt.secondaryScale), 1000)]
         }
         var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 1
         stroke.ink.color.resolvedColor(with: UITraitCollection(userInterfaceStyle: .light))
@@ -60,7 +64,7 @@ enum StrokeCodec {
         var seen: [String: Int] = [:]
         return strokes.map { stroke in
             let w = wire(stroke)
-            let geometry = (try? encoder.encode([w.ink] + w.p.map { $0.map { String($0) }.joined(separator: ",") })) ?? Data()
+            let geometry = (try? encoder.encode([w.ink] + w.p.map { $0.prefix(9).map { String($0) }.joined(separator: ",") })) ?? Data()
             let digest = SHA256.hash(data: geometry).prefix(12).map { String(format: "%02x", $0) }.joined()
             let n = (seen[digest] ?? 0) + 1
             seen[digest] = n
@@ -74,6 +78,12 @@ enum StrokeCodec {
         guard let w = try? JSONDecoder().decode(WireStroke.self, from: Data(json.utf8)), !w.p.isEmpty else { return nil }
         let points = w.p.compactMap { a -> PKStrokePoint? in
             guard a.count >= 9 else { return nil }
+            if a.count >= 10 {
+                return PKStrokePoint(location: CGPoint(x: a[0], y: a[1]), timeOffset: a[2],
+                                     size: CGSize(width: a[3], height: a[4]), opacity: CGFloat(a[5]),
+                                     force: CGFloat(a[6]), azimuth: CGFloat(a[7]), altitude: CGFloat(a[8]),
+                                     secondaryScale: CGFloat(a[9]))
+            }
             return PKStrokePoint(location: CGPoint(x: a[0], y: a[1]), timeOffset: a[2],
                                  size: CGSize(width: a[3], height: a[4]), opacity: CGFloat(a[5]),
                                  force: CGFloat(a[6]), azimuth: CGFloat(a[7]), altitude: CGFloat(a[8]))

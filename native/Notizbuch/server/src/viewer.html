@@ -166,7 +166,8 @@ function swiftNumber(v) {
   return Number.isInteger(v) ? v.toFixed(1) : String(v);
 }
 async function strokeID(wire) {
-  const geometry = JSON.stringify([wire.ink, ...wire.p.map(p => p.map(swiftNumber).join(","))]);
+  // Nur die ersten neun Werte je Punkt, wie in der App (der zehnte, die Zweitskala, zählt nicht zur ID)
+  const geometry = JSON.stringify([wire.ink, ...wire.p.map(p => p.slice(0, 9).map(swiftNumber).join(","))]);
   const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(geometry)));
   return [...hash.slice(0, 12)].map(b => b.toString(16).padStart(2, "0")).join("");
 }
