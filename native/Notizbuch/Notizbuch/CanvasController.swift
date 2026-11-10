@@ -405,6 +405,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             eraserCursor.isHidden = true
             if let start = eraseStart, start.strokes.count != canvas.drawing.strokes.count {
                 canvas.undoManager?.registerUndo(withTarget: self) { $0.replaceDrawingUndoably(with: start) }
+                // PencilKit lässt beim Entfernen manchmal einen feinen Rest des Strichs stehen
+                redrawInkSoon()
             }
             eraseStart = nil
             lastErasePoint = nil

@@ -32,7 +32,7 @@ final class PageView: UIView {
         ctx.fill(rect)
         switch content {
         case .grid:
-            Self.drawGrid(in: ctx, rect: rect, lineWidth: 0.5)
+            Self.drawGrid(in: ctx, rect: rect, lineWidth: 0.5, snapToPixels: true)
         case .pdf(let page):
             Self.drawPDF(page, in: ctx, size: bounds.size)
         }
@@ -42,19 +42,38 @@ final class PageView: UIView {
     nonisolated static let gridStep = PageLayout.width / 30
     nonisolated(unsafe) static let gridColor = UIColor(white: 0.82, alpha: 1)
 
-    nonisolated static func drawGrid(in ctx: CGContext, rect: CGRect, lineWidth: CGFloat) {
+    /// `snapToPixels`: am Bildschirm jede Linie auf ganze Bildpunkte legen. Sonst fällt eine
+    /// dünne Linie je nach Lage zwischen zwei Pixel und wird so blass, dass man sie kaum sieht.
+    nonisolated static func drawGrid(in ctx: CGContext, rect: CGRect, lineWidth: CGFloat, snapToPixels: Bool = false) {
         ctx.setStrokeColor(gridColor.cgColor)
-        ctx.setLineWidth(lineWidth)
+        // Bildpunkte je Seitenpunkt in diesem Kontext
+        let m = ctx.ctm
+        let px = snapToPixels ? max(hypot(m.a, m.b), 0.0001) : 0
+        let widthPx = snapToPixels ? max(1, (lineWidth * px).rounded()) : 0
+        ctx.setLineWidth(snapToPixels ? widthPx / px : lineWidth)
+        // Mitte der Linie so legen, dass sie in Gerätekoordinaten genau ganze Pixel füllt
+        func snapped(_ p: CGPoint, vertical: Bool) -> CGPoint {
+            guard snapToPixels else { return p }
+            var d = ctx.convertToDeviceSpace(p)
+            if vertical {
+                d.x = (d.x - widthPx / 2).rounded() + widthPx / 2
+            } else {
+                d.y = (d.y - widthPx / 2).rounded() + widthPx / 2
+            }
+            return ctx.convertToUserSpace(d)
+        }
         var x = (rect.minX / gridStep).rounded(.up) * gridStep
         while x <= rect.maxX {
-            ctx.move(to: CGPoint(x: x, y: rect.minY))
-            ctx.addLine(to: CGPoint(x: x, y: rect.maxY))
+            let p = snapped(CGPoint(x: x, y: rect.minY), vertical: true)
+            ctx.move(to: CGPoint(x: p.x, y: rect.minY))
+            ctx.addLine(to: CGPoint(x: p.x, y: rect.maxY))
             x += gridStep
         }
         var y = (rect.minY / gridStep).rounded(.up) * gridStep
         while y <= rect.maxY {
-            ctx.move(to: CGPoint(x: rect.minX, y: y))
-            ctx.addLine(to: CGPoint(x: rect.maxX, y: y))
+            let p = snapped(CGPoint(x: rect.minX, y: y), vertical: false)
+            ctx.move(to: CGPoint(x: rect.minX, y: p.y))
+            ctx.addLine(to: CGPoint(x: rect.maxX, y: p.y))
             y += gridStep
         }
         ctx.strokePath()

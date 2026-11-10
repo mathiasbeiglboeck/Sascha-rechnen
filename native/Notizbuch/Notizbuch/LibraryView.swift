@@ -29,16 +29,19 @@ struct LibraryView: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 220), spacing: 24)], spacing: 28) {
                     if currentFolder == nil {
                         ForEach(folders, id: \.self) { name in
-                            FolderCard(name: name, count: store.documents.filter { $0.folder == name }.count)
+                            FolderCard(name: name, count: store.documents.filter { $0.folder == name }.count,
+                                       isTemp: name == DocumentStore.tempFolder)
                                 .onTapGesture { currentFolder = name }
                                 .dropDestination(for: String.self) { ids, _ in moveDocs(ids, to: name) }
                                 .contextMenu {
+                                    if name != DocumentStore.tempFolder {
                                     Button {
                                         folderName = name
                                         renamingFolder = name
                                     } label: { Label("Ordner umbenennen", systemImage: "pencil") }
                                     Button(role: .destructive) { removeFolder(name) } label: {
                                         Label("Ordner auflösen", systemImage: "folder.badge.minus")
+                                    }
                                     }
                                 }
                         }
@@ -73,6 +76,7 @@ struct LibraryView: View {
             // (sonst erfährt das andere Gerät erst nach dem Schließen von einem neuen Dokument)
             .task {
                 while !Task.isCancelled {
+                    for id in store.purgeTemp(keeping: openDoc?.id) { sync.noteDeleted(id) }
                     await sync.syncLibrary()
                     try? await Task.sleep(for: .seconds(20))
                 }
@@ -184,9 +188,11 @@ extension LibraryView {
         emptyFoldersRaw.split(separator: "\n").map(String.init)
     }
 
-    /// Alle Ordner: die aus den Dokumenten (kommen auch über den Sync) und die noch leeren
+    /// Alle Ordner: zuerst „temp“ (immer da), dann die aus den Dokumenten (kommen auch über den Sync) und die noch leeren
     private var folders: [String] {
-        Set(store.documents.compactMap(\.folder) + emptyFolders)
+        let temp = DocumentStore.tempFolder
+        return [temp] + Set(store.documents.compactMap(\.folder) + emptyFolders)
+            .subtracting([temp])
             .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
 
@@ -237,7 +243,7 @@ extension LibraryView {
 
     private func renameFolder(_ old: String, to raw: String) {
         let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, name != old else { return }
+        guard !name.isEmpty, name != old, name != DocumentStore.tempFolder else { return }
         for doc in store.documents where doc.folder == old { store.move(doc, to: name) }
         emptyFoldersRaw = emptyFolders.map { $0 == old ? name : $0 }.joined(separator: "\n")
         Task { await sync.syncLibrary() }
@@ -310,12 +316,13 @@ struct SyncSettingsView: View {
 struct FolderCard: View {
     let name: String
     let count: Int
+    var isTemp = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ZStack {
                 RoundedRectangle(cornerRadius: 6).fill(Color(red: 0.89, green: 0.87, blue: 0.80))
-                Image(systemName: "folder.fill")
+                Image(systemName: isTemp ? "clock.arrow.circlepath" : "folder.fill")
                     .font(.system(size: 54))
                     .foregroundStyle(Color(red: 0.55, green: 0.52, blue: 0.44))
             }
@@ -323,8 +330,8 @@ struct FolderCard: View {
             .shadow(color: .black.opacity(0.08), radius: 3, y: 1)
 
             Text(name).font(.subheadline.weight(.medium)).lineLimit(1)
-            Text(count == 1 ? "1 Dokument" : "\(count) Dokumente")
-                .font(.caption).foregroundStyle(.secondary)
+            Text((count == 1 ? "1 Dokument" : "\(count) Dokumente") + (isTemp ? " · löscht nach 2 Wochen" : ""))
+                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
         }
         .contentShape(Rectangle())
     }

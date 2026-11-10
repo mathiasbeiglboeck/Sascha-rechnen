@@ -89,6 +89,19 @@ final class DocumentStore: ObservableObject {
         }
     }
 
+    /// Fester Ordner für Durchlaufendes: PDFs von Claude und ChatGPT landen hier
+    static let tempFolder = "temp"
+    /// Nach so vielen Tagen ohne Änderung wird ein Dokument im temp-Ordner gelöscht
+    static let tempDays = 14
+
+    /// Löscht Dokumente im temp-Ordner, die seit `tempDays` Tagen nicht geändert wurden; gibt ihre IDs zurück
+    func purgeTemp(keeping open: UUID?) -> [UUID] {
+        let limit = Date().addingTimeInterval(-Double(Self.tempDays) * 86400)
+        let old = documents.filter { $0.folder == Self.tempFolder && $0.modified < limit && $0.id != open }
+        for doc in old { delete(doc) }
+        return old.map(\.id)
+    }
+
     /// Verschiebt ein Dokument in einen Ordner (nil = oberste Ebene); gilt nach dem Sync auf allen Geräten
     func move(_ doc: NoteDocument, to folder: String?) {
         var d = doc

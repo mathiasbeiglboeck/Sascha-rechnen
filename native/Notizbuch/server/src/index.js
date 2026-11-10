@@ -286,7 +286,8 @@ export class Store extends DurableObject {
     const now = Date.now() / 1000;
     const title = (url.searchParams.get("title") || "Aus dem Eingang").slice(0, 200);
     this.putBlob(`pdf/${id}`, bytes, "application/pdf");
-    this.putMeta(id, { id, title, kind: "pdf", created: now, modified: now, pageCount: 0, layoutVersion: 2 });
+    // Was Claude oder ChatGPT schicken, landet im Ordner „temp“ (die App löscht es dort nach 2 Wochen)
+    this.putMeta(id, { id, title, kind: "pdf", created: now, modified: now, pageCount: 0, layoutVersion: 2, folder: "temp" });
     return { id, title };
   }
 
