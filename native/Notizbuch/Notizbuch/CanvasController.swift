@@ -165,7 +165,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             // Nicht mitten in einem Strich, sonst ginge er verloren
-            if self.usingTool { self.redrawInkSoon(); return }
+            if self.toolBusy { self.redrawInkSoon(); return }
             let drawing = self.canvas.drawing
             self.setDrawing(PKDrawing())
             self.setDrawing(drawing)
@@ -192,6 +192,12 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private var syncTimer: Timer?
     private var localChanged = true
     private var usingTool = false
+    /// Wann der Stift zuletzt abgesetzt wurde. PencilKit übernimmt den fertigen Strich erst kurz
+    /// nach `canvasViewDidEndUsingTool` in die Zeichnung; wer in diesem Moment die Zeichnung
+    /// ersetzt (fremde Striche einfügen), verliert den gerade geschriebenen Strich.
+    private var lastToolEnd = Date.distantPast
+    private var toolBusy: Bool { usingTool || Date().timeIntervalSince(lastToolEnd) < 0.5 }
+    private var pendingWork: DispatchWorkItem?
     private var pending = RemoteChanges()
 
     private func pageDrawing() -> PKDrawing {
@@ -202,7 +208,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         guard sync.isConfigured, k > 0, !sync.isBusy(doc.id), UIApplication.shared.applicationState == .active else { return }
         // Fremde Änderungen müssen drin sein, bevor der eigene Stand verglichen wird
         if !pending.isEmpty {
-            guard !usingTool else { return }
+            guard !toolBusy else { return }
             applyPending()
         }
         let snapshot = localChanged ? pageDrawing() : nil
@@ -327,7 +333,17 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     /// Entfernte Änderungen; während der Pencil schreibt, warten sie, bis er absetzt
     func enqueue(_ changes: RemoteChanges) {
         pending.merge(changes)
-        if !usingTool { applyPending() }
+        applyPendingWhenIdle()
+    }
+
+    /// Fremde Striche erst einfügen, wenn der Stift eine halbe Sekunde ruht
+    private func applyPendingWhenIdle() {
+        pendingWork?.cancel()
+        guard !pending.isEmpty else { return }
+        guard toolBusy else { applyPending(); return }
+        let work = DispatchWorkItem { [weak self] in self?.applyPendingWhenIdle() }
+        pendingWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
     }
 
     private func applyPending() {
@@ -402,6 +418,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             erase(at: p)
         case .ended, .cancelled, .failed:
             usingTool = false
+            lastToolEnd = Date()
+            defer { applyPendingWhenIdle() }
             unlockScrollingSoon()
             eraserCursor.isHidden = true
             if let start = eraseStart, start.strokes.count != canvas.drawing.strokes.count {
@@ -503,8 +521,9 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
         usingTool = false
+        lastToolEnd = Date()
         unlockScrollingSoon()
-        applyPending()
+        applyPendingWhenIdle()
     }
 
     private func moveCursor(to p: CGPoint) {

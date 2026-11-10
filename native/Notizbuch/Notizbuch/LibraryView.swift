@@ -96,7 +96,7 @@ struct LibraryView: View {
                                                              : "Leg hier ein Notizbuch an, oder verschieb ein Dokument hierher (lange drücken)."))
                 }
             }
-            .navigationTitle(currentFolder ?? "Notizbuch")
+            .navigationTitle(currentFolder ?? "BetterNotes")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     if currentFolder != nil {
