@@ -28,8 +28,11 @@ html,body { margin:0; background:var(--bg); color:var(--text); font-family:var(-
 .page svg.ptr { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; overflow:hidden; }
 .page svg.ptr path { fill:none; stroke-linecap:round; stroke-linejoin:round; }
 body.pointing .page canvas.ink { cursor:crosshair; }
-#pointer { color:#d1006b !important; }
-#pointer.on { background:#ff1f8f !important; color:#fff !important; }
+body { --ptr:#ff1f8f; }
+#pointer::before { content:""; display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--ptr);
+  margin-right:6px; vertical-align:1px; }
+#pointer.on { background:var(--ptr) !important; color:#fff !important; }
+#pointer.on::before { background:#fff; }
 .page canvas.ink { touch-action:pan-y; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
 body.drawing .page canvas.ink { cursor:crosshair; }
 body.erasing .page canvas.ink { cursor:none; }
@@ -249,7 +252,7 @@ function wake(el) {
   const f = frames[el.index], r = pixelRatio();
   el.task?.cancel();
   for (const c of [el.bg, el.ink]) { c.width = Math.round(W * scale * r); c.height = Math.round(f.h * scale * r); }
-  el.live = true; el.rendered = 0;
+  el.live = true; el.rendered = 0; el.gen = (el.gen || 0) + 1;
   renderBackground(el);
   drawInk(el.index);
 }
@@ -272,9 +275,11 @@ async function renderBackground(el) {
   const ctx = el.bg.getContext("2d"), s = el.bg.width / W;
   ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, el.bg.width, el.bg.height);
   if (pdf) {
-    const page = await pdf.getPage(el.index + 1);
+    const source = pdf, gen = el.gen;
+    let page;
+    try { page = await source.getPage(el.index + 1); } catch { return; } // PDF inzwischen ersetzt
+    if (!el.live || el.gen !== gen || pdf !== source) return;
     const vp = page.getViewport({ scale: el.bg.width / page.getViewport({ scale: 1 }).width });
-    if (!el.live) return;
     const task = page.render({ canvasContext: ctx, viewport: vp });
     el.task = task;
     try { await task.promise; } catch {} // abgebrochen, weil die Seite aus dem Blick ist
@@ -453,7 +458,7 @@ async function paste() {
   if (!clip || !ws || ws.readyState !== 1) return;
   pasteShift += 24;
   const ids = await replaceStrokes([], clip.map(w => shifted(w, pasteShift, pasteShift)));
-  lassoing = true; erasing = false; tools();
+  lassoing = true; erasing = pointing = false; tools();
   select(new Set(ids));
 }
 document.getElementById("paste").onclick = paste;
@@ -520,8 +525,8 @@ function attachDrawing(el) {
     if (e.pointerType === "touch" || !ws || ws.readyState !== 1) return; // Finger scrollt
     e.preventDefault(); el.ink.setPointerCapture(e.pointerId);
     if (pointing) {
-      ptr = { id: CLIENT + "-" + (++pointerCount), unsent: [pt(e)], last: 0 };
-      pointerAdd(ptr.id, CLIENT, ptr.unsent, false);
+      ptr = { id: CLIENT + "-" + (++pointerCount), unsent: [pt(e)], last: 0, flush: 0 };
+      pointerAdd(ptr.id, CLIENT, ptr.unsent, false, myColor);
       sendPointer(ptr, false);
       return;
     }
@@ -544,9 +549,15 @@ function attachDrawing(el) {
     if (ptr) {
       const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
       const pts = (evs.length ? evs : [e]).map(pt);
-      pointerAdd(ptr.id, CLIENT, pts, false);
+      pointerAdd(ptr.id, CLIENT, pts, false, myColor);
       ptr.unsent.push(...pts);
+      clearTimeout(ptr.flush);
       if (performance.now() - ptr.last > 30) sendPointer(ptr, false);
+      else {
+        // Bleibt die Maus stehen, kommen keine neuen Ereignisse: den Rest trotzdem gleich schicken
+        const p = ptr;
+        p.flush = setTimeout(() => { if (ptr === p && p.unsent.length) sendPointer(p, false); }, 35);
+      }
       return;
     }
     if (loop) {
@@ -574,7 +585,7 @@ function attachDrawing(el) {
     drawWire(ctx, { c: [...COLORS[color], 1], p: cur.pts.slice(-3) }, el.ink.width / W, frames[el.index].y);
   });
   const end = async () => {
-    if (ptr) { pointerAdd(ptr.id, CLIENT, [], true); sendPointer(ptr, true); ptr = null; return; }
+    if (ptr) { clearTimeout(ptr.flush); pointerAdd(ptr.id, CLIENT, [], true, myColor); sendPointer(ptr, true); ptr = null; return; }
     if (loop) { const poly = loop.poly; loop = null; finishLasso(poly); return; }
     if (rub) {
       if (rub.erased.length) history.push({ added: [], erased: rub.erased });
@@ -601,8 +612,20 @@ function attachDrawing(el) {
 // den Stift abgesetzt hat, verblassen alle seine Linien (zeigt er gleich weiter, bleiben sie so lange).
 const SVGNS = "http://www.w3.org/2000/svg";
 const CLIENT = Math.random().toString(36).slice(2, 10);
+// Jede Person zeigt in ihrer Farbe: das iPad lila, das iPhone pink, jeder Gast eine eigene vom Server
 const PTR_COLOR = "#ff1f8f", PTR_W = 4.5, PTR_FADE = 10000;
-const ptrs = new Map();     // id -> {from, pts, groups: Map(Seite -> <g>)}
+const isColor = (c) => typeof c === "string" && /^#[0-9a-fA-F]{6}$/.test(c);
+const COLOR_KEY = "betternotes-pointer-color";
+let myColor = PTR_COLOR;
+try { const saved = localStorage.getItem(COLOR_KEY); if (isColor(saved)) myColor = saved; } catch {}
+document.body.style.setProperty("--ptr", myColor);
+function setMyColor(c) {
+  if (!isColor(c)) return;
+  myColor = c;
+  document.body.style.setProperty("--ptr", c);
+  try { localStorage.setItem(COLOR_KEY, c); } catch {}
+}
+const ptrs = new Map();     // id -> {from, color, pts, groups: Map(Seite -> <g>)}
 const ptrFade = new Map();  // from -> Timer
 let pointerCount = 0;
 function sendPointer(p, end) {
@@ -610,9 +633,9 @@ function sendPointer(p, end) {
   send({ type: "pointer", from: CLIENT, id: p.id, end, pts: p.unsent.map(q => [Math.round(q[0] * 10) / 10, Math.round(q[1] * 10) / 10]) });
   p.unsent = [];
 }
-function pointerAdd(id, from, pts, end) {
+function pointerAdd(id, from, pts, end, color) {
   let p = ptrs.get(id);
-  if (!p) { p = { from, pts: [], groups: new Map() }; ptrs.set(id, p); }
+  if (!p) { p = { from, color: isColor(color) ? color : PTR_COLOR, pts: [], groups: new Map() }; ptrs.set(id, p); }
   p.pts.push(...pts);
   drawPointer(p);
   clearTimeout(ptrFade.get(from));
@@ -631,7 +654,7 @@ function drawPointer(p) {
       g = document.createElementNS(SVGNS, "g");
       for (const [w, a] of [[PTR_W * 3.2, 0.22], [PTR_W, 1]]) {
         const path = document.createElementNS(SVGNS, "path");
-        path.setAttribute("stroke", PTR_COLOR); path.setAttribute("stroke-opacity", a); path.setAttribute("stroke-width", w);
+        path.setAttribute("stroke", p.color); path.setAttribute("stroke-opacity", a); path.setAttribute("stroke-width", w);
         g.appendChild(path);
       }
       el.ptr.appendChild(g); p.groups.set(i, g);
@@ -655,64 +678,113 @@ function fadePointers(from) {
 function send(msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
 
 function connect() {
-  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + base + "/ws");
+  let wanted = null;
+  try { wanted = localStorage.getItem(COLOR_KEY); } catch {}
+  const query = isColor(wanted) ? "?c=" + wanted.slice(1) : "";
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + base + "/ws" + query);
   ws.onopen = () => status("live");
   ws.onclose = (e) => {
     if (e.code === 4001) return fail("Das Teilen wurde beendet.");
+    if (gone) return;
     status("Verbindung unterbrochen …");
-    setTimeout(async () => { await load(true); connect(); }, 3000);
+    setTimeout(reconnect, 3000);
   };
   ws.onmessage = (e) => {
     let msg; try { msg = JSON.parse(e.data); } catch { return; }
     if (msg.type === "changes") {
-      let y0 = Infinity, y1 = -Infinity;
-      for (const c of msg.changes) {
-        if (c.data) {
-          if (strokes.has(c.id)) continue;
-          const r = addStroke(c.id, c.data); if (r) { y0 = Math.min(y0, r.y0); y1 = Math.max(y1, r.y1); }
-        } else {
-          removeStroke(c.id);
-        }
-      }
-      ensurePages();
-      if (y0 <= y1) redrawRange(y0, y1);
+      // Während neu geladen wird: merken und danach anwenden, sonst gingen sie mit dem alten Stand verloren
+      if (buffer) buffer.push(...(msg.changes || []));
+      else applyChanges(msg.changes || []);
+    } else if (msg.type === "you") {
+      setMyColor(msg.color);
     } else if (msg.type === "view" && follow) {
       const target = (msg.y0 * scale) + document.getElementById("pages").offsetTop - document.getElementById("bar").offsetHeight;
       scrollTo({ top: Math.max(0, target), behavior: "smooth" });
     } else if (msg.type === "pointer") {
-      pointerAdd(msg.id, msg.from, msg.pts || [], !!msg.end);
+      pointerAdd(msg.id, msg.from, msg.pts || [], !!msg.end, msg.color);
     } else if (msg.type === "pages") {
       // Seiten gelöscht oder eingefügt: alles neu laden (Striche, Seiten, PDF)
-      load(true).catch(() => {});
+      reload().catch(() => {});
     } else if (msg.type === "presence") {
       status(msg.guests > 1 ? `live · ${msg.guests} Gäste` : "live");
     }
   };
 }
 
-async function load(reload) {
-  const res = await fetch(base + "/data", { cache: "no-store" });
-  if (!res.ok) { fail("Dieser Link ist nicht (mehr) gültig."); throw new Error("ungültig"); }
-  const data = await res.json();
-  if (reload) { strokes.clear(); order = []; if (sel) select(null); }
-  // Das PDF selbst wurde geändert (Seiten gelöscht oder eingefügt): neu laden
-  if (pdf && (data.pdfVersion || 0) !== (doc?.pdfVersion || 0)) { pdf.destroy(); pdf = null; }
-  doc = data;
-  document.getElementById("title").textContent = data.title || "BetterNotes";
-  document.title = (data.title || "BetterNotes") + " · live";
-  for (const s of data.strokes) addStroke(s.id, s.data);
-  if (data.kind === "pdf" && !pdf) {
-    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-    pdf = await pdfjsLib.getDocument(base + "/pdf?v=" + (data.pdfVersion || 0)).promise;
-    pageHeights = [];
-    for (let i = 1; i <= pdf.numPages; i++) {
-      const vp = (await pdf.getPage(i)).getViewport({ scale: 1 });
-      pageHeights.push(W * vp.height / vp.width);
+function applyChanges(list) {
+  let y0 = Infinity, y1 = -Infinity;
+  for (const c of list) {
+    if (c.data) {
+      if (strokes.has(c.id)) continue;
+      const r = addStroke(c.id, c.data); if (r) { y0 = Math.min(y0, r.y0); y1 = Math.max(y1, r.y1); }
+    } else {
+      removeStroke(c.id);
     }
-  } else if (!pdf) {
-    pageHeights = Array(notebookPagesNeeded()).fill(A4H);
   }
-  layout(); buildPages();
+  ensurePages();
+  if (y0 <= y1) redrawRange(y0, y1);
+}
+
+// Neu laden, immer nur eines nach dem anderen (sonst kämen Seiten doppelt); kommt währenddessen noch
+// ein Anlass, folgt genau ein weiteres Laden
+let loading = null, loadAgain = false, buffer = null, gone = false;
+function reload() {
+  if (loading) { loadAgain = true; return loading; }
+  loading = (async () => {
+    try {
+      do { loadAgain = false; await load(true); } while (loadAgain);
+    } finally { loading = null; }
+  })();
+  return loading;
+}
+async function reconnect() {
+  try { await reload(); } catch { if (!gone) setTimeout(reconnect, 5000); return; }
+  connect();
+}
+
+async function load(isReload) {
+  buffer = [];
+  let nextPdf = pdf;
+  try {
+    const res = await fetch(base + "/data", { cache: "no-store" });
+    if (!res.ok) { gone = true; fail("Dieser Link ist nicht (mehr) gültig."); throw new Error("ungültig"); }
+    const data = await res.json();
+    // Ein neues PDF (Seiten gelöscht oder eingefügt) erst ganz laden, dann umschalten
+    let heights = null;
+    if (data.kind === "pdf" && (!pdf || (data.pdfVersion || 0) !== (doc?.pdfVersion || 0))) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+      nextPdf = await pdfjsLib.getDocument(base + "/pdf?v=" + (data.pdfVersion || 0)).promise;
+      heights = [];
+      for (let i = 1; i <= nextPdf.numPages; i++) {
+        const vp = (await nextPdf.getPage(i)).getViewport({ scale: 1 });
+        heights.push(W * vp.height / vp.width);
+      }
+    }
+    // Ab hier ohne Unterbrechung umstellen
+    // Andere Seitenordnung: Eigene alte Schritte würden Striche an ihren alten Stellen zurückbringen
+    if (isReload && doc && ((data.pagesVersion || 0) !== (doc.pagesVersion || 0) || (data.pdfVersion || 0) !== (doc.pdfVersion || 0))) {
+      history.length = 0;
+    }
+    if (isReload) { strokes.clear(); order = []; if (sel) select(null); }
+    if (nextPdf !== pdf) { if (pdf) pdf.destroy(); pdf = nextPdf; }
+    doc = data;
+    document.getElementById("title").textContent = data.title || "BetterNotes";
+    document.title = (data.title || "BetterNotes") + " · live";
+    for (const s of data.strokes) addStroke(s.id, s.data);
+    if (heights) pageHeights = heights;
+    else if (data.kind !== "pdf") pageHeights = Array(notebookPagesNeeded()).fill(A4H);
+    layout(); buildPages();
+    // Was live kam, während geladen wurde: nur, was neuer ist als die Momentaufnahme
+    const pending = buffer; buffer = null;
+    const since = Number(data.seq) || 0;
+    applyChanges(since ? pending.filter(c => !(c.seq <= since)) : pending);
+  } catch (e) {
+    if (nextPdf && nextPdf !== pdf) nextPdf.destroy();
+    // Alter Stand bleibt: was inzwischen kam, gehört dazu
+    const pending = buffer || []; buffer = null;
+    if (pending.length) applyChanges(pending);
+    throw e;
+  }
 }
 
 let resizeTimer;
@@ -725,7 +797,7 @@ addEventListener("resize", () => {
     if (w !== lastWidth) { lastWidth = w; buildPages(); }
   }, 200);
 });
-load(false).then(connect).catch(() => {});
+load(false).then(connect).catch(() => { if (!gone) setTimeout(reconnect, 5000); });
 </script>
 </body>
 </html>

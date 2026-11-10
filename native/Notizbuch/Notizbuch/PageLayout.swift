@@ -43,6 +43,18 @@ struct PageLayout {
         return PageLayout(frames: frames, gap: gap)
     }
 
+    /// Seite, zu der die Höhe `y` (Seitenpunkte) gehört: die letzte Seite, die darüber (samt Abstand) beginnt.
+    /// Oberhalb der ersten Seite die erste, unterhalb der letzten die letzte. Binäre Suche.
+    func page(at y: CGFloat) -> Int {
+        guard !frames.isEmpty else { return 0 }
+        var lo = 0, hi = frames.count - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if frames[mid].minY - gap <= y { lo = mid } else { hi = mid - 1 }
+        }
+        return lo
+    }
+
     /// Verschiebt jeden Strich mit der Seite, auf der er liegt, von einem alten Layout in dieses
     func migrate(_ drawing: PKDrawing, from old: PageLayout) -> PKDrawing {
         let strokes = drawing.strokes.map { stroke -> PKStroke in

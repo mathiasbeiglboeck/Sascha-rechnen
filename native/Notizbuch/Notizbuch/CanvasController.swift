@@ -1,5 +1,4 @@
 import UIKit
-import UIKit.UIGestureRecognizerSubclass
 import PencilKit
 import PDFKit
 
@@ -16,6 +15,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     /// Hinweis mit eigener Anzeigedauer; leerer Text blendet ihn aus
     var onFlashTimed: (String, Double) -> Void = { _, _ in }
     var onGuests: (Int?) -> Void = { _ in }
+    /// Für die offene Seitenübersicht: fremde Striche oder Seitenänderungen sind angekommen
+    var onPagesChanged: (() -> Void)?
 
     let doc: NoteDocument
     private let store: DocumentStore
@@ -30,6 +31,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private var pendingSave: DispatchWorkItem?
     private var dirty = false
     private var settingDrawing = false
+    /// Stand nach dem letzten Setzen oder Speichern; ein gleicher Stand wird nicht noch einmal gespeichert
+    private var baseline: PKDrawing?
+    /// Seit dem letzten Setzen oder Speichern mit einem Werkzeug gearbeitet (dann sicher eine echte Änderung)
+    private var toolUsedSinceSave = false
 
     private var inkColor = UIColor.black
     private var inkWidth: CGFloat = 2
@@ -44,6 +49,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private var pointerLine: String?
     private var pointerUnsent: [CGPoint] = []
     private var lastPointerSend = Date.distantPast
+    private var pointerFlush: DispatchWorkItem?
     private var viewOnly = false
     private let eraserGesture = EraserGesture()
     private let eraserCursor = UIView()
@@ -130,7 +136,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         pencil.delegate = self
         view.addInteraction(pencil)
 
-        NotificationCenter.default.addObserver(self, selector: #selector(saveNow),
+        NotificationCenter.default.addObserver(self, selector: #selector(appWillResignActive),
                                                name: UIApplication.willResignActiveNotification, object: nil)
 
         // Ab jetzt landen entfernte Änderungen an diesem Dokument hier statt in der Datei
@@ -139,6 +145,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        if detached { reattach() }
         syncTimer?.invalidate()
         syncTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.syncCycle() }
@@ -164,6 +171,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             relayout()
             growIfNeeded()
             canvas.contentOffset = CGPoint(x: 0, y: -top)
+            warmUpIDs()
+            syncCycle()
         } else {
             // Drehen: Zeichnung auf die neue Breite umrechnen
             let f = newK / k
@@ -173,6 +182,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             updatePixelScale()
             updateContentSize()
             redrawInkSoon()
+            // Alle Striche liegen jetzt anders: IDs im Hintergrund neu, nicht beim nächsten Strich
+            warmUpIDs()
         }
         applyTool()
     }
@@ -195,20 +206,50 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        detached = true
         syncTimer?.invalidate()
         syncTimer = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
+        pointerFlush?.cancel()
         applyPending()
         saveNow()
+        persistSyncStateNow()
         if sync.openController === self { sync.openController = nil }
         let sync = self.sync, id = doc.id
         Task { await sync.syncClosed(id) }
     }
 
-    // MARK: Sync: alle 3 Sekunden eigene Änderungen schicken und fremde holen
+    /// Wieder sichtbar, nachdem die Ansicht verschwunden war: Inzwischen kamen fremde Änderungen in die Datei
+    /// statt auf die Leinwand. Also wieder als offene Leinwand anmelden und die Zeichnung neu laden.
+    private func reattach() {
+        detached = false
+        sync.openController = self
+        guard k > 0 else { return }
+        // Aktuelle Metadaten (die beim Öffnen übergebenen sind veraltet, etwa die Layout-Version)
+        let current = store.documents.first { $0.id == doc.id } ?? doc
+        if doc.kind == .pdf {
+            pdf = CGPDFDocument(store.pdfURL(doc.id) as CFURL) ?? pdf
+        } else {
+            pageCount = max(current.pageCount, 1)
+        }
+        pending = RemoteChanges()
+        setDrawing(store.loadDrawing(current).transformed(using: CGAffineTransform(scaleX: k, y: k)))
+        canvas.undoManager?.removeAllActions()
+        rebuildPages()
+        growIfNeeded()
+        localChanged = true
+        warmUpIDs()
+    }
+
+    // MARK: Sync: eigene Striche gleich nach dem Absetzen schicken, fremde holen, sobald der Server sie meldet
 
     private var syncTimer: Timer?
+    private var syncTask: Task<Void, Never>?
+    /// Noch einmal holen, sobald der laufende Abgleich fertig ist
+    private var fetchAgain = false
+    /// Höchste Änderungsnummer, die der Server per Hinweis gemeldet hat
+    private var remoteSeqHint = 0
     private var localChanged = true
     private var usingTool = false
     /// Wann der Stift zuletzt abgesetzt wurde. PencilKit übernimmt den fertigen Strich erst kurz
@@ -220,36 +261,151 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private var pending = RemoteChanges()
     /// Seitenzahl, die ein anderes Gerät nach Löschen oder Einfügen gemeldet hat (nur Notizbücher)
     private var remotePageTarget: Int?
+    private var remoteTargetSince: Date?
     /// Stand vor der letzten Seitenänderung in der Übersicht
     private var pageUndo: PageUndo?
+    /// Seiten werden gerade gelöscht oder eingefügt: so lange kein Abgleich der Striche
+    private var restructuring = false
+    /// Die Ansicht ist verschwunden (Dokument geschlossen)
+    private var detached = false
+    /// Nach Seitenänderungen in einem PDF: Die verschobenen Striche warten, bis das neue PDF am Server ist
+    private var pdfHoldUntil: Date?
+    private var nextHoldRetry = Date.distantPast
+    /// Ein anderes Gerät hat Seiten geändert: Seine verschobenen Striche warten auf den neuen Seitenstand
+    private var structureSyncSince: Date?
+    /// IDs aller Striche werden im Hintergrund vorberechnet
+    private var idWarmup: Task<Void, Never>?
+    private var warmups = 0
+    private var persistWork: DispatchWorkItem?
+
+    /// Für den Abgleich in Paketen: Es gibt Neues, das zuerst hinaus soll
+    var hasUnsyncedLocalChanges: Bool { localChanged }
+    var isRestructuring: Bool { restructuring }
+
+    /// Leinwand- in Seitenpunkte
+    private var toPage: CGAffineTransform { CGAffineTransform(scaleX: 1 / k, y: 1 / k) }
 
     private func pageDrawing() -> PKDrawing {
-        canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k))
+        canvas.drawing.transformed(using: toPage)
     }
 
+    private var canSync: Bool {
+        sync.isConfigured && k > 0 && !restructuring && !detached && UIApplication.shared.applicationState == .active
+    }
+
+    /// Gleicht ab: schickt eigene Änderungen und holt fremde. Läuft schon ein Abgleich, folgt gleich danach noch einer.
     private func syncCycle() {
-        guard sync.isConfigured, k > 0, !sync.isBusy(doc.id), UIApplication.shared.applicationState == .active else { return }
-        // Fremde Änderungen müssen drin sein, bevor der eigene Stand verglichen wird
-        if !pending.isEmpty {
-            guard !toolBusy else { return }
-            applyPending()
+        guard canSync else { return }
+        if syncTask != nil {
+            fetchAgain = true
+            return
         }
-        let snapshot = localChanged ? pageDrawing() : nil
-        localChanged = false
-        let sync = self.sync, id = doc.id
-        Task { [weak self] in
-            let ok = await sync.syncStrokes(id, snapshot: snapshot)
-            if !ok, snapshot != nil { self?.localChanged = true }
+        syncTask = Task { [weak self] in
+            await self?.syncLoop()
+            self?.syncTask = nil
         }
     }
 
-    /// Kurz nach einem Strich abgleichen, damit Zuschauer ihn gleich sehen
+    private func syncLoop() async {
+        // Große Dokumente: Erst wenn alle IDs bekannt sind, sonst hielte das Hashen die App an
+        for _ in 0..<3 {
+            guard let warmup = idWarmup else { break }
+            await warmup.value
+        }
+        var again = true
+        while again, canSync {
+            fetchAgain = false
+            let holding = holdingStrokes
+            if holding, Date() > nextHoldRetry {
+                // Das neue PDF muss zuerst hinauf, bis dahin warten die verschobenen Striche
+                nextHoldRetry = Date().addingTimeInterval(6)
+                let sync = self.sync
+                Task { [weak self] in
+                    await sync.syncLibrary()
+                    self?.syncCycle()
+                }
+            }
+            let snapshot = localChanged && !holding ? strokeSnapshot() : nil
+            if snapshot != nil { localChanged = false }
+            let hint = remoteSeqHint
+            let ok = await sync.syncStrokes(doc.id, snapshot: snapshot)
+            guard ok else {
+                // Nächster Versuch mit dem Takt (alle 3 Sekunden), nicht sofort
+                if snapshot != nil { localChanged = true }
+                return
+            }
+            let known = sync.knownSeq(doc.id)
+            // Kam während der Anfrage kein neuer Hinweis, ist der alte erledigt (auch nach einem Neustart des Servers)
+            if remoteSeqHint == hint { remoteSeqHint = min(remoteSeqHint, known) }
+            schedulePersist()
+            again = fetchAgain || (localChanged && !holdingStrokes) || remoteSeqHint > known
+        }
+    }
+
+    private var holdingStrokes: Bool {
+        guard let until = pdfHoldUntil else { return false }
+        if Date() < until, sync.pdfUploadPending.contains(doc.id) { return true }
+        pdfHoldUntil = nil
+        return false
+    }
+
+    /// Stand der Leinwand für den Abgleich. Fremde Änderungen, die noch auf die Leinwand warten (der Stift
+    /// schreibt gerade), zählen schon mit: Sonst hielte der Abgleich sie für hier gelöscht.
+    private func strokeSnapshot() -> StrokeSnapshot {
+        let start = CACurrentMediaTime()
+        var snapshot = StrokeSnapshot(canvas.drawing.strokes, toPage: toPage)
+        if !pending.isEmpty {
+            snapshot.alsoPresent = Set(pending.added.map { $0.id })
+            snapshot.alsoGone = pending.removed
+        }
+        Log.sync.info("Stand der Leinwand: \(snapshot.strokes.count) Striche in \(CanvasController.ms(since: start)) ms")
+        return snapshot
+    }
+
+    nonisolated static func ms(since start: CFTimeInterval) -> Int { Int((CACurrentMediaTime() - start) * 1000) }
+
+    /// IDs aller Striche im Hintergrund vorberechnen (nach dem Laden oder Drehen), damit kein Abgleich die App
+    /// anhält, weil er Zehntausende Striche hashen müsste
+    private func warmUpIDs() {
+        warmups += 1
+        let number = warmups
+        let strokes = canvas.drawing.strokes, toPage = self.toPage
+        let start = CACurrentMediaTime()
+        idWarmup = Task { [weak self] in
+            await StrokeIDCache.shared.prewarm(strokes, toPage: toPage)
+            Log.sync.info("IDs vorberechnet: \(strokes.count) Striche in \(CanvasController.ms(since: start)) ms")
+            guard let self, self.warmups == number else { return }
+            self.idWarmup = nil
+            self.applyPendingWhenIdle()
+            self.syncCycle()
+        }
+    }
+
+    /// Gleich nach einem Strich abgleichen; die kurze Pause fasst Änderungen eines Augenblicks zusammen
     private var syncSoonWork: DispatchWorkItem?
     private func syncSoon() {
         syncSoonWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.syncCycle() }
         syncSoonWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: work)
+    }
+
+    /// Sync-Stand bald sichern (fasst viele Abgleiche zu einem Schreiben zusammen)
+    private func schedulePersist() {
+        persistWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.persistSyncStateNow() }
+        persistWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
+    /// Sichert den Sync-Stand, wenn die gespeicherte Zeichnung alles enthält, was er als vorhanden kennt:
+    /// Alle gelieferten fremden Änderungen sind eingefügt, und nichts ist ungespeichert. Sonst später
+    /// (das nächste Speichern oder Einfügen plant es neu).
+    private func persistSyncStateNow() {
+        persistWork?.cancel()
+        persistWork = nil
+        guard pending.isEmpty, !dirty, k > 0 else { return }
+        sync.persistState(doc.id)
     }
 
     // MARK: Live-Teilen
@@ -289,17 +445,31 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
               let type = obj["type"] as? String else { return }
         switch type {
         case "changes":
-            syncSoon()
+            // Ein neuerer Server meldet die Änderungsnummer: das eigene Echo und schon Geholtes übergehen
+            if let seq = (obj["seq"] as? NSNumber)?.intValue {
+                remoteSeqHint = max(remoteSeqHint, seq)
+                guard seq > sync.knownSeq(doc.id) else { return }
+                // Der laufende Abgleich sieht den Hinweis und holt gleich danach
+                if syncTask != nil { return }
+            }
+            syncCycle()
         case "pointer":
             guard let id = obj["id"] as? String, let author = obj["from"] as? String,
                   let pts = obj["pts"] as? [[Double]] else { return }
             let points = pts.compactMap { $0.count >= 2 ? CGPoint(x: $0[0], y: $0[1]) : nil }
+            let color = PointerOverlay.color(hex: obj["color"] as? String) ?? PointerOverlay.pink
             canvas.bringSubviewToFront(pointerOverlay)
-            pointerOverlay.add(id: id, author: author, points: points, end: obj["end"] as? Bool ?? false)
+            pointerOverlay.add(id: id, author: author, points: points, end: obj["end"] as? Bool ?? false, color: color)
         case "pages":
-            // Ein anderes Gerät hat Seiten gelöscht oder eingefügt
+            // Ein anderes Gerät hat Seiten gelöscht oder eingefügt. Seine verschobenen Striche erst einfügen,
+            // wenn hier auch die neuen Seiten (und das neue PDF) da sind
+            structureSyncSince = Date()
             let sync = self.sync
-            Task { await sync.syncLibrary() }
+            Task { [weak self] in
+                await sync.syncLibrary()
+                self?.structureSyncSince = nil
+                self?.applyPendingWhenIdle()
+            }
         case "presence":
             guests = obj["guests"] as? Int ?? 0
             onGuests(shared || guests > 0 ? guests : nil)
@@ -369,42 +539,51 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         applyPendingWhenIdle()
     }
 
-    /// Fremde Striche erst einfügen, wenn der Stift eine halbe Sekunde ruht
+    /// Fremde Striche erst einfügen, wenn der Stift eine halbe Sekunde ruht (und neue Seiten schon da sind)
     private func applyPendingWhenIdle() {
         pendingWork?.cancel()
         guard !pending.isEmpty else { return }
-        guard toolBusy else { applyPending(); return }
+        let waitForPages = structureSyncSince.map { Date().timeIntervalSince($0) < 15 } ?? false
+        guard toolBusy || waitForPages || idWarmup != nil else {
+            applyPending()
+            return
+        }
         let work = DispatchWorkItem { [weak self] in self?.applyPendingWhenIdle() }
         pendingWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
     }
 
+    /// Fügt die fremden Änderungen ein. Nur die neuen Striche kommen dazu; die übrigen bleiben, wie sie sind,
+    /// sodass PencilKit nicht alles neu zeichnen muss. Gespeichert wird im Hintergrund.
     private func applyPending() {
         guard !pending.isEmpty, k > 0 else { return }
+        let start = CACurrentMediaTime()
         let changes = pending
         pending = RemoteChanges()
-        guard let merged = StrokeCodec.apply(changes, to: pageDrawing()) else { return }
-        let wasEmpty = canvas.drawing.strokes.isEmpty
-        setDrawing(merged.transformed(using: CGAffineTransform(scaleX: k, y: k)))
+        guard let result = StrokeCodec.apply(changes, to: canvas.drawing, scale: k) else { return }
+        setDrawing(result.drawing)
         // Auf einer leeren Leinwand zeigt PencilKit den ersten Strich von außen sonst nicht an
-        if wasEmpty { redrawInkSoon() }
+        if result.wasEmpty { redrawInkSoon() }
         // Alte Rückgängig-Schritte würden fremde Striche wieder entfernen
         canvas.undoManager?.removeAllActions()
         fitToRemotePageCount()
         growIfNeeded()
+        // Eigene, noch nicht gespeicherte Änderungen sind in dieser Zeichnung mit drin
+        let touch = dirty
         dirty = false
         pendingSave?.cancel()
-        store.saveDrawing(merged, for: doc.id, pageCount: pageCount)
+        store.saveDrawing(result.drawing, toPage: toPage, for: doc.id, pageCount: pageCount, touch: touch)
+        schedulePersist()
+        onPagesChanged?()
+        Log.sync.info("Eingefügt: +\(changes.added.count) −\(changes.removed.count) in \(CanvasController.ms(since: start)) ms")
     }
-
-    /// Stand der Zeichnung nach dem Laden bzw. letzten Speichern; gleicher Stand wird nicht erneut gespeichert
-    private var savedData: Data?
 
     private func setDrawing(_ drawing: PKDrawing) {
         settingDrawing = true
         canvas.drawing = drawing
         settingDrawing = false
-        savedData = canvas.drawing.dataRepresentation()
+        baseline = canvas.drawing
+        toolUsedSinceSave = false
     }
 
     // MARK: Werkzeuge
@@ -435,8 +614,15 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         if !erasing { eraserCursor.isHidden = true }
     }
 
-    func undo() { canvas.undoManager?.undo() }
-    func redo() { canvas.undoManager?.redo() }
+    func undo() {
+        toolUsedSinceSave = true
+        canvas.undoManager?.undo()
+    }
+
+    func redo() {
+        toolUsedSinceSave = true
+        canvas.undoManager?.redo()
+    }
 
     // MARK: Zeigestift
 
@@ -444,15 +630,15 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         let points = g.takeSamples()
         switch g.state {
         case .began:
-            lockScrolling()
-            pointerCount += 1
-            pointerLine = "\(pointerAuthor)-\(pointerCount)"
-            pointerUnsent = []
-            canvas.bringSubviewToFront(pointerOverlay)
+            // Am iPhone (Finger) nicht sperren: Ein zweiter Finger soll scrollen können
+            if g.isPencil { lockScrolling() }
+            startPointerLine()
             addPointer(points, end: false)
         case .changed:
             addPointer(points, end: false)
         case .ended, .cancelled, .failed:
+            // Kurzes Antippen (die Geste begann gar nicht erst): ein leuchtender Punkt
+            if pointerLine == nil, g.state == .ended, !points.isEmpty { startPointerLine() }
             addPointer(points, end: true)
             pointerLine = nil
             unlockScrollingSoon()
@@ -461,16 +647,40 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         }
     }
 
+    private func startPointerLine() {
+        pointerCount += 1
+        pointerLine = "\(pointerAuthor)-\(pointerCount)"
+        pointerUnsent = []
+        canvas.bringSubviewToFront(pointerOverlay)
+    }
+
     /// Zeichnet die Punkte und schickt sie höchstens alle 30 ms an die anderen (am Ende sofort)
     private func addPointer(_ points: [CGPoint], end: Bool) {
         guard let id = pointerLine else { return }
-        pointerOverlay.add(id: id, author: pointerAuthor, points: points, end: end)
+        pointerOverlay.add(id: id, author: pointerAuthor, points: points, end: end, color: PointerOverlay.ownColor)
         pointerUnsent += points
-        guard end || Date().timeIntervalSince(lastPointerSend) > 0.03, let socket else { return }
+        pointerFlush?.cancel()
+        pointerFlush = nil
+        if end || Date().timeIntervalSince(lastPointerSend) > 0.03 {
+            sendPointer(id, end: end)
+        } else {
+            // Bleibt der Stift stehen, kommen keine neuen Punkte: den Rest trotzdem gleich schicken
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.pointerLine == id else { return }
+                self.sendPointer(id, end: false)
+            }
+            pointerFlush = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.035, execute: work)
+        }
+    }
+
+    private func sendPointer(_ id: String, end: Bool) {
+        guard let socket else { return }
         lastPointerSend = Date()
         let coords = pointerUnsent.map { "[\(Double(($0.x * 10).rounded()) / 10),\(Double(($0.y * 10).rounded()) / 10)]" }
         pointerUnsent = []
-        let text = "{\"type\":\"pointer\",\"from\":\"\(pointerAuthor)\",\"id\":\"\(id)\",\"end\":\(end),\"pts\":[\(coords.joined(separator: ","))]}"
+        let text = "{\"type\":\"pointer\",\"from\":\"\(pointerAuthor)\",\"id\":\"\(id)\",\"end\":\(end),"
+            + "\"color\":\"\(PointerOverlay.ownHex)\",\"pts\":[\(coords.joined(separator: ","))]}"
         socket.send(.string(text)) { _ in }
     }
 
@@ -482,13 +692,22 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         switch g.state {
         case .began:
             usingTool = true
-            lockScrolling()
+            toolUsedSinceSave = true
+            // Am iPhone (Finger) nicht sperren: Ein zweiter Finger soll scrollen können
+            if g.isPencil { lockScrolling() }
             eraseStart = canvas.drawing
             lastErasePoint = nil
             erase(at: p)
         case .changed:
             erase(at: p)
         case .ended, .cancelled, .failed:
+            if eraseStart == nil, g.state == .ended {
+                // Kurzes Antippen mit dem Finger (die Geste begann gar nicht erst): einmal radieren
+                toolUsedSinceSave = true
+                eraseStart = canvas.drawing
+                lastErasePoint = nil
+                erase(at: p)
+            }
             usingTool = false
             lastToolEnd = Date()
             defer { applyPendingWhenIdle() }
@@ -534,7 +753,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
         var strokes = canvas.drawing.strokes
         let before = strokes.count
-        strokes.removeAll { stroke in samples.contains { Self.stroke(stroke, hits: $0, radius: r) } }
+        strokes.removeAll { stroke in samples.contains { CanvasController.stroke(stroke, hits: $0, radius: r) } }
         if strokes.count != before {
             canvas.drawing = PKDrawing(strokes: strokes)
         }
@@ -588,7 +807,9 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
         usingTool = true
-        lockScrolling()
+        toolUsedSinceSave = true
+        // Handballen gibt es nur am iPad; am iPhone soll ein zweiter Finger weiter scrollen können
+        if isPad { lockScrolling() }
     }
 
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
@@ -661,10 +882,16 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         canvas.contentSize = CGSize(width: PageLayout.width * s, height: layout.totalHeight * s)
     }
 
+    /// Unterkante der Tinte in Seitenpunkten (nil = keine Tinte)
+    private var inkBottom: CGFloat? {
+        let bounds = canvas.drawing.bounds
+        guard k > 0, !bounds.isNull, !bounds.isEmpty, bounds.maxY.isFinite else { return nil }
+        return bounds.maxY / k
+    }
+
     /// Im Notizbuch kommt eine neue leere Seite dazu, sobald auf der letzten geschrieben wird
     private func growIfNeeded() {
-        guard pdf == nil, k > 0, !canvas.drawing.strokes.isEmpty else { return }
-        let bottom = canvas.drawing.bounds.maxY / k
+        guard pdf == nil, let bottom = inkBottom else { return }
         var grew = false
         while let last = PageLayout.notebook(pages: pageCount).frames.last, bottom > last.minY {
             pageCount += 1
@@ -697,36 +924,26 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         updateContentSize()
     }
 
+    /// Speichert im Hintergrund (Umrechnen und Kodieren der ganzen Zeichnung soll den Stift nie bremsen)
     @objc func saveNow() {
         pendingSave?.cancel()
         pendingSave = nil
         guard dirty, k > 0 else { return }
         dirty = false
-        // Bloßes Öffnen (PencilKit meldet manchmal verspätet eine „Änderung“) soll nichts speichern
-        let current = canvas.drawing.dataRepresentation()
-        guard current != savedData else { return }
-        savedData = current
-        let pageUnits = canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k))
-        store.saveDrawing(pageUnits, for: doc.id, pageCount: pageCount)
-    }
-}
-
-/// Meldet Berührungen sofort (ohne Mindestbewegung wie beim Pan), damit auch ein kurzes Antippen radiert
-final class EraserGesture: UIGestureRecognizer {
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
-        state = (state == .possible && touches.count == 1) ? .began : .failed
+        let current = canvas.drawing
+        // Bloßes Öffnen (PencilKit meldet manchmal verspätet eine „Änderung“) soll nichts speichern:
+        // Ohne Werkzeug seither vergleicht der Hintergrund mit dem letzten Stand
+        let base = toolUsedSinceSave ? nil : baseline
+        store.saveDrawing(current, toPage: toPage, for: doc.id, pageCount: pageCount, touch: true, unlessEqualTo: base)
+        baseline = current
+        toolUsedSinceSave = false
+        schedulePersist()
     }
 
-    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
-        state = .changed
-    }
-
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
-        state = .ended
-    }
-
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
-        state = .cancelled
+    @objc private func appWillResignActive() {
+        if !toolBusy { applyPending() }
+        saveNow()
+        persistSyncStateNow()
     }
 }
 
@@ -862,10 +1079,15 @@ extension CanvasController {
 
 // MARK: Seiten löschen und einfügen (Seitenübersicht)
 
-/// Stand vor der letzten Seitenänderung, für „Rückgängig“ in der Übersicht
+/// Wie die letzte Seitenänderung rückgängig zu machen ist, für „Rückgängig“ in der Übersicht.
+/// Rückgängig rechnet die Seiten zurück, statt den alten Stand einzusetzen: Striche, die inzwischen
+/// von anderen Geräten kamen, bleiben so erhalten.
 struct PageUndo {
-    /// Zeichnung in Seitenpunkten
-    let drawing: PKDrawing
+    /// Striche der gelöschten Seiten (Seitenpunkte, Koordinaten vor der Änderung)
+    let removed: [PKStroke]
+    /// Für jede Seite jetzt: welche Seite sie vorher war (nil = eingefügte Seite)
+    let inverse: (Int) -> Int?
+    /// Seitenzahl des Notizbuchs vor der Änderung
     let pageCount: Int
     /// Kopie des PDFs vor der Änderung (nur bei PDF-Dokumenten)
     let pdfBackup: URL?
@@ -875,15 +1097,30 @@ struct PageEditError: LocalizedError {
     let errorDescription: String?
 }
 
+/// Was die Übersicht für ihre Vorschaubilder braucht. Umrechnen und Sortieren der Striche läuft im Hintergrund.
+struct OverviewSource: @unchecked Sendable {
+    let frames: [CGRect]
+    let pdf: CGPDFDocument?
+    /// Zeichnung der Leinwand und wie sie in Seitenpunkte umzurechnen ist
+    let ink: PKDrawing
+    let toPage: CGAffineTransform
+
+    func build() -> PageExport {
+        PageExport(frames: frames, pdf: pdf, ink: ink.transformed(using: toPage)).indexed()
+    }
+}
+
 extension CanvasController {
-    /// Momentaufnahme aller Seiten für die Vorschaubilder der Übersicht
-    func overviewSnapshot() -> PageExport {
+    /// Momentaufnahme aller Seiten für die Übersicht (fremde Striche zuerst einfügen)
+    func overviewSource() -> OverviewSource {
         applyPending()
         saveNow()
-        return exporter
+        return OverviewSource(frames: layout.frames, pdf: pdf, ink: canvas.drawing,
+                              toPage: CGAffineTransform(scaleX: 1 / max(k, 0.0001), y: 1 / max(k, 0.0001)))
     }
 
     var canUndoPageChange: Bool { pageUndo != nil }
+    var pageTotal: Int { layout.frames.count }
 
     /// Springt so, dass Seite `i` oben unter der Leiste beginnt
     func scrollToPage(_ i: Int) {
@@ -896,37 +1133,69 @@ extension CanvasController {
         sendView(force: true)
     }
 
-    /// Seite, auf der ein Strich liegt (nach seiner Mitte)
-    private static func page(of stroke: PKStroke, in layout: PageLayout) -> Int {
-        let midY = stroke.renderBounds.midY
-        return layout.frames.lastIndex { $0.minY - layout.gap <= midY } ?? 0
+    /// Seiten, auf denen etwas steht
+    private func inkedPages() -> Set<Int> {
+        guard k > 0, !layout.frames.isEmpty else { return [] }
+        var pages = Set<Int>()
+        for stroke in canvas.drawing.strokes {
+            pages.insert(layout.page(at: stroke.renderBounds.midY / k))
+        }
+        return pages
     }
 
     /// Löscht Seiten samt ihren Notizen; die Seiten darunter rücken nach
     func deletePages(_ pages: Set<Int>, done: @escaping (String?) -> Void) {
-        let gone = pages.filter { layout.frames.indices.contains($0) }
+        guard !restructuring else { done("Einen Moment, die letzte Änderung läuft noch"); return }
+        var gone = pages.filter { layout.frames.indices.contains($0) }
         guard !gone.isEmpty else { done(nil); return }
-        if pdf != nil, gone.count >= layout.frames.count {
-            done("Mindestens eine Seite muss bleiben")
-            return
+        let count = layout.frames.count
+        if pdf != nil {
+            if gone.count >= count {
+                done("Mindestens eine Seite muss bleiben")
+                return
+            }
+        } else {
+            // Nach der letzten beschriebenen Seite bleibt immer eine leere (sie käme sofort wieder)
+            let lastInk = inkedPages().max() ?? -1
+            let tail = (lastInk + 1)..<count
+            if !tail.isEmpty, tail.allSatisfy({ gone.contains($0) }), let keep = tail.last { gone.remove(keep) }
+            guard !gone.isEmpty else {
+                done("Die leere Seite am Ende bleibt immer da")
+                return
+            }
         }
         let sorted = gone.sorted()
-        let mapping: (Int) -> Int? = { i in
-            gone.contains(i) ? nil : i - sorted.filter { $0 < i }.count
+        // Neue Nummer jeder alten Seite (nil = gelöscht)
+        var newIndex: [Int?] = []
+        var shift = 0
+        for i in 0..<count {
+            if gone.contains(i) {
+                newIndex.append(nil)
+                shift += 1
+            } else {
+                newIndex.append(i - shift)
+            }
         }
+        let table = newIndex
+        let mapping: (Int) -> Int? = { i in i >= 0 && i < table.count ? table[i] : i - sorted.count }
+        // Rückweg: Seite n jetzt war vorher die n-te verbliebene; danach Gewachsenes rückt um die gelöschten nach
+        let survivors = (0..<count).filter { !gone.contains($0) }
+        let inverse: (Int) -> Int? = { n in n < survivors.count ? survivors[n] : n + sorted.count }
         var edit: (@Sendable (PDFDocument) throws -> Void)?
         if pdf != nil {
             edit = { doc in
                 for i in sorted.reversed() { doc.removePage(at: i) }
             }
         }
-        restructure(mapping: mapping, notebookPages: max(pageCount - gone.count, 1), pdfEdit: edit, done: done)
+        restructure(pageDelta: -sorted.count, mapping: mapping, inverse: inverse, pdfEdit: edit, done: done)
     }
 
     /// Fügt eine leere karierte Seite ein, sodass sie Seite `index` wird
     func insertBlankPage(at index: Int, done: @escaping (String?) -> Void) {
+        guard !restructuring else { done("Einen Moment, die letzte Änderung läuft noch"); return }
         let j = min(max(index, 0), layout.frames.count)
         let mapping: (Int) -> Int? = { i in i >= j ? i + 1 : i }
+        let inverse: (Int) -> Int? = { n in n < j ? n : (n == j ? nil : n - 1) }
         var edit: (@Sendable (PDFDocument) throws -> Void)?
         if pdf != nil { edit = { doc in
             // So breit wie die Nachbarseite, im Format A4
@@ -936,12 +1205,12 @@ extension CanvasController {
                 let box = neighbor.bounds(for: .cropBox)
                 width = abs(neighbor.rotation) % 180 == 90 ? box.height : box.width
             }
-            guard let page = PDFDocument(data: Self.gridPagePDF(width: width))?.page(at: 0) else {
+            guard let page = PDFDocument(data: CanvasController.gridPagePDF(width: width))?.page(at: 0) else {
                 throw PageEditError(errorDescription: "Leere Seite konnte nicht erstellt werden")
             }
             doc.insert(page, at: j)
         } }
-        restructure(mapping: mapping, notebookPages: pageCount + 1, pdfEdit: edit, done: done)
+        restructure(pageDelta: 1, mapping: mapping, inverse: inverse, pdfEdit: edit, done: done)
     }
 
     /// Eine karierte Seite als einseitiges PDF (für das Einfügen in PDF-Dokumente)
@@ -957,23 +1226,79 @@ extension CanvasController {
         }
     }
 
+    /// Holt sofort, was am Server neu ist, und bringt es auf die Leinwand: Vor einer Seitenänderung soll alles,
+    /// was andere schon geschrieben haben, mit seiner Seite mitrücken. Eigenes geht erst danach hinaus
+    /// (es bekommt durch das Verschieben ohnehin neue IDs).
+    private func fetchRemoteNow() async {
+        if let running = syncTask { await running.value }
+        for _ in 0..<3 {
+            guard let warmup = idWarmup else { break }
+            await warmup.value
+        }
+        if sync.isConfigured, k > 0 {
+            await sync.syncStrokes(doc.id, snapshot: nil)
+        }
+        applyPending()
+    }
+
     /// Macht die letzte Seitenänderung rückgängig
     func undoPageChange(done: @escaping (String?) -> Void) {
-        guard let undo = pageUndo else { done(nil); return }
+        guard let undo = pageUndo, !restructuring else { done(nil); return }
         pageUndo = nil
-        applyPending()
-        if let backup = undo.pdfBackup {
-            let url = store.pdfURL(doc.id)
-            do {
-                _ = try FileManager.default.replaceItemAt(url, withItemAt: backup)
-            } catch {
-                done("Rückgängig fehlgeschlagen: \(error.localizedDescription)")
-                return
+        restructuring = true
+        Task { [weak self] in
+            guard let self else { return }
+            await self.fetchRemoteNow()
+            if let backup = undo.pdfBackup {
+                let url = self.store.pdfURL(self.doc.id)
+                do {
+                    _ = try FileManager.default.replaceItemAt(url, withItemAt: backup)
+                } catch {
+                    self.restructuring = false
+                    done("Rückgängig fehlgeschlagen: \(error.localizedDescription)")
+                    return
+                }
+                guard let restored = CGPDFDocument(url as CFURL) else {
+                    self.restructuring = false
+                    done("Rückgängig fehlgeschlagen: PDF lässt sich nicht öffnen")
+                    return
+                }
+                self.pdf = restored
             }
-            pdf = CGPDFDocument(url as CFURL)
+            let current = self.layout
+            let strokes = self.pageDrawing().strokes
+            // Notizbuch: so viele Seiten, dass auch inzwischen gewachsene Seiten einen Platz haben
+            let target = self.pdf.map { PageLayout.pdf($0) } ?? PageLayout.notebook(pages: undo.pageCount + current.frames.count)
+            let moved = CanvasController.move(strokes, from: current, to: target, mapping: undo.inverse)
+            self.commitPages(PKDrawing(strokes: moved.kept + undo.removed), pageCount: undo.pageCount,
+                             pdfChanged: undo.pdfBackup != nil)
+            done(nil)
         }
-        commitPages(undo.drawing, pageCount: undo.pageCount, pdfChanged: undo.pdfBackup != nil)
-        done(nil)
+    }
+
+    /// Verschiebt Striche mit ihrer Seite von `old` nach `new`; `mapping` sagt, welche Seite welche wird
+    /// (nil = fällt weg). Was keiner Seite sicher zuzuordnen ist, bleibt, wo es ist: lieber an der falschen
+    /// Stelle als verloren.
+    private static func move(_ strokes: [PKStroke], from old: PageLayout, to new: PageLayout,
+                             mapping: (Int) -> Int?) -> (kept: [PKStroke], removed: [PKStroke]) {
+        var kept: [PKStroke] = [], removed: [PKStroke] = []
+        guard !old.frames.isEmpty else { return (strokes, []) }
+        for stroke in strokes {
+            let i = old.page(at: stroke.renderBounds.midY)
+            guard let j = mapping(i) else {
+                removed.append(stroke)
+                continue
+            }
+            guard j >= 0, j < new.frames.count else {
+                kept.append(stroke)
+                continue
+            }
+            var s = stroke
+            s.transform = s.transform.concatenating(
+                CGAffineTransform(translationX: 0, y: new.frames[j].minY - old.frames[i].minY))
+            kept.append(s)
+        }
+        return (kept, removed)
     }
 
     /// Beim Schließen der Übersicht: Kopie für Rückgängig aufräumen
@@ -983,24 +1308,55 @@ extension CanvasController {
     }
 
     /// Ordnet Seiten neu: `mapping` sagt für jede alte Seite, welche neue Seite sie wird (nil = fällt weg).
-    /// Bei PDFs wird zuerst das PDF selbst geändert (im Hintergrund), dann rücken die Notizen mit.
-    private func restructure(mapping: @escaping (Int) -> Int?, notebookPages: Int,
+    /// Zuerst wird geholt, was andere Geräte schon geschrieben haben, damit es mitrückt. Bei PDFs wird dann
+    /// das PDF selbst geändert (im Hintergrund), danach rücken die Notizen mit.
+    private func restructure(pageDelta: Int, mapping: @escaping (Int) -> Int?, inverse: @escaping (Int) -> Int?,
                              pdfEdit: (@Sendable (PDFDocument) throws -> Void)?, done: @escaping (String?) -> Void) {
-        applyPending()
-        saveNow()
+        restructuring = true
         discardPageUndo()
-        let url = store.pdfURL(doc.id)
-        let backup: URL? = {
-            guard pdfEdit != nil else { return nil }
-            let b = url.deletingLastPathComponent().appendingPathComponent("source-undo.pdf")
-            try? FileManager.default.removeItem(at: b)
-            return (try? FileManager.default.copyItem(at: url, to: b)) != nil ? b : nil
-        }()
-        let undo = PageUndo(drawing: pageDrawing(), pageCount: pageCount, pdfBackup: backup)
-
-        let finish: (CGPDFDocument?) -> Void = { [weak self] newPDF in
+        Task { [weak self] in
             guard let self else { return }
-            // Was inzwischen von anderen Geräten kam, liegt noch im alten Layout: erst einfügen, dann verschieben
+            await self.fetchRemoteNow()
+            var backup: URL?
+            var newPDF: CGPDFDocument?
+            if let pdfEdit {
+                let url = self.store.pdfURL(self.doc.id)
+                do {
+                    backup = try await PageExport.run { () -> URL? in
+                        let fm = FileManager.default
+                        // Kopie für Rückgängig (fehlt sie, geht es eben ohne Rückgängig)
+                        let copy = url.deletingLastPathComponent().appendingPathComponent("source-undo.pdf")
+                        try? fm.removeItem(at: copy)
+                        let saved = (try? fm.copyItem(at: url, to: copy)) != nil ? copy : nil
+                        do {
+                            guard let doc = PDFDocument(url: url) else {
+                                throw PageEditError(errorDescription: "PDF lässt sich nicht öffnen")
+                            }
+                            try pdfEdit(doc)
+                            let tmp = url.deletingLastPathComponent().appendingPathComponent("source-new.pdf")
+                            try? fm.removeItem(at: tmp)
+                            guard doc.write(to: tmp) else {
+                                throw PageEditError(errorDescription: "PDF lässt sich nicht speichern")
+                            }
+                            _ = try fm.replaceItemAt(url, withItemAt: tmp)
+                        } catch {
+                            if let saved { try? fm.removeItem(at: saved) }
+                            throw error
+                        }
+                        return saved
+                    }
+                    guard let p = CGPDFDocument(url as CFURL) else {
+                        throw PageEditError(errorDescription: "Geändertes PDF lässt sich nicht öffnen")
+                    }
+                    newPDF = p
+                } catch {
+                    if let backup { try? FileManager.default.removeItem(at: backup) }
+                    self.restructuring = false
+                    done("Seiten ändern fehlgeschlagen: \(error.localizedDescription)")
+                    return
+                }
+            }
+            // Was eben noch kam, liegt im alten Layout: erst einfügen, dann verschieben
             self.applyPending()
             let old = self.layout
             let strokes = self.pageDrawing().strokes
@@ -1009,50 +1365,12 @@ extension CanvasController {
                 self.pdf = newPDF
                 new = .pdf(newPDF)
             } else {
-                new = .notebook(pages: notebookPages)
+                new = .notebook(pages: max(old.frames.count + pageDelta, 1))
             }
-            let moved = strokes.compactMap { stroke -> PKStroke? in
-                let i = Self.page(of: stroke, in: old)
-                guard i < old.frames.count, let j = mapping(i), j < new.frames.count else {
-                    // Notizen unter der letzten Seite (sollte es nicht geben) bleiben, wo sie sind
-                    return i < old.frames.count ? nil : stroke
-                }
-                var s = stroke
-                s.transform = s.transform.concatenating(
-                    CGAffineTransform(translationX: 0, y: new.frames[j].minY - old.frames[i].minY))
-                return s
-            }
-            self.pageUndo = undo
-            self.commitPages(PKDrawing(strokes: moved), pageCount: notebookPages, pdfChanged: newPDF != nil)
+            let moved = CanvasController.move(strokes, from: old, to: new, mapping: mapping)
+            self.pageUndo = PageUndo(removed: moved.removed, inverse: inverse, pageCount: old.frames.count, pdfBackup: backup)
+            self.commitPages(PKDrawing(strokes: moved.kept), pageCount: new.frames.count, pdfChanged: newPDF != nil)
             done(nil)
-        }
-
-        guard let pdfEdit else {
-            finish(nil)
-            return
-        }
-        Task {
-            do {
-                try await PageExport.run {
-                    guard let doc = PDFDocument(url: url) else {
-                        throw PageEditError(errorDescription: "PDF lässt sich nicht öffnen")
-                    }
-                    try pdfEdit(doc)
-                    let tmp = url.deletingLastPathComponent().appendingPathComponent("source-new.pdf")
-                    try? FileManager.default.removeItem(at: tmp)
-                    guard doc.write(to: tmp) else {
-                        throw PageEditError(errorDescription: "PDF lässt sich nicht speichern")
-                    }
-                    _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
-                }
-                guard let newPDF = CGPDFDocument(url as CFURL) else {
-                    throw PageEditError(errorDescription: "Geändertes PDF lässt sich nicht öffnen")
-                }
-                finish(newPDF)
-            } catch {
-                if let backup { try? FileManager.default.removeItem(at: backup) }
-                done("Seiten ändern fehlgeschlagen: \(error.localizedDescription)")
-            }
         }
     }
 
@@ -1067,31 +1385,55 @@ extension CanvasController {
         redrawInkSoon()
         dirty = false
         pendingSave?.cancel()
-        store.saveDrawing(drawing, for: doc.id, pageCount: pageCount)
-        if pdfChanged { store.notePDFChanged(doc.id) }
+        store.saveDrawing(drawing, for: doc.id, pageCount: pageCount, touch: true)
+        // Neue Seitenversion: Andere Geräte übernehmen Seitenzahl bzw. PDF, auch wenn sie inzwischen selbst
+        // etwas gespeichert haben
+        store.notePagesChanged(doc.id, pdf: pdfChanged)
+        if pdfChanged {
+            // Die verschobenen Striche erst schicken, wenn das neue PDF am Server ist (höchstens 30 s warten)
+            sync.notePDFUploadPending(doc.id)
+            pdfHoldUntil = Date().addingTimeInterval(30)
+            nextHoldRetry = Date().addingTimeInterval(6)
+        }
         localChanged = true
-        syncSoon()
+        restructuring = false
+        schedulePersist()
+        warmUpIDs()
         let sync = self.sync
-        Task { await sync.syncLibrary() }
+        Task { [weak self] in
+            await sync.syncLibrary()
+            self?.syncCycle()
+        }
+        syncCycle()
     }
 
     /// Ein anderes Gerät hat Seiten gelöscht oder eingefügt: neue Seitenzahl bzw. neues PDF übernehmen
     func remoteStructureChanged(pageCount n: Int, pdfChanged: Bool) {
+        // Das eigene Rückgängig passt nicht mehr zu den neuen Seiten
+        discardPageUndo()
         if pdfChanged, doc.kind == .pdf {
-            pdf = CGPDFDocument(store.pdfURL(doc.id) as CFURL)
-            discardPageUndo()
+            pdf = CGPDFDocument(store.pdfURL(doc.id) as CFURL) ?? pdf
             if k > 0 { rebuildPages() }
         }
         if doc.kind == .notebook {
             remotePageTarget = max(n, 1)
+            remoteTargetSince = Date()
             fitToRemotePageCount()
         }
+        onPagesChanged?()
     }
 
-    /// Notizbuch auf die gemeldete Seitenzahl bringen, aber nie eine Seite mit Notizen abschneiden
+    /// Notizbuch auf die gemeldete Seitenzahl bringen, aber nie eine Seite mit Notizen abschneiden.
+    /// Erledigt, sobald die verschobenen Striche da sind (oder nach einer halben Minute).
     private func fitToRemotePageCount() {
         guard let target = remotePageTarget, pdf == nil, k > 0 else { return }
-        let want = PageLayout.pagesNeeded(for: pageDrawing(), kind: .notebook, current: target)
+        var want = max(target, 1)
+        if let bottom = inkBottom {
+            while bottom > PageLayout.gap + CGFloat(want - 1) * (PageLayout.a4Height + PageLayout.gap) { want += 1 }
+        }
+        if want == target || Date().timeIntervalSince(remoteTargetSince ?? .distantPast) > 30 {
+            remotePageTarget = nil
+        }
         guard want != pageCount else { return }
         pageCount = want
         rebuildPages()

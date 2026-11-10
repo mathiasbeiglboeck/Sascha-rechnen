@@ -8,10 +8,42 @@ struct PageExport: @unchecked Sendable {
     let frames: [CGRect]
     let pdf: CGPDFDocument?
     let ink: PKDrawing
+    /// Striche je Seite, einmal vorsortiert (siehe `indexed()`); sonst wird je Seite die ganze Zeichnung durchsucht
+    private var byPage: [[PKStroke]]?
 
-    /// Striche je Seite (ein Strich über eine Seitengrenze hinweg gehört zu beiden)
-    private func strokes(on frame: CGRect) -> [PKStroke] {
-        ink.strokes.filter { $0.renderBounds.intersects(frame) }
+    init(frames: [CGRect], pdf: CGPDFDocument?, ink: PKDrawing) {
+        self.frames = frames
+        self.pdf = pdf
+        self.ink = ink
+    }
+
+    /// Dieselbe Momentaufnahme mit den Strichen nach Seiten sortiert: Die Übersicht fragt jede Seite einzeln
+    /// ab, und ein Skriptum mit 100 Seiten und 10 000 Strichen soll dafür nicht 100-mal alles durchsuchen.
+    func indexed() -> PageExport {
+        var copy = self
+        var pages = Array(repeating: [PKStroke](), count: frames.count)
+        if !frames.isEmpty {
+            let layout = PageLayout(frames: frames, gap: PageLayout.gap)
+            for stroke in ink.strokes {
+                let b = stroke.renderBounds
+                guard !b.isNull, !b.isEmpty else { continue }
+                // Erste Seite, die der Strich berühren kann, dann so weit, wie er reicht
+                var i = max(layout.page(at: b.minY) - 1, 0)
+                while i < frames.count, frames[i].minY <= b.maxY {
+                    if frames[i].intersects(b) { pages[i].append(stroke) }
+                    i += 1
+                }
+            }
+        }
+        copy.byPage = pages
+        return copy
+    }
+
+    /// Striche einer Seite (ein Strich über eine Seitengrenze hinweg gehört zu beiden)
+    private func strokes(on i: Int) -> [PKStroke] {
+        if let byPage, byPage.indices.contains(i) { return byPage[i] }
+        let frame = frames[i]
+        return ink.strokes.filter { $0.renderBounds.intersects(frame) }
     }
 
     /// Zeichnet Seite `i` (Hintergrund und Tinte) in Seitenpunkten ab (0, 0)
@@ -25,7 +57,7 @@ struct PageExport: @unchecked Sendable {
         } else {
             PageView.drawGrid(in: ctx, rect: rect, lineWidth: 0.5)
         }
-        let own = strokes(on: frame)
+        let own = strokes(on: i)
         guard !own.isEmpty else { return }
         // Nur den Bereich mit Tinte rastern, nicht die ganze Seite
         let area = own.reduce(CGRect.null) { $0.union($1.renderBounds) }.intersection(frame).integral
@@ -65,6 +97,17 @@ struct PageExport: @unchecked Sendable {
         return UIGraphicsImageRenderer(size: frames[i].size, format: format).pngData { c in
             drawPage(i, in: c.cgContext, inkScale: 2)
         }
+    }
+
+    /// Kennzahl der Tinte auf einer Seite: ändert sich, wenn dort ein Strich dazukommt, wegfällt oder sich bewegt
+    func inkFingerprint(page i: Int) -> Int {
+        var h = Hasher()
+        for s in strokes(on: i) {
+            let b = s.renderBounds
+            for v in [b.minX, b.minY, b.maxX, b.maxY] { h.combine(Int((v * 4).rounded())) }
+            h.combine(s.path.count)
+        }
+        return h.finalize()
     }
 
     /// Kleines Vorschaubild einer Seite, `pixelWidth` Pixel breit

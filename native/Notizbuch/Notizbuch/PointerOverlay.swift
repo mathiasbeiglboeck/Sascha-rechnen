@@ -1,14 +1,32 @@
 import UIKit
-import UIKit.UIGestureRecognizerSubclass
 
 /// Zeigestift: leuchtende Linien, um Mitschauende auf etwas hinzuweisen.
 /// Sie werden nie gespeichert und laufen nicht über den Strich-Abgleich, sondern gehen direkt
 /// über die Live-Verbindung an alle anderen. Etwa zehn Sekunden nach dem Absetzen verblassen sie;
 /// wer gleich weiterzeigt, hält alle seine Linien so lange sichtbar.
 ///
+/// Jede Person zeigt in ihrer eigenen Farbe: das iPad immer lila, das iPhone pink, Gäste im Browser
+/// bekommen vom Server je eine andere Farbe.
+///
 /// Koordinaten in Seitenpunkten (wie die Seiten), die Ansicht wird mit der Leinwand skaliert.
 final class PointerOverlay: UIView {
-    static let color = UIColor(red: 1.0, green: 0.12, blue: 0.56, alpha: 1)
+    static let purpleHex = "#9438ff"
+    static let pinkHex = "#ff1f8f"
+    /// Für Linien ohne Farbangabe (ältere Geräte)
+    static let pink = color(hex: pinkHex) ?? .systemPink
+    /// Farbe dieses Geräts
+    static var ownHex: String { UIDevice.current.userInterfaceIdiom == .pad ? purpleHex : pinkHex }
+    static var ownColor: UIColor { color(hex: ownHex) ?? pink }
+
+    /// "#rrggbb" → Farbe (nil bei allem anderen)
+    static func color(hex: String?) -> UIColor? {
+        guard let hex, hex.count == 7, hex.first == "#",
+              hex.dropFirst().allSatisfy(\.isHexDigit),
+              let v = UInt32(hex.dropFirst(), radix: 16) else { return nil }
+        return UIColor(red: CGFloat((v >> 16) & 0xff) / 255, green: CGFloat((v >> 8) & 0xff) / 255,
+                       blue: CGFloat(v & 0xff) / 255, alpha: 1)
+    }
+
     /// Breite in Seitenpunkten
     static let width: CGFloat = 4.5
     static let fadeAfter: TimeInterval = 10
@@ -31,8 +49,8 @@ final class PointerOverlay: UIView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) wird nicht verwendet") }
 
-    /// Punkte an eine Linie anhängen (neue Linie, wenn die ID unbekannt ist)
-    func add(id: String, author: String, points: [CGPoint], end: Bool) {
+    /// Punkte an eine Linie anhängen (neue Linie in `color`, wenn die ID unbekannt ist)
+    func add(id: String, author: String, points: [CGPoint], end: Bool, color: UIColor) {
         var line: Line
         if let existing = lines[id] {
             line = existing
@@ -40,7 +58,7 @@ final class PointerOverlay: UIView {
             let halo = CAShapeLayer(), core = CAShapeLayer()
             for (layer, w, alpha) in [(halo, Self.width * 3.2, CGFloat(0.22)), (core, Self.width, CGFloat(1))] {
                 layer.fillColor = nil
-                layer.strokeColor = Self.color.withAlphaComponent(alpha).cgColor
+                layer.strokeColor = color.withAlphaComponent(alpha).cgColor
                 layer.lineWidth = w
                 layer.lineCap = .round
                 layer.lineJoin = .round
@@ -92,52 +110,5 @@ final class PointerOverlay: UIView {
         }
         path.addLine(to: p[p.count - 1])
         return path
-    }
-}
-
-/// Sammelt alle Punkte (auch die zwischen zwei Bildern, „coalesced“) in den Koordinaten von `target`
-final class PointerGesture: UIGestureRecognizer {
-    weak var space: UIView?
-    private var samples: [CGPoint] = []
-
-    /// Neue Punkte seit dem letzten Abholen
-    func takeSamples() -> [CGPoint] {
-        defer { samples.removeAll() }
-        return samples
-    }
-
-    private func collect(_ touch: UITouch, _ event: UIEvent) {
-        let space = self.space ?? view
-        for t in event.coalescedTouches(for: touch) ?? [touch] {
-            samples.append(t.location(in: space))
-        }
-    }
-
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
-        guard state == .possible, touches.count == 1, let t = touches.first else {
-            state = .failed
-            return
-        }
-        samples.append(t.location(in: space ?? view))
-        state = .began
-    }
-
-    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
-        if let t = touches.first { collect(t, event) }
-        state = .changed
-    }
-
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
-        if let t = touches.first { samples.append(t.location(in: space ?? view)) }
-        state = .ended
-    }
-
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
-        state = .cancelled
-    }
-
-    override func reset() {
-        super.reset()
-        samples.removeAll()
     }
 }

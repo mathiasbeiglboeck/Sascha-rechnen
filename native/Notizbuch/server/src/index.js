@@ -13,6 +13,9 @@ import viewerHTML from "./viewer.html";
 
 const CHUNK = 1024 * 1024;
 const RECIPIENTS = ["claude", "chatgpt"];
+// Zeigestift-Farben der Gäste im Browser, je Gast eine andere. Lila (iPad) und Pink (iPhone) gehören den Apps.
+const GUEST_COLORS = ["#00a8e8", "#ff7a00", "#00b386", "#ff3b30", "#2f6bff", "#e0a800"];
+const isColor = (c) => typeof c === "string" && /^#[0-9a-fA-F]{6}$/.test(c);
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
@@ -133,39 +136,49 @@ export class Store extends DurableObject {
     }));
   }
 
-  /// Letzte Änderung gewinnt; gelöschte Dokumente bleiben als Grabstein (deleted: true)
+  /// Letzte Änderung gewinnt (modified); gelöschte Dokumente bleiben als Grabstein (deleted: true).
+  /// Seitenzahl und PDF-Version folgen dagegen der neuesten Seitenänderung (pagesVersion, pdfVersion)
+  /// und gehen nie zurück: Ein Gerät, das von der Seitenänderung noch nichts weiß, darf sie nicht überschreiben.
   putMeta(id, meta) {
     if (typeof meta !== "object" || meta === null) throw new Error("meta fehlt");
     meta.id = id;
     const modified = Number(meta.modified) || 0;
     const existing = this.sql.exec("SELECT meta, modified FROM docs WHERE id = ?", id).toArray()[0];
-    if (existing && existing.modified > modified) return JSON.parse(existing.meta);
-    const clean = { ...meta };
-    delete clean.strokeSeq;
-    delete clean.hasPDF;
-    this.sql.exec(
-      "INSERT OR REPLACE INTO docs (id, meta, modified, seq) VALUES (?, ?, ?, ?)",
-      id, JSON.stringify(clean), modified, this.nextSeq(),
-    );
-    if (clean.deleted) {
-      this.sql.exec("DELETE FROM strokes WHERE doc = ?", id);
-      this.deleteBlob(`pdf/${id}`);
-    } else if (existing) {
-      // Seiten gelöscht oder eingefügt: offene Ansichten bauen ihre Seiten neu auf
-      const before = JSON.parse(existing.meta);
-      if ((clean.pdfVersion || 0) !== (before.pdfVersion || 0) || (Number(clean.pageCount) || 0) < (Number(before.pageCount) || 0)) {
-        this.broadcast(id, { type: "pages" });
+    const before = existing ? JSON.parse(existing.meta) : null;
+    let result;
+    if (existing && existing.modified > modified) {
+      // Älterer Stand: höchstens eine neuere Seitenänderung bzw. PDF-Version übernehmen
+      if (before.deleted || !newerStructure(meta, before)) return before;
+      result = { ...before };
+      takeStructure(result, meta);
+      this.sql.exec("UPDATE docs SET meta = ?, seq = ? WHERE id = ?", JSON.stringify(result), this.nextSeq(), id);
+    } else {
+      result = { ...meta };
+      delete result.strokeSeq;
+      delete result.hasPDF;
+      if (before && !result.deleted) takeStructure(result, before);
+      this.sql.exec(
+        "INSERT OR REPLACE INTO docs (id, meta, modified, seq) VALUES (?, ?, ?, ?)",
+        id, JSON.stringify(result), modified, this.nextSeq(),
+      );
+      if (result.deleted) {
+        this.sql.exec("DELETE FROM strokes WHERE doc = ?", id);
+        this.deleteBlob(`pdf/${id}`);
       }
     }
-    return clean;
+    // Seiten gelöscht oder eingefügt: offene Ansichten bauen ihre Seiten neu auf
+    if (before && !result.deleted && newerStructure(result, before)) this.broadcast(id, { type: "pages" });
+    return result;
   }
 
   /// body: { since, add: [{ id, data }], remove: [id] }  →  { seq, changes: [{ id, data | null }] }
+  /// Was die Anfrage selbst schreibt, kommt nicht zurück (sonst ginge nach einer Seitenänderung alles doppelt hin und her).
   syncDoc(doc, body) {
     const since = Number(body.since) || 0;
+    const upTo = this.sql.exec("SELECT v FROM counter WHERE k = 'seq'").toArray()[0]?.v || 0;
     this.applyOps(doc, body.add || [], body.remove || []);
     const rows = this.sql
-      .exec("SELECT id, data, alive, seq FROM strokes WHERE doc = ? AND seq > ? ORDER BY seq", doc, since)
+      .exec("SELECT id, data, alive, seq FROM strokes WHERE doc = ? AND seq > ? AND seq <= ? ORDER BY seq", doc, since, upTo)
       .toArray();
     const max = this.sql.exec("SELECT MAX(seq) AS s FROM strokes WHERE doc = ?", doc).one().s || 0;
     return { seq: max, changes: rows.map((r) => ({ id: r.id, data: r.alive ? r.data : null })) };
@@ -174,25 +187,46 @@ export class Store extends DurableObject {
   /// Schreibt Striche und meldet sie allen, die das Dokument gerade live offen haben
   applyOps(doc, add, remove) {
     const changes = [];
+    let last = 0;
     this.ctx.storage.transactionSync(() => {
       for (const s of add) {
         if (!s || typeof s.id !== "string" || typeof s.data !== "string" || s.data.length > 500000) continue;
+        last = this.nextSeq();
         this.sql.exec(
           "INSERT OR REPLACE INTO strokes (doc, id, data, alive, seq) VALUES (?, ?, ?, 1, ?)",
-          doc, s.id, s.data, this.nextSeq(),
+          doc, s.id, s.data, last,
         );
-        changes.push({ id: s.id, data: s.data });
+        changes.push({ id: s.id, data: s.data, seq: last });
       }
       for (const id of remove) {
         if (typeof id !== "string") continue;
+        last = this.nextSeq();
         this.sql.exec(
           "INSERT OR REPLACE INTO strokes (doc, id, data, alive, seq) VALUES (?, ?, NULL, 0, ?)",
-          doc, id, this.nextSeq(),
+          doc, id, last,
         );
-        changes.push({ id, data: null });
+        changes.push({ id, data: null, seq: last });
       }
     });
-    if (changes.length) this.broadcast(doc, { type: "changes", changes });
+    if (!changes.length) return;
+    // Apps holen die Striche selbst per Sync: ein kurzer Hinweis genügt. Mit der neuen Änderungsnummer:
+    // Wer sie schon kennt (der Absender selbst), muss nicht nachfragen.
+    this.broadcast(doc, { type: "changes", changes: [], seq: last }, `app:${doc}`);
+    // Browser bekommen die Striche mit, in Teilen von höchstens etwa 500 KB
+    // (nach einer Seitenänderung sind es alle Striche darunter auf einmal)
+    let part = [], size = 0;
+    const flush = () => {
+      if (part.length) this.broadcast(doc, { type: "changes", changes: part }, `guest:${doc}`);
+      part = [];
+      size = 0;
+    };
+    for (const c of changes) {
+      const n = (c.data ? c.data.length : 0) + c.id.length + 40;
+      if (size + n > 500000) flush();
+      part.push(c);
+      size += n;
+    }
+    flush();
   }
 
   // ---------- Live: WebSockets (Hibernation-API) ----------
@@ -201,8 +235,12 @@ export class Store extends DurableObject {
   accept(request, doc, role) {
     if (request.headers.get("upgrade") !== "websocket") return json({ error: "WebSocket erwartet" }, 426);
     const pair = new WebSocketPair();
+    const color = role === "guest" ? this.guestColor(doc, new URL(request.url).searchParams.get("c")) : null;
     this.ctx.acceptWebSocket(pair[1], [`doc:${doc}`, `${role}:${doc}`]);
+    if (color) pair[1].serializeAttachment({ color });
     if (role === "guest") {
+      // Eigene Zeigestift-Farbe (gilt, solange die Verbindung steht)
+      pair[1].send(JSON.stringify({ type: "you", color }));
       if (this.lastView?.[doc]) pair[1].send(JSON.stringify(this.lastView[doc]));
       this.presence(doc);
     } else {
@@ -210,6 +248,19 @@ export class Store extends DurableObject {
       pair[1].send(JSON.stringify({ type: "presence", guests: this.ctx.getWebSockets(`guest:${doc}`).length }));
     }
     return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  /// Farbe für einen neuen Gast: die gewünschte (die er vor einer Unterbrechung hatte), wenn sie frei ist,
+  /// sonst die erste freie; sind alle vergeben, reihum
+  guestColor(doc, wanted) {
+    const used = new Set();
+    for (const ws of this.ctx.getWebSockets(`guest:${doc}`)) {
+      const c = ws.deserializeAttachment()?.color;
+      if (c) used.add(c);
+    }
+    const want = wanted ? "#" + String(wanted).replace(/^#/, "").toLowerCase() : null;
+    if (want && GUEST_COLORS.includes(want) && !used.has(want)) return want;
+    return GUEST_COLORS.find((c) => !used.has(c)) || GUEST_COLORS[used.size % GUEST_COLORS.length];
   }
 
   broadcast(doc, msg, tag = `doc:${doc}`) {
@@ -241,8 +292,11 @@ export class Store extends DurableObject {
       const pts = msg.pts.slice(0, 4000)
         .filter((p) => Array.isArray(p) && p.length >= 2)
         .map((p) => [Number(p[0]) || 0, Number(p[1]) || 0]);
+      // Farbe: Gäste zeigen in der Farbe, die der Server ihnen gegeben hat, Apps in ihrer eigenen
+      const own = ws.deserializeAttachment()?.color;
+      const color = isColor(own) ? own : isColor(msg.color) ? msg.color.toLowerCase() : undefined;
       const out = JSON.stringify({
-        type: "pointer", id: msg.id.slice(0, 64), from: String(msg.from || "").slice(0, 64), end: !!msg.end, pts,
+        type: "pointer", id: msg.id.slice(0, 64), from: String(msg.from || "").slice(0, 64), end: !!msg.end, pts, color,
       });
       for (const other of this.ctx.getWebSockets(docTag)) {
         if (other !== ws) try { other.send(out); } catch {}
@@ -287,7 +341,12 @@ export class Store extends DurableObject {
       const strokes = this.sql
         .exec("SELECT id, data FROM strokes WHERE doc = ? AND alive = 1 ORDER BY seq", doc)
         .toArray();
-      return json({ title: meta.title, kind: meta.kind, pageCount: meta.pageCount || 1, pdfVersion: meta.pdfVersion || 0, strokes });
+      // Stand dieser Momentaufnahme: Live-Änderungen bis hierher sind darin schon enthalten
+      const seq = this.sql.exec("SELECT MAX(seq) AS s FROM strokes WHERE doc = ?", doc).one().s || 0;
+      return json({
+        title: meta.title, kind: meta.kind, pageCount: meta.pageCount || 1,
+        pdfVersion: meta.pdfVersion || 0, pagesVersion: meta.pagesVersion || 0, seq, strokes,
+      });
     }
     return json({ error: "Unbekannte Adresse" }, 404);
   }
@@ -353,4 +412,19 @@ export class Store extends DurableObject {
     }
     return new Response(out, { headers: { "content-type": meta.type || "application/octet-stream" } });
   }
+}
+
+// Seitenänderungen (löschen, einfügen) tragen eine eigene Version: pagesVersion für Seitenzahl und
+// Reihenfolge, pdfVersion für das PDF selbst. Beide gehen nie zurück.
+function newerStructure(a, b) {
+  return (Number(a.pagesVersion) || 0) > (Number(b.pagesVersion) || 0) || (Number(a.pdfVersion) || 0) > (Number(b.pdfVersion) || 0);
+}
+
+/// Übernimmt in `target` die Seitenangaben aus `other`, wo sie neuer sind
+function takeStructure(target, other) {
+  if ((Number(other.pagesVersion) || 0) > (Number(target.pagesVersion) || 0)) {
+    target.pagesVersion = Number(other.pagesVersion);
+    target.pageCount = other.pageCount;
+  }
+  if ((Number(other.pdfVersion) || 0) > (Number(target.pdfVersion) || 0)) target.pdfVersion = Number(other.pdfVersion);
 }

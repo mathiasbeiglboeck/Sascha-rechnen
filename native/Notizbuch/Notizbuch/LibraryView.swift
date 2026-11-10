@@ -364,7 +364,7 @@ struct DocCard: View {
                 .font(.caption).foregroundStyle(.secondary)
         }
         .contentShape(Rectangle())
-        .task(id: doc.modified) {
+        .task(id: "\(doc.modified.timeIntervalSince1970)-\(store.inkVersions[doc.id] ?? 0)") {
             image = store.thumbnail(for: doc, width: 300)
         }
     }
