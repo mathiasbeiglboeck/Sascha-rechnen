@@ -12,6 +12,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     var onToggleMenus: () -> Void = {}
     var onToggleEraser: () -> Void = {}
     var onFlash: (String) -> Void = { _ in }
+    /// Hinweis mit eigener Anzeigedauer; leerer Text blendet ihn aus
+    var onFlashTimed: (String, Double) -> Void = { _, _ in }
     var onGuests: (Int?) -> Void = { _ in }
 
     let doc: NoteDocument
@@ -637,130 +639,113 @@ extension CanvasController {
         return layout.frames.indices.min { abs(layout.frames[$0].midY - y) < abs(layout.frames[$1].midY - y) } ?? 0
     }
 
+    private var exporter: PageExport {
+        PageExport(frames: layout.frames, pdf: pdf,
+                   ink: canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k)))
+    }
+
     func share(_ kind: ShareKind, from sourceRect: CGRect) {
         saveNow()
-        let ink = canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k))
         let i = currentPageIndex
         if case .sendTo(let recipient) = kind {
-            sendPage(i, ink: ink, to: recipient)
+            sendPage(i, to: recipient)
             return
         }
         if case .sendDocumentTo(let recipient) = kind {
-            sendDocument(ink: ink, to: recipient)
+            sendDocument(to: recipient)
             return
         }
-        let name: String
-        let data: Data
-        switch kind {
-        case .sendTo, .sendDocumentTo:
-            return
-        case .pagePDF:
-            name = "\(doc.title) – Seite \(i + 1).pdf"
-            data = pdfData(pages: [i], ink: ink)
-        case .documentPDF:
-            name = "\(doc.title).pdf"
-            data = pdfData(pages: Array(layout.frames.indices), ink: ink)
-        case .pageImage:
-            name = "\(doc.title) – Seite \(i + 1).png"
-            let frame = layout.frames[i]
-            let format = UIGraphicsImageRendererFormat()
-            format.scale = 2
-            data = UIGraphicsImageRenderer(size: frame.size, format: format).pngData { c in
-                drawPage(i, ink: ink, in: c.cgContext)
+        let export = exporter
+        let title = doc.title.replacingOccurrences(of: "/", with: "-")
+        let pages = layout.frames.count
+        if case .documentPDF = kind, pages > 10 { onFlashTimed("PDF mit \(pages) Seiten wird erstellt …", 30) }
+        Task { [weak self] in
+            do {
+                let url = try await PageExport.run { () -> URL in
+                    let tmp = FileManager.default.temporaryDirectory
+                    switch kind {
+                    case .pagePDF:
+                        let url = tmp.appendingPathComponent("\(title) – Seite \(i + 1).pdf")
+                        try export.writePDF(pages: [i], to: url, inkScale: 4)
+                        return url
+                    case .documentPDF:
+                        let url = tmp.appendingPathComponent("\(title).pdf")
+                        try export.writePDF(pages: Array(export.frames.indices), to: url, inkScale: 3)
+                        return url
+                    default:
+                        let url = tmp.appendingPathComponent("\(title) – Seite \(i + 1).png")
+                        try export.pngData(page: i).write(to: url, options: .atomic)
+                        return url
+                    }
+                }
+                guard let self else { return }
+                self.onFlashTimed("", 0)
+                let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+                sheet.popoverPresentationController?.sourceView = self.view
+                sheet.popoverPresentationController?.sourceRect = sourceRect
+                self.present(sheet, animated: true)
+            } catch {
+                self?.onFlashTimed("Export fehlgeschlagen: \(error.localizedDescription)", 3)
             }
         }
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent(name.replacingOccurrences(of: "/", with: "-"))
-        do { try data.write(to: url, options: .atomic) } catch { return }
-        let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
-        sheet.popoverPresentationController?.sourceView = view
-        sheet.popoverPresentationController?.sourceRect = sourceRect
-        present(sheet, animated: true)
     }
 
-    /// Legt die Seite als PDF und als Bild in den Ausgang des Briefkastens, wo Claude oder Codex sie abholen
+    /// Ganzes Dokument höchstens so viele Seiten an Claude oder ChatGPT
     static let maxPagesToAI = 80
 
     /// Ganzes Dokument (Hintergrund und Notizen) als ein PDF an Claude oder ChatGPT
-    private func sendDocument(ink: PKDrawing, to recipient: String) {
+    private func sendDocument(to recipient: String) {
         guard sync.isConfigured else {
-            onFlash("Erst den Server einrichten (Zahnrad in der Übersicht)")
+            onFlashTimed("Erst den Server einrichten (Zahnrad in der Übersicht)", 2.5)
             return
         }
         let count = min(layout.frames.count, Self.maxPagesToAI)
         let cut = layout.frames.count > count
-        let pdf = pdfData(pages: Array(0..<count), ink: ink, inkScale: 2)
         let name = cut ? "\(doc.title) – Seiten 1-\(count).pdf" : "\(doc.title).pdf"
         let who = recipient == "claude" ? "Claude" : "ChatGPT"
-        onFlash("Wird gesendet …")
+        let export = exporter
+        onFlashTimed("Wird gesendet …", 60)
         let sync = self.sync
         Task { [weak self] in
             do {
+                let pdf = try await PageExport.run { () -> Data in
+                    let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".pdf")
+                    defer { try? FileManager.default.removeItem(at: url) }
+                    try export.writePDF(pages: Array(0..<count), to: url, inkScale: 2)
+                    return try Data(contentsOf: url)
+                }
                 try await sync.sendToOutbox(to: recipient, name: name, data: pdf, type: "application/pdf")
-                self?.onFlash(cut ? "Seiten 1–\(count) liegen bereit für \(who)" : "Ganzes Dokument liegt bereit für \(who)")
+                self?.onFlashTimed(cut ? "Seiten 1–\(count) liegen bereit für \(who)" : "Ganzes Dokument liegt bereit für \(who)", 2.5)
             } catch {
-                self?.onFlash("Senden fehlgeschlagen: \(error.localizedDescription)")
+                self?.onFlashTimed("Senden fehlgeschlagen: \(error.localizedDescription)", 3)
             }
         }
     }
 
-    private func sendPage(_ i: Int, ink: PKDrawing, to recipient: String) {
+    /// Legt die Seite als PDF und als Bild in den Ausgang des Briefkastens, wo Claude oder Codex sie abholen
+    private func sendPage(_ i: Int, to recipient: String) {
         guard sync.isConfigured else {
-            onFlash("Erst den Server einrichten (Zahnrad in der Übersicht)")
+            onFlashTimed("Erst den Server einrichten (Zahnrad in der Übersicht)", 2.5)
             return
         }
         let base = "\(doc.title) – Seite \(i + 1)"
-        let pdf = pdfData(pages: [i], ink: ink)
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 2
-        let png = UIGraphicsImageRenderer(size: layout.frames[i].size, format: format).pngData { c in
-            drawPage(i, ink: ink, in: c.cgContext)
-        }
-        onFlash("Wird gesendet …")
+        let export = exporter
+        onFlashTimed("Wird gesendet …", 30)
         let sync = self.sync
         Task { [weak self] in
             do {
+                let (pdf, png) = try await PageExport.run { () -> (Data, Data) in
+                    let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".pdf")
+                    defer { try? FileManager.default.removeItem(at: url) }
+                    try export.writePDF(pages: [i], to: url, inkScale: 4)
+                    return (try Data(contentsOf: url), export.pngData(page: i))
+                }
                 try await sync.sendToOutbox(to: recipient, name: base + ".pdf", data: pdf, type: "application/pdf")
                 try await sync.sendToOutbox(to: recipient, name: base + ".png", data: png, type: "image/png")
-                self?.onFlash("Seite \(i + 1) liegt bereit für \(recipient == "claude" ? "Claude" : "ChatGPT")")
+                self?.onFlashTimed("Seite \(i + 1) liegt bereit für \(recipient == "claude" ? "Claude" : "ChatGPT")", 2.5)
             } catch {
-                self?.onFlash("Senden fehlgeschlagen: \(error.localizedDescription)")
+                self?.onFlashTimed("Senden fehlgeschlagen: \(error.localizedDescription)", 3)
             }
-        }
-    }
-
-    /// PDF in echter Größe: Notizbuchseiten als A4, PDF-Seiten in ihrer Originalgröße
-    private func pdfData(pages: [Int], ink: PKDrawing, inkScale: CGFloat = 4) -> Data {
-        let renderer = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 595.28, height: 841.89))
-        return renderer.pdfData { c in
-            for i in pages {
-                let frame = layout.frames[i]
-                var outWidth: CGFloat = 595.28
-                if let page = pdf?.page(at: i + 1) {
-                    let box = page.getBoxRect(.cropBox)
-                    outWidth = abs(page.rotationAngle) % 180 == 90 ? box.height : box.width
-                }
-                let s = outWidth / frame.width
-                c.beginPage(withBounds: CGRect(x: 0, y: 0, width: outWidth, height: frame.height * s), pageInfo: [:])
-                c.cgContext.scaleBy(x: s, y: s)
-                drawPage(i, ink: ink, in: c.cgContext, inkScale: inkScale)
-            }
-        }
-    }
-
-    /// Zeichnet Seite `i` (Hintergrund und Tinte) in Seitenpunkten ab (0, 0)
-    private func drawPage(_ i: Int, ink: PKDrawing, in ctx: CGContext, inkScale: CGFloat = 4) {
-        let frame = layout.frames[i]
-        let rect = CGRect(origin: .zero, size: frame.size)
-        ctx.setFillColor(UIColor.white.cgColor)
-        ctx.fill(rect)
-        if let page = pdf?.page(at: i + 1) {
-            PageView.drawPDF(page, in: ctx, size: frame.size)
-        } else {
-            PageView.drawGrid(in: ctx, rect: rect, lineWidth: 0.5)
-        }
-        UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
-            ink.image(from: frame, scale: inkScale).draw(in: rect)
         }
     }
 }

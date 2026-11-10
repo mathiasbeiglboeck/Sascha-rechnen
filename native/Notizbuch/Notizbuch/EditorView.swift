@@ -34,7 +34,7 @@ final class ToolState: ObservableObject {
 
     /// Doppeltippen am Pencil: Radierer ↔ Stift (vom Lasso aus zum Radierer)
     func show(_ message: String, seconds: Double = 1.6) {
-        flash = message
+        flash = message.isEmpty ? nil : message
         flashTask?.cancel()
         flashTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(seconds))
@@ -105,6 +105,7 @@ struct CanvasRepresentable: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> CanvasController {
         let controller = CanvasController(doc: doc, store: store, sync: sync)
         controller.onFlash = { [weak tools] in tools?.show($0) }
+        controller.onFlashTimed = { [weak tools] in tools?.show($0, seconds: $1) }
         controller.onGuests = { [weak tools] in tools?.guests = $0 }
         controller.onToggleMenus = { [weak tools] in tools?.menusHidden.toggle() }
         controller.onToggleEraser = { [weak tools] in tools?.toggleEraser() }

@@ -19,6 +19,8 @@ struct NoteDocument: Codable, Identifiable, Hashable {
     var pageCount: Int
     /// Version des Seitenlayouts, mit dem die Striche gespeichert sind (fehlt = 1)
     var layoutVersion: Int?
+    /// Ordner in der Übersicht (nil = oberste Ebene)
+    var folder: String?
 }
 
 @MainActor
@@ -53,23 +55,23 @@ final class DocumentStore: ObservableObject {
         .sorted { $0.modified > $1.modified }
     }
 
-    func createNotebook() -> NoteDocument {
+    func createNotebook(inFolder: String? = nil) -> NoteDocument {
         let now = Date()
         let doc = NoteDocument(id: UUID(), title: "Notizen " + now.formatted(date: .abbreviated, time: .omitted),
                                kind: .notebook, created: now, modified: now, pageCount: 1,
-                               layoutVersion: PageLayout.currentVersion)
+                               layoutVersion: PageLayout.currentVersion, folder: inFolder)
         try? fm.createDirectory(at: folder(doc.id), withIntermediateDirectories: true)
         save(doc)
         return doc
     }
 
-    func importPDF(from url: URL) throws -> NoteDocument {
+    func importPDF(from url: URL, inFolder: String? = nil) throws -> NoteDocument {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         let now = Date()
         let doc = NoteDocument(id: UUID(), title: url.deletingPathExtension().lastPathComponent,
                                kind: .pdf, created: now, modified: now, pageCount: 0,
-                               layoutVersion: PageLayout.currentVersion)
+                               layoutVersion: PageLayout.currentVersion, folder: inFolder)
         try fm.createDirectory(at: folder(doc.id), withIntermediateDirectories: true)
         try fm.copyItem(at: url, to: pdfURL(doc.id))
         save(doc)
@@ -85,6 +87,16 @@ final class DocumentStore: ObservableObject {
         } else {
             documents.insert(doc, at: 0)
         }
+    }
+
+    /// Verschiebt ein Dokument in einen Ordner (nil = oberste Ebene); gilt nach dem Sync auf allen Geräten
+    func move(_ doc: NoteDocument, to folder: String?) {
+        var d = doc
+        let name = folder?.trimmingCharacters(in: .whitespacesAndNewlines)
+        d.folder = (name?.isEmpty ?? true) ? nil : name
+        guard d.folder != doc.folder else { return }
+        d.modified = Date()
+        save(d)
     }
 
     func rename(_ doc: NoteDocument, to title: String) {

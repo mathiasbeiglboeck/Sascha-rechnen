@@ -12,6 +12,7 @@ struct RemoteMeta: Codable {
     var deleted: Bool?
     var strokeSeq: Int?
     var hasPDF: Bool?
+    var folder: String?
 }
 
 /// Was dieses Gerät über den Sync-Stand eines Dokuments weiß (liegt als sync.json im Dokumentordner)
@@ -236,6 +237,7 @@ final class SyncEngine: ObservableObject {
                     if r.modified.timeIntervalSince1970 > local.modified.timeIntervalSince1970 + 0.001 {
                         var merged = local
                         merged.title = r.title
+                        merged.folder = r.folder
                         merged.pageCount = max(local.pageCount, r.pageCount)
                         merged.modified = r.modified
                         store.save(merged)
@@ -252,7 +254,7 @@ final class SyncEngine: ObservableObject {
                     // Striche auf dem Server liegen immer im aktuellen Seitenlayout
                     store.save(NoteDocument(id: r.id, title: r.title, kind: r.kind, created: r.created,
                                             modified: r.modified, pageCount: max(r.pageCount, 1),
-                                            layoutVersion: PageLayout.currentVersion))
+                                            layoutVersion: PageLayout.currentVersion, folder: r.folder))
                 }
             }
 

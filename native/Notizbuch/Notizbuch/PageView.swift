@@ -39,10 +39,10 @@ final class PageView: UIView {
     }
 
     /// 7-mm-Karos: A4 ist 210 mm breit, also 30 Kästchen über die Seitenbreite
-    static let gridStep = PageLayout.width / 30
-    static let gridColor = UIColor(white: 0.82, alpha: 1)
+    nonisolated static let gridStep = PageLayout.width / 30
+    nonisolated(unsafe) static let gridColor = UIColor(white: 0.82, alpha: 1)
 
-    static func drawGrid(in ctx: CGContext, rect: CGRect, lineWidth: CGFloat) {
+    nonisolated static func drawGrid(in ctx: CGContext, rect: CGRect, lineWidth: CGFloat) {
         ctx.setStrokeColor(gridColor.cgColor)
         ctx.setLineWidth(lineWidth)
         var x = (rect.minX / gridStep).rounded(.up) * gridStep
@@ -61,7 +61,7 @@ final class PageView: UIView {
     }
 
     /// Zeichnet eine PDF-Seite füllend in ein Rechteck der Größe `size` (UIKit-Koordinaten, y nach unten)
-    static func drawPDF(_ page: CGPDFPage, in ctx: CGContext, size: CGSize) {
+    nonisolated static func drawPDF(_ page: CGPDFPage, in ctx: CGContext, size: CGSize) {
         let box = page.getBoxRect(.cropBox)
         let turned = abs(page.rotationAngle) % 180 == 90
         let natural = turned ? CGSize(width: box.height, height: box.width) : box.size
