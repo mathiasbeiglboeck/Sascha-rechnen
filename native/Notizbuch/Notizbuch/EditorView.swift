@@ -141,7 +141,21 @@ struct ToolBar: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
-        HStack(spacing: sizeClass == .compact ? 7 : 14) {
+        if sizeClass == .compact {
+            bar(spacing: 7, compact: true)
+        } else {
+            // Schmale iPads (iPad mini: 744 bis 768 Punkte im Hochformat) und geteilter Bildschirm: erst enger, dann
+            // wie am iPhone, statt über den Rand hinaus
+            ViewThatFits(in: .horizontal) {
+                bar(spacing: 14, compact: false)
+                bar(spacing: 8, compact: false)
+                bar(spacing: 7, compact: true)
+            }
+        }
+    }
+
+    private func bar(spacing: CGFloat, compact: Bool) -> some View {
+        HStack(spacing: spacing) {
             Button(action: onClose) {
                 Image(systemName: "chevron.left").font(.body.weight(.semibold))
             }
@@ -154,7 +168,7 @@ struct ToolBar: View {
                     Label("Bearbeiten", systemImage: "pencil.tip").labelStyle(.titleAndIcon)
                 }
             } else {
-            if sizeClass == .compact {
+            if compact {
                 compactPickers
             } else {
                 colorButtons
@@ -162,7 +176,7 @@ struct ToolBar: View {
                 widthButtons
             }
             divider
-            if sizeClass == .compact {
+            if compact {
                 // Am iPhone ist zu wenig Platz: Werkzeuge in einem Menü
                 modeMenu
             } else {
@@ -182,7 +196,7 @@ struct ToolBar: View {
         }
         .font(.body)
         .tint(.primary)
-        .padding(.horizontal, sizeClass == .compact ? 12 : 16)
+        .padding(.horizontal, compact ? 12 : 16)
         .padding(.vertical, 8)
         .background(.regularMaterial, in: Capsule())
         .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
