@@ -408,7 +408,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             Log.sync.info("IDs vorberechnet: \(strokes.count) Striche in \(CanvasController.ms(since: start)) ms")
             guard let self, self.warmups == number else { return }
             self.idWarmup = nil
-            done?(StrokeIDCache.shared.ids(for: strokes, toPage: toPage, pruning: .canvas))
+            // Ohne Aufräumen: Ist die Leinwand inzwischen zu, gehört der Speicher vielleicht schon einer anderen
+            done?(StrokeIDCache.shared.ids(for: strokes, toPage: toPage, pruning: .never))
             self.applyPendingWhenIdle()
             self.syncCycle()
         }

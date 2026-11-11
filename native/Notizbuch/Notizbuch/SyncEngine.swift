@@ -78,7 +78,12 @@ final class SyncEngine: ObservableObject {
 
     let store: DocumentStore
     /// Das gerade geöffnete Dokument bekommt entfernte Änderungen direkt auf die Leinwand
-    weak var openController: CanvasController?
+    weak var openController: CanvasController? {
+        didSet { if let id = openController?.doc.id { openings[id, default: 0] += 1 } }
+    }
+    /// Wie oft ein Dokument geöffnet wurde: Ein Abgleich seiner Datei merkt so, dass inzwischen eine Leinwand darin
+    /// geschrieben haben kann (seine Datei ist dann neuer als der Stand, mit dem er begann)
+    private var openings: [UUID: Int] = [:]
 
     private var busy = Set<UUID>()
     /// Sync-Stand je Dokument im Speicher (die Platte liest und schreibt nur selten)
@@ -261,8 +266,10 @@ final class SyncEngine: ObservableObject {
         defer { busy.remove(id) }
 
         let state = self.state(id)
-        // Abgleich der offenen Leinwand: Er hört auf, sobald sie Neues hat, Seiten ändert oder geschlossen wird
+        // Abgleich der offenen Leinwand: Er hört auf, sobald sie Neues hat, Seiten ändert oder geschlossen wird.
+        // Abgleich der Datei: Er hört auf, sobald das Dokument inzwischen offen war
         let startedOpen = openController?.doc.id == id
+        let openedBefore = openings[id, default: 0]
         var adds: [(id: String, stroke: PKStroke)] = []
         var earlyRemoves: [String] = []
         var lateRemoves: [String] = []
@@ -365,12 +372,15 @@ final class SyncEngine: ObservableObject {
             next += part.count
             chunk += 1
             // Die offene Leinwand hat Neues (zuerst das schicken, der Rest folgt im nächsten Abgleich) oder will
-            // Seiten ändern. Oder die Leinwand, für die dieser Abgleich lief, ist zu: Dann macht der Abgleich des
-            // geschlossenen Dokuments weiter
+            // Seiten ändern. Oder dieser Stand ist überholt, weil die Leinwand inzwischen zu ist bzw. das Dokument
+            // offen war: Dann macht gleich ein Abgleich seiner Datei weiter
             if next < adds.count {
                 let canvasNow = openController?.doc.id == id ? openController : nil
-                if canvasNow.map({ $0.hasUnsyncedLocalChanges || $0.isRestructuring }) ?? startedOpen {
+                let stop = canvasNow.map { $0.hasUnsyncedLocalChanges || $0.isRestructuring }
+                    ?? (startedOpen || openings[id, default: 0] != openedBefore)
+                if stop {
                     noteWaiting(from: next)
+                    if canvasNow == nil { Task { [weak self] in await self?.syncClosed(id) } }
                     return true
                 }
             }
@@ -399,18 +409,23 @@ final class SyncEngine: ObservableObject {
 
     /// Abgleich eines Dokuments, das gerade nicht offen ist: Zeichnung von der Platte
     func syncClosed(_ id: UUID) async {
-        // Eben geschlossen: Läuft noch ein Abgleich der Leinwand, dessen Ende abwarten
+        // Eben geschlossen: Läuft noch ein Abgleich der Leinwand, dessen Ende abwarten. Läuft danach immer noch einer
+        // (etwa der Rest eines großen Hochladens, der schon mit der Datei weitermacht), bleibt es bei ihm
         for _ in 0..<100 where busy.contains(id) {
             try? await Task.sleep(for: .milliseconds(50))
         }
         // Inzwischen wieder geöffnet: Dann gleicht die Leinwand ab, nicht die (ältere) Datei
-        guard openController?.doc.id != id, let doc = store.documents.first(where: { $0.id == id }) else { return }
+        guard !busy.contains(id), openController?.doc.id != id,
+              let doc = store.documents.first(where: { $0.id == id }) else { return }
+        let opened = openings[id, default: 0]
         let snapshot = StrokeSnapshot(store.loadDrawing(doc).strokes, toPage: .identity,
                                       pruning: openController == nil ? .closed : .never)
         guard await syncStrokes(id, snapshot: snapshot) else { return }
         // Währenddessen wieder geöffnet: Das Geholte wartet auf der Leinwand, nicht in der Datei. Den Stand sichert
-        // dann die Leinwand, sobald ihre Zeichnung gespeichert ist (sonst wäre er der Datei voraus)
-        guard openController?.doc.id != id else { return }
+        // dann die Leinwand, sobald ihre Zeichnung gespeichert ist (sonst wäre er der Datei voraus). War es offen und
+        // ist schon wieder zu, fehlt hier, was dort dazukam: Dann gilt der Abgleich nicht als vollständig, und der
+        // nächste holt es nach
+        guard openController?.doc.id != id, openings[id, default: 0] == opened else { return }
         state(id).syncedModified = store.documents.first(where: { $0.id == id })?.modified.timeIntervalSince1970 ?? 0
         persistState(id)
     }
