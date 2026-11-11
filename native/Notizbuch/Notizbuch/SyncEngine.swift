@@ -84,6 +84,8 @@ final class SyncEngine: ObservableObject {
     /// Wie oft ein Dokument geöffnet wurde: Ein Abgleich seiner Datei merkt so, dass inzwischen eine Leinwand darin
     /// geschrieben haben kann (seine Datei ist dann neuer als der Stand, mit dem er begann)
     private var openings: [UUID: Int] = [:]
+    /// Wie oft ein Abgleich der Datei vollständig war: Wer darauf gewartet hat, braucht keinen eigenen mehr
+    private var closedPasses: [UUID: Int] = [:]
 
     private var busy = Set<UUID>()
     /// Sync-Stand je Dokument im Speicher (die Platte liest und schreibt nur selten)
@@ -409,13 +411,15 @@ final class SyncEngine: ObservableObject {
 
     /// Abgleich eines Dokuments, das gerade nicht offen ist: Zeichnung von der Platte
     func syncClosed(_ id: UUID) async {
+        let passes = closedPasses[id, default: 0]
         // Eben geschlossen: Läuft noch ein Abgleich der Leinwand, dessen Ende abwarten. Läuft danach immer noch einer
-        // (etwa der Rest eines großen Hochladens, der schon mit der Datei weitermacht), bleibt es bei ihm
+        // (etwa der Rest eines großen Hochladens, der schon mit der Datei weitermacht), bleibt es bei ihm; ebenso,
+        // wenn inzwischen einer fertig wurde (er begann nach diesem Aufruf, hat also schon alles)
         for _ in 0..<100 where busy.contains(id) {
             try? await Task.sleep(for: .milliseconds(50))
         }
         // Inzwischen wieder geöffnet: Dann gleicht die Leinwand ab, nicht die (ältere) Datei
-        guard !busy.contains(id), openController?.doc.id != id,
+        guard !busy.contains(id), closedPasses[id, default: 0] == passes, openController?.doc.id != id,
               let doc = store.documents.first(where: { $0.id == id }) else { return }
         let opened = openings[id, default: 0]
         let snapshot = StrokeSnapshot(store.loadDrawing(doc).strokes, toPage: .identity,
@@ -427,6 +431,7 @@ final class SyncEngine: ObservableObject {
         // nächste holt es nach
         guard openController?.doc.id != id, openings[id, default: 0] == opened else { return }
         state(id).syncedModified = store.documents.first(where: { $0.id == id })?.modified.timeIntervalSince1970 ?? 0
+        closedPasses[id, default: 0] += 1
         persistState(id)
     }
 
