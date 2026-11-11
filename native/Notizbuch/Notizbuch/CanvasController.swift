@@ -183,7 +183,11 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         } else {
             // Drehen: Zeichnung auf die neue Breite umrechnen
             let f = newK / k
-            setDrawing(canvas.drawing.transformed(using: CGAffineTransform(scaleX: f, y: f)))
+            let scale = CGAffineTransform(scaleX: f, y: f)
+            // Der Vergleichsstand fürs Speichern gilt in Leinwandpunkten: mit umrechnen (bleibt er, weil etwas
+            // ungespeichert ist, sähe das Speichern sonst einen Unterschied, wo keiner ist)
+            if dirty { baseline = baseline?.transformed(using: scale) }
+            setDrawing(canvas.drawing.transformed(using: scale))
             canvas.undoManager?.removeAllActions()
             k = newK
             updatePixelScale()
@@ -303,9 +307,11 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     }
 
     /// Takt alle 3 Sekunden: holt auch, falls ein Hinweis des Servers verloren ging, und versucht Fehlgeschlagenes
-    /// noch einmal. Lief eben erst ein Abgleich (der holt immer mit), ist diese Runde überflüssig (spart Anfragen)
+    /// noch einmal. Lief eben erst ein Abgleich (der holt immer mit) und steht die Live-Verbindung (sie meldet
+    /// Neues sofort), ist diese Runde überflüssig (spart Anfragen)
     private func syncTick() {
-        if !localChanged, remoteSeqHint <= sync.knownSeq(doc.id), Date().timeIntervalSince(lastFetch) < 2.5 { return }
+        if socket != nil, !localChanged, remoteSeqHint <= sync.knownSeq(doc.id),
+           Date().timeIntervalSince(lastFetch) < 2.5 { return }
         syncCycle()
     }
 
@@ -427,13 +433,18 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private func persistSyncStateNow() {
         persistWork?.cancel()
         persistWork = nil
-        guard pending.isEmpty, !dirty, !remoteUnsaved, k > 0 else { return }
+        // Eine geschlossene Leinwand, deren Abgleich noch lief, sichert nichts mehr, sobald das Dokument wieder
+        // (in einer neuen Leinwand) offen ist: Deren Fremdes ist dann vielleicht noch nicht gespeichert
+        guard pending.isEmpty, !dirty, !remoteUnsaved, k > 0,
+              sync.openController == nil || sync.openController === self else { return }
         sync.persistState(doc.id)
     }
 
     // MARK: Live-Teilen
 
     private var socket: URLSessionWebSocketTask?
+    /// Auf der neuen Verbindung kam noch nichts an
+    private var socketFresh = false
     private var shared = false
     private var guests = 0
     private var lastViewSent = Date.distantPast
@@ -442,6 +453,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         guard socket == nil, syncTimer != nil, let req = sync.webSocketRequest(doc.id) else { return }
         let task = URLSession.shared.webSocketTask(with: req)
         socket = task
+        socketFresh = true
         task.resume()
         receive(task)
         sendView(force: true)
@@ -453,6 +465,11 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
                 guard let self, self.socket === task else { return }
                 switch result {
                 case .success(let message):
+                    // Verbindung steht: Was geschrieben wurde, solange sie fehlte, gleich holen (Hinweise ab jetzt)
+                    if self.socketFresh {
+                        self.socketFresh = false
+                        self.syncCycle()
+                    }
                     if case .string(let text) = message { self.handleLive(text) }
                     self.receive(task)
                 case .failure:
@@ -596,6 +613,9 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         if result.wasEmpty { redrawInkSoon() }
         // Alte Rückgängig-Schritte würden fremde Striche wieder entfernen
         canvas.undoManager?.removeAllActions()
+        // Solange noch Striche kommen (nach einer Seitenänderung anderswo in vielen Paketen), gilt die gemeldete
+        // Seitenzahl weiter: Die alten Fassungen verschwinden erst mit dem letzten Paket
+        if remotePageTarget != nil { remoteTargetSince = Date() }
         fitToRemotePageCount()
         growIfNeeded()
         // Gespeichert wird gleich, mit allem, was dann auf der Leinwand ist (kommen viele fremde Striche
@@ -969,13 +989,15 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         // Nur eigene Änderungen zählen als Bearbeitung (modified), übernommene fremde nicht
         let touch = dirty
         let current = canvas.drawing
-        // Bloßes Öffnen (PencilKit meldet manchmal verspätet eine „Änderung“) soll nichts speichern:
-        // Ohne Werkzeug seither vergleicht der Hintergrund mit dem letzten Stand. Eingefügte fremde Striche
-        // stehen dagegen sicher noch nicht in der Datei
-        let base = toolUsedSinceSave || remoteUnsaved ? nil : baseline
+        // Bloßes Öffnen (PencilKit meldet manchmal verspätet eine „Änderung“) soll nichts speichern und nichts als
+        // bearbeitet markieren: Ohne Werkzeug seither vergleicht der Hintergrund mit dem letzten Stand. Eingefügte
+        // fremde Striche stehen dagegen sicher noch nicht in der Datei, dann wird jedenfalls geschrieben.
+        let base = dirty && !toolUsedSinceSave ? baseline : nil
+        let force = remoteUnsaved
         dirty = false
         remoteUnsaved = false
-        store.saveDrawing(current, toPage: toPage, for: doc.id, pageCount: pageCount, touch: touch, unlessEqualTo: base)
+        store.saveDrawing(current, toPage: toPage, for: doc.id, pageCount: pageCount, touch: touch,
+                          unlessEqualTo: base, force: force)
         baseline = current
         toolUsedSinceSave = false
         schedulePersist()
@@ -1298,6 +1320,7 @@ extension CanvasController {
             if self.pageDrawing().strokes.contains(where: { undo.inverse(before.page(at: $0.renderBounds.midY)) == nil }) {
                 self.pageUndo = undo
                 self.restructuring = false
+                self.syncCycle()
                 done("Auf der eingefügten Seite steht inzwischen etwas. Zum Entfernen die Seite löschen.")
                 return
             }
@@ -1307,11 +1330,13 @@ extension CanvasController {
                     _ = try FileManager.default.replaceItemAt(url, withItemAt: backup)
                 } catch {
                     self.restructuring = false
+                    self.syncCycle()
                     done("Rückgängig fehlgeschlagen: \(error.localizedDescription)")
                     return
                 }
                 guard let restored = CGPDFDocument(url as CFURL) else {
                     self.restructuring = false
+                    self.syncCycle()
                     done("Rückgängig fehlgeschlagen: PDF lässt sich nicht öffnen")
                     return
                 }
@@ -1404,6 +1429,7 @@ extension CanvasController {
                 } catch {
                     if let backup { try? FileManager.default.removeItem(at: backup) }
                     self.restructuring = false
+                    self.syncCycle()
                     done("Seiten ändern fehlgeschlagen: \(error.localizedDescription)")
                     return
                 }
@@ -1444,6 +1470,8 @@ extension CanvasController {
         // Neue Seitenversion: Andere Geräte übernehmen Seitenzahl bzw. PDF, auch wenn sie inzwischen selbst
         // etwas gespeichert haben
         store.notePagesChanged(doc.id, pdf: pdfChanged, pageCount: pageCount)
+        // Alle Striche darunter haben neue IDs: viel hochzuladen, was danach geschrieben wird, geht vor
+        sync.noteBulkChange(doc.id)
         if pdfChanged {
             // Die verschobenen Striche erst schicken, wenn das neue PDF am Server ist (höchstens 30 s warten)
             sync.notePDFUploadPending(doc.id)

@@ -181,40 +181,43 @@ final class DocumentStore: ObservableObject {
     ///   - base: Stand nach dem letzten Laden oder Speichern. Ist die Zeichnung genau gleich (PencilKit meldet
     ///     beim Öffnen manchmal eine „Änderung“), wird nichts geschrieben.
     func saveDrawing(_ drawing: PKDrawing, toPage: CGAffineTransform = .identity, for id: UUID, pageCount: Int,
-                     touch: Bool = true, unlessEqualTo base: PKDrawing? = nil) {
+                     touch: Bool = true, unlessEqualTo base: PKDrawing? = nil, force: Bool = false) {
         writes += 1
         let number = writes
         writing[id] = PendingDrawing(number: number, drawing: drawing, toPage: toPage)
+        // Seitenordnung beim Auftrag: Ändert sie sich bis zum Ende des Schreibens, gilt dessen Seitenzahl nicht mehr
+        let pagesVersion = documents.first(where: { $0.id == id })?.pagesVersion
         let url = drawingURL(id)
         let box = UncheckedBox((drawing, base))
         let task = UIApplication.shared.beginBackgroundTask(withName: "Zeichnung speichern")
         io.async { [weak self] in
             let (drawing, base) = box.value
-            var changed = true
-            if let base, base.dataRepresentation() == drawing.dataRepresentation() {
-                changed = false
-            } else {
+            // Gleich wie `base`: nicht schreiben (außer mit `force`) und nicht als Bearbeitung zählen
+            var same = false
+            if let base { same = base.dataRepresentation() == drawing.dataRepresentation() }
+            let write = !same || force
+            if write {
                 let page = toPage.isIdentity ? drawing : drawing.transformed(using: toPage)
                 try? page.dataRepresentation().write(to: url, options: .atomic)
             }
             DispatchQueue.main.async {
-                self?.finishedWriting(id, number: number, changed: changed, pageCount: pageCount, touch: touch)
+                self?.finishedWriting(id, number: number, wrote: write, pageCount: pageCount, touch: touch && !same,
+                                      pagesVersion: pagesVersion)
                 UIApplication.shared.endBackgroundTask(task)
             }
         }
     }
 
-    private func finishedWriting(_ id: UUID, number: Int, changed: Bool, pageCount: Int, touch: Bool) {
-        // Die Seitenzahl bestimmt nur das neueste Schreiben: Ein älteres (etwa fremde Striche kurz vor einer
-        // Seitenänderung) brächte sonst die alte Zahl unter die neue Seitenversion zurück
+    private func finishedWriting(_ id: UUID, number: Int, wrote: Bool, pageCount: Int, touch: Bool, pagesVersion: Int?) {
+        // Die Seitenzahl bestimmt nur das neueste Schreiben, und nur, wenn sich die Seitenordnung seit dem Auftrag
+        // nicht geändert hat: Sonst brächte es die alte Zahl unter die neue Seitenversion zurück
         let latest = writing[id]?.number == number
         if latest { writing[id] = nil }
-        if changed { inkVersions[id, default: 0] += 1 }
+        if wrote { inkVersions[id, default: 0] += 1 }
         guard var doc = documents.first(where: { $0.id == id }) else { return }
-        let count = latest ? pageCount : doc.pageCount
-        let touchNow = changed && touch
-        guard touchNow || doc.pageCount != count else { return }
-        if touchNow { doc.modified = Date() }
+        let count = latest && doc.pagesVersion == pagesVersion ? pageCount : doc.pageCount
+        guard touch || doc.pageCount != count else { return }
+        if touch { doc.modified = Date() }
         doc.pageCount = count
         save(doc)
     }

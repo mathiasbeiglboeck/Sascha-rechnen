@@ -167,8 +167,8 @@ export class Store extends DurableObject {
       }
     }
     // Seiten gelöscht oder eingefügt: offene Ansichten bauen ihre Seiten neu auf. Ältere Apps schicken keine
-    // Seitenversion; bei ihnen zeigt wie früher eine kleinere Seitenzahl das Löschen an
-    const legacyDelete = !("pagesVersion" in meta) && (Number(meta.pageCount) || 0) < (Number(before?.pageCount) || 0);
+    // Seitenversion; bei ihnen zeigt wie früher eine kleinere (gespeicherte) Seitenzahl das Löschen an
+    const legacyDelete = !("pagesVersion" in meta) && (Number(result.pageCount) || 0) < (Number(before?.pageCount) || 0);
     if (before && !result.deleted && (newerStructure(result, before) || legacyDelete)) {
       // Mit dem neuen Seitenstand: Wer ihn schon hat (das Gerät, das die Seiten geändert hat), muss nichts tun
       const pagesVersion = Number(result.pagesVersion) || 0, pdfVersion = Number(result.pdfVersion) || 0;
