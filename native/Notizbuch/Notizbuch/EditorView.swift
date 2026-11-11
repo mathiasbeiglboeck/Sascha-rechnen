@@ -26,6 +26,11 @@ final class ToolState: ObservableObject {
     /// Am iPhone startet jedes Dokument im Nur-Sehen-Modus
     @Published var viewOnly = UIDevice.current.userInterfaceIdiom == .phone
     @Published var menusHidden = false
+    /// Am iPad wählbar: eingeklappte Leiste mit nur Radierer und Ausklappen (für Stifte ohne Drücken, z. B. am
+    /// iPad mini mit dem einfachen Pencil). Bleibt auf dem Gerät gespeichert.
+    @Published var menuCollapsed = UserDefaults.standard.bool(forKey: "menuCollapsed") {
+        didSet { UserDefaults.standard.set(menuCollapsed, forKey: "menuCollapsed") }
+    }
     /// Kurzer Hinweis, wenn bei ausgeblendeten Menüs das Werkzeug wechselt
     @Published var flash: String?
     /// Zahl der Gäste, die gerade live zusehen (nil = nicht geteilt)
@@ -105,6 +110,7 @@ struct EditorView: View {
         .statusBarHidden(tools.menusHidden)
         .persistentSystemOverlays(tools.menusHidden ? .hidden : .automatic)
         .animation(.easeOut(duration: 0.2), value: tools.menusHidden)
+        .animation(.easeOut(duration: 0.2), value: tools.menuCollapsed)
         .animation(.easeOut(duration: 0.2), value: tools.flash)
     }
 }
@@ -141,7 +147,9 @@ struct ToolBar: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
-        if sizeClass == .compact {
+        if isPad && tools.menuCollapsed {
+            collapsedBar
+        } else if sizeClass == .compact {
             bar(spacing: 7, compact: true)
         } else {
             // Schmale iPads (iPad mini: 744 bis 768 Punkte im Hochformat) und geteilter Bildschirm: erst enger, dann
@@ -192,11 +200,35 @@ struct ToolBar: View {
                 divider
                 Button { tools.viewOnly = true } label: { Image(systemName: "eye") }
             }
+            if isPad {
+                divider
+                Button { tools.menuCollapsed = true } label: { Image(systemName: "arrow.down.right.and.arrow.up.left") }
+                    .accessibilityLabel("Leiste einklappen")
+            }
             }
         }
         .font(.body)
         .tint(.primary)
         .padding(.horizontal, compact ? 12 : 16)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: Capsule())
+        .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+    }
+
+    private var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
+
+    /// Eingeklappt: nur Radierer (an/aus) und Ausklappen
+    private var collapsedBar: some View {
+        HStack(spacing: 10) {
+            modeButton(.eraser, symbol: "eraser")
+            Button { tools.menuCollapsed = false } label: {
+                Image(systemName: "arrow.up.left.and.arrow.down.right").padding(5)
+            }
+            .accessibilityLabel("Leiste ausklappen")
+        }
+        .font(.body)
+        .tint(.primary)
+        .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(.regularMaterial, in: Capsule())
         .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
