@@ -7,21 +7,62 @@
 <title>BetterNotes</title>
 <style>
 /* Web-Ansicht für Gäste: dieselben Seiten wie in der App, live, und mit der Maus mitzeichnen */
-:root { --bg:#e6e6e1; --bar:#fbfaf6; --text:#23302a; --muted:#7b847e; --line:#dcd8cc; --chip:#ece7da; --accent:#2f6b4f;
+:root { --bg:#e6e6e1; --bar:#fbfaf6; --text:#23302a; --muted:#7b847e; --line:#dcd8cc; --accent:#2f6b4f;
+  --glass:rgba(251,250,246,.84); --hover:rgba(35,48,42,.07); --sel:rgba(35,48,42,.12);
   --f:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",system-ui,sans-serif; }
 * { box-sizing:border-box; }
 html,body { margin:0; background:var(--bg); color:var(--text); font-family:var(--f); }
-#bar { position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:10px; flex-wrap:wrap;
-  padding:8px 14px; background:var(--bar); border-bottom:1px solid var(--line); }
-#title { font-weight:600; margin-right:auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:40vw; }
-#bar button { font:inherit; font-size:14px; border:0; border-radius:8px; padding:6px 10px; background:var(--chip); color:var(--text); cursor:pointer; }
-#bar button.on { background:var(--text); color:var(--bar); }
-.dot { width:22px; height:22px; border-radius:50%; border:2px solid transparent; cursor:pointer; padding:0; }
-.dot.on { border-color:var(--text); }
-.w { width:26px; height:26px; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; border-radius:6px; }
-.w span { background:var(--muted); border-radius:50%; display:block; }
-.w.on span { background:var(--text); }
-#status { font-size:13px; color:var(--muted); }
+/* Werkzeugleiste wie am iPad: schwebende Kapsel oben in der Mitte, die Seiten laufen darunter durch */
+#bar { position:sticky; top:0; z-index:5; padding:6px 10px 4px; pointer-events:none; }
+#tools { pointer-events:auto; width:fit-content; max-width:100%; margin:0 auto; display:flex; flex-wrap:wrap;
+  align-items:center; justify-content:center; gap:2px 6px; padding:4px 10px; border-radius:21px;
+  background:var(--glass); -webkit-backdrop-filter:blur(18px) saturate(1.6); backdrop-filter:blur(18px) saturate(1.6);
+  box-shadow:0 2px 10px rgba(0,0,0,.09), 0 0 0 .5px rgba(0,0,0,.08);
+  -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent; }
+#title { font-size:13px; font-weight:600; max-width:190px; padding:0 4px;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.sep { flex:none; width:1px; height:18px; background:rgba(35,48,42,.15); }
+#tools button { -webkit-appearance:none; appearance:none; margin:0; }
+#colors, #widths { display:flex; align-items:center; gap:1px; }
+.dot { width:26px; height:26px; padding:3px; border:0; border-radius:50%; background-clip:content-box; cursor:pointer; }
+.w { width:22px; height:26px; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; }
+.w span { background:var(--text); opacity:.3; border-radius:50%; display:block; }
+.w.on span { opacity:.9; }
+#tools button.icon { width:30px; height:28px; padding:0; border:0; border-radius:7px; background:none; color:var(--text);
+  display:inline-grid; place-items:center; cursor:pointer; }
+.icon svg { width:19px; height:19px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
+#tools .icon.on, #tools #follow.on { background-color:var(--sel); }
+#follow { font:500 12.5px var(--f); height:26px; padding:0 9px; border:0; border-radius:13px; background:none; color:var(--muted); cursor:pointer; }
+#follow.on { color:var(--text); }
+@media (hover:hover) { #tools .icon:hover, #tools #follow:hover { background-color:var(--hover); }
+  #tools .icon.on:hover, #tools #follow.on:hover { background-color:var(--sel); }
+  .dot:hover { box-shadow:inset 0 0 0 1.5px rgba(35,48,42,.25); } }
+.dot.on, .dot.on:hover { box-shadow:inset 0 0 0 1.5px rgba(35,48,42,.6); }
+#status { font-size:12px; color:var(--muted); white-space:nowrap; display:inline-flex; align-items:center; gap:4px; padding-right:2px; }
+#status::before { content:""; width:7px; height:7px; border-radius:50%; background:#c2c6c2; }
+#status.live::before { background:#34c759; }
+#status:empty::before { display:none; }
+#status svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.8; margin-left:2px; }
+.br { display:none; }
+/* Schmaler (iPad mini, geteilter Bildschirm): enger, damit es in einer Zeile bleibt */
+@media (max-width:820px) {
+  #tools { gap:2px 4px; }
+  #title { max-width:110px; }
+  #tools button.icon { width:28px; }
+}
+/* Handy: oben Name und Status, darunter die Werkzeuge */
+@media (max-width:700px) {
+  #bar { padding:6px 6px 4px; }
+  #tools { gap:2px 3px; padding:4px 8px; }
+  .sep { display:none; }
+  #title { order:-4; max-width:min(200px, 45vw); }
+  #follow { order:-3; }
+  #status { order:-2; }
+  .br { display:block; order:-1; flex-basis:100%; height:0; }
+  .dot { width:22px; height:22px; padding:2px; }
+  .w { width:19px; }
+  #tools button.icon { width:26px; }
+}
 #pages { max-width:1100px; margin:0 auto; padding:6px 0 40px; }
 .page { position:relative; background:#fff; margin:0 auto 6px; }
 .page canvas { position:absolute; inset:0; width:100%; height:100%; }
@@ -29,10 +70,8 @@ html,body { margin:0; background:var(--bg); color:var(--text); font-family:var(-
 .page svg.ptr path { fill:none; stroke-linecap:round; stroke-linejoin:round; }
 body.pointing .page canvas.ink { cursor:crosshair; }
 body { --ptr:#ff1f8f; }
-#pointer::before { content:""; display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--ptr);
-  margin-right:6px; vertical-align:1px; }
-#pointer.on { background:var(--ptr) !important; color:#fff !important; }
-#pointer.on::before { background:#fff; }
+/* Wie am iPad: das Zeigestift-Symbol in der eigenen Zeigefarbe */
+#tools #pointer { color:var(--ptr); }
 .page canvas.ink { touch-action:pan-y; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
 body.drawing .page canvas.ink { cursor:crosshair; }
 body.erasing .page canvas.ink { cursor:none; }
@@ -45,23 +84,38 @@ body.lassoing .page canvas.ink { cursor:crosshair; }
 #sel { position:fixed; z-index:7; border:1.5px dashed #2f6b4f; background:rgba(47,107,79,.06); cursor:move; touch-action:none; display:none; }
 #sel-bar { position:absolute; left:0; bottom:100%; margin-bottom:6px; display:flex; gap:4px; white-space:nowrap; }
 #sel-bar button { font:13px var(--f); border:0; border-radius:7px; padding:5px 9px; background:var(--text); color:var(--bar); cursor:pointer; }
-#paste[hidden] { display:none; }
+#tools #paste[hidden] { display:none; }
 #msg { max-width:520px; margin:80px auto; text-align:center; color:var(--muted); line-height:1.5; padding:0 16px; }
 </style>
 </head>
 <body>
-<div id="bar">
+<div id="bar"><div id="tools">
   <span id="title">BetterNotes</span>
+  <i class="sep"></i>
   <span id="colors"></span>
+  <i class="sep"></i>
   <span id="widths"></span>
-  <button id="pointer" title="Zeigestift: leuchtet und verschwindet nach etwa zehn Sekunden (Taste P)">Zeigen</button>
-  <button id="eraser" title="Radierer: löscht jeden Strich, den er berührt (Taste E)">Radierer</button>
-  <button id="lasso" title="Lasso: Striche umkreisen, dann verschieben, kopieren oder löschen (Taste L)">Lasso</button>
-  <button id="paste" hidden title="Kopierte Striche einfügen (Strg/Cmd+V)">Einfügen</button>
-  <button id="undo" title="Meinen letzten Schritt zurücknehmen">↶</button>
+  <i class="sep"></i>
+  <button id="pointer" class="icon" title="Zeigestift: leuchtet und verschwindet nach etwa zehn Sekunden (Taste P)" aria-label="Zeigestift">
+    <svg viewBox="0 0 24 24"><path d="M3 16.5c1.6-3.2 3.6-8.5 6.1-8.5 1.7 0 1.3 2.7-.1 5.2-1.3 2.4-1.3 4.6.4 4.6 2.4 0 3.9-8.3 6.6-8.3 1.6 0 1.3 2.4.1 4.6-1 2-.8 3.6.7 3.6 1.5 0 2.6-1.6 3.2-2.8"/></svg>
+  </button>
+  <button id="eraser" class="icon" title="Radierer: löscht jeden Strich, den er berührt (Taste E)" aria-label="Radierer">
+    <svg viewBox="0 0 24 24"><path d="M13.6 4.4a1.7 1.7 0 0 1 2.4 0l3.6 3.6a1.7 1.7 0 0 1 0 2.4L11.3 18.7H7.6l-3.2-3.2a1.7 1.7 0 0 1 0-2.4z"/><path d="M8.7 9.3l6 6M11.3 18.7h8.2"/></svg>
+  </button>
+  <button id="lasso" class="icon" title="Lasso: Striche umkreisen, dann verschieben, kopieren oder löschen (Taste L)" aria-label="Lasso">
+    <svg viewBox="0 0 24 24"><ellipse cx="12.5" cy="9.5" rx="8" ry="5"/><path d="M7.4 13.3c-1.4 1.1-1.6 2.6-.4 3.4 1.4.9 1.6 2.4.6 3.8"/></svg>
+  </button>
+  <button id="paste" class="icon" hidden title="Kopierte Striche einfügen (Strg/Cmd+V)" aria-label="Einfügen">
+    <svg viewBox="0 0 24 24"><path d="M15.5 5H17a1.5 1.5 0 0 1 1.5 1.5v12A1.5 1.5 0 0 1 17 20H7a1.5 1.5 0 0 1-1.5-1.5v-12A1.5 1.5 0 0 1 7 5h1.5"/><rect x="8.5" y="3.5" width="7" height="3" rx="1"/></svg>
+  </button>
+  <button id="undo" class="icon" title="Meinen letzten Schritt zurücknehmen (Strg/Cmd+Z)" aria-label="Zurück">
+    <svg viewBox="0 0 24 24"><path d="M8.5 4.5L4 9l4.5 4.5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>
+  </button>
+  <i class="sep"></i>
   <button id="follow" class="on" title="Mitscrollen, wo gerade geschrieben wird">Folgen</button>
   <span id="status">verbinde …</span>
-</div>
+  <i class="br"></i>
+</div></div>
 <div id="pages"></div>
 <div id="msg" hidden></div>
 <div id="eraser-cursor"></div>
@@ -75,12 +129,13 @@ body.lassoing .page canvas.ink { cursor:crosshair; }
 "use strict";
 const W = 768, GAP = 6, A4H = W * 297 / 210, GRID = W / 30;
 const base = location.pathname.replace(/\/$/, "");
-const COLORS = [[0.8,0.17,0.15],[0.12,0.27,0.64],[0.13,0.52,0.29],[0.1,0.1,0.11]];
+// Dieselben Farben in derselben Reihenfolge wie am iPad: schwarz, blau, rot, grün, orange
+const COLORS = [[0.1,0.1,0.11],[0.12,0.27,0.64],[0.8,0.17,0.15],[0.13,0.52,0.29],[0.92,0.52,0.1]];
 // PencilKit zeichnet dünne Striche am iPhone fast unsichtbar: unter etwa 3 Seitenpunkten werden sie blass
 // Die beiden dünnsten wirken am iPhone (PencilKit, kleiner Maßstab) blass, am iPad und im Browser normal
 const WIDTHS = [1.8, 2.5, 3.2, 4.2, 6.5];
 const ERASER_PX = 8;      // Radius am Bildschirm, wie in der App
-let color = 0, width = 2, follow = true, erasing = false, lassoing = false, pointing = false;
+let color = 2, width = 2, follow = true, erasing = false, lassoing = false, pointing = false;
 let sel = null;    // Lasso-Auswahl {ids: Set, bbox}
 let drag = null;   // {ids, dx, dy} während des Verschiebens
 let clip = null;   // kopierte Striche (wire-Objekte)
@@ -102,20 +157,20 @@ const els = [];           // je Seite {div, bg, ink, rendered}
 const colorsEl = document.getElementById("colors"), widthsEl = document.getElementById("widths");
 COLORS.forEach((c, i) => {
   const b = document.createElement("button");
-  b.className = "dot"; b.style.background = `rgb(${c.map(v => v * 255).join(",")})`;
+  b.className = "dot"; b.style.backgroundColor = `rgb(${c.map(v => v * 255).join(",")})`;
   b.onclick = () => { color = i; erasing = lassoing = pointing = false; tools(); };
   colorsEl.appendChild(b);
 });
 WIDTHS.forEach((w, i) => {
   const b = document.createElement("span");
-  b.className = "w"; b.innerHTML = `<span style="width:${3 + i * 3}px;height:${3 + i * 3}px"></span>`;
+  b.className = "w"; b.innerHTML = `<span style="width:${4 + i * 3}px;height:${4 + i * 3}px"></span>`;
   b.onclick = () => { width = i; erasing = lassoing = pointing = false; tools(); };
   widthsEl.appendChild(b);
 });
 function tools() {
   const pen = !erasing && !lassoing && !pointing;
   [...colorsEl.children].forEach((b, i) => b.classList.toggle("on", pen && i === color));
-  [...widthsEl.children].forEach((b, i) => b.classList.toggle("on", pen && i === width));
+  [...widthsEl.children].forEach((b, i) => b.classList.toggle("on", i === width));
   document.getElementById("eraser").classList.toggle("on", erasing);
   document.getElementById("lasso").classList.toggle("on", lassoing);
   document.body.classList.toggle("erasing", erasing);
@@ -167,7 +222,14 @@ function undo() {
   }
 }
 document.getElementById("undo").onclick = undo;
-const status = (t) => (document.getElementById("status").textContent = t);
+// Kurz wie am iPad: grüner Punkt, wenn verbunden, und ein Auge mit der Zahl, wenn mehrere zusehen
+function status(t, live = false, guests = 0) {
+  const el = document.getElementById("status"), n = Math.floor(Number(guests)) || 0;
+  el.textContent = t;
+  el.classList.toggle("live", live);
+  el.title = n > 1 ? `${n} Gäste sehen gerade zu` : "";
+  if (n > 1) el.insertAdjacentHTML("beforeend", `<svg viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/></svg>${n}`);
+}
 function fail(text) {
   document.getElementById("pages").hidden = true;
   const m = document.getElementById("msg"); m.hidden = false; m.textContent = text;
@@ -688,7 +750,7 @@ function connect() {
   if (doc) { q.set("since", seen); q.set("pv", doc.pagesVersion || 0); q.set("dv", doc.pdfVersion || 0); }
   const query = q.toString() ? "?" + q : "";
   ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + base + "/ws" + query);
-  ws.onopen = () => status("live");
+  ws.onopen = () => status("live", true);
   ws.onclose = (e) => {
     if (e.code === 4001) return fail("Das Teilen wurde beendet.");
     if (gone) return;
@@ -712,7 +774,7 @@ function connect() {
       // Seiten gelöscht oder eingefügt: alles neu laden (Striche, Seiten, PDF)
       reload().catch(() => {});
     } else if (msg.type === "presence") {
-      status(msg.guests > 1 ? `live · ${msg.guests} Gäste` : "live");
+      status("live", true, msg.guests);
     }
   };
 }
@@ -776,6 +838,7 @@ async function load(isReload) {
     if (nextPdf !== pdf) { if (pdf) pdf.destroy(); pdf = nextPdf; }
     doc = data;
     document.getElementById("title").textContent = data.title || "BetterNotes";
+    document.getElementById("title").title = data.title || "";
     document.title = (data.title || "BetterNotes") + " · live";
     for (const s of data.strokes) addStroke(s.id, s.data);
     if (heights) pageHeights = heights;
