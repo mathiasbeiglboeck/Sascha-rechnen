@@ -176,6 +176,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             relayout()
             setDrawing(store.loadDrawing(doc).transformed(using: CGAffineTransform(scaleX: newK, y: newK)))
             growIfNeeded()
+            adoptRemotePageTarget()
             canvas.contentOffset = CGPoint(x: 0, y: -top)
             redrawInkSoon()
             warmUpIDs()
@@ -249,6 +250,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         canvas.undoManager?.removeAllActions()
         rebuildPages()
         growIfNeeded()
+        adoptRemotePageTarget()
         localChanged = true
         warmUpIDs()
     }
@@ -382,7 +384,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     /// schreibt gerade), zählen schon mit: Sonst hielte der Abgleich sie für hier gelöscht.
     private func strokeSnapshot() -> StrokeSnapshot {
         let start = CACurrentMediaTime()
-        var snapshot = StrokeSnapshot(canvas.drawing.strokes, toPage: toPage, prune: true)
+        var snapshot = StrokeSnapshot(canvas.drawing.strokes, toPage: toPage, pruning: .canvas)
         if !pending.isEmpty {
             snapshot.alsoPresent = Set(pending.added.map { $0.id })
             snapshot.alsoGone = pending.removed
@@ -395,7 +397,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     /// IDs aller Striche im Hintergrund vorberechnen (nach dem Laden oder Drehen), damit kein Abgleich die App
     /// anhält, weil er Zehntausende Striche hashen müsste
-    private func warmUpIDs() {
+    /// - Parameter done: bekommt danach die IDs der Striche von jetzt (aus dem Speicher, ohne neu zu hashen)
+    private func warmUpIDs(then done: (([String]) -> Void)? = nil) {
         warmups += 1
         let number = warmups
         let strokes = canvas.drawing.strokes, toPage = self.toPage
@@ -405,6 +408,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             Log.sync.info("IDs vorberechnet: \(strokes.count) Striche in \(CanvasController.ms(since: start)) ms")
             guard let self, self.warmups == number else { return }
             self.idWarmup = nil
+            done?(StrokeIDCache.shared.ids(for: strokes, toPage: toPage, pruning: .canvas))
             self.applyPendingWhenIdle()
             self.syncCycle()
         }
@@ -607,7 +611,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         let start = CACurrentMediaTime()
         let changes = pending
         pending = RemoteChanges()
-        guard let result = StrokeCodec.apply(changes, to: canvas.drawing, scale: k, prune: true) else { return }
+        guard let result = StrokeCodec.apply(changes, to: canvas.drawing, scale: k, pruning: .canvas) else { return }
         setDrawing(result.drawing)
         // Auf einer leeren Leinwand zeigt PencilKit den ersten Strich von außen sonst nicht an
         if result.wasEmpty { redrawInkSoon() }
@@ -1471,7 +1475,7 @@ extension CanvasController {
         // etwas gespeichert haben
         store.notePagesChanged(doc.id, pdf: pdfChanged, pageCount: pageCount)
         // Alle Striche darunter haben neue IDs: viel hochzuladen, was danach geschrieben wird, geht vor
-        sync.noteBulkChange(doc.id)
+        let bulk = sync.noteBulkChange(doc.id)
         if pdfChanged {
             // Die verschobenen Striche erst schicken, wenn das neue PDF am Server ist (höchstens 30 s warten)
             sync.notePDFUploadPending(doc.id)
@@ -1481,10 +1485,10 @@ extension CanvasController {
         localChanged = true
         restructuring = false
         schedulePersist()
-        warmUpIDs()
-        let sync = self.sync
+        let id = doc.id, engine = sync
+        warmUpIDs { ids in engine.noteBulkContents(id, generation: bulk, ids: Set(ids)) }
         Task { [weak self] in
-            await sync.syncLibrary()
+            await engine.syncLibrary()
             self?.syncCycle()
         }
         syncCycle()
@@ -1506,6 +1510,15 @@ extension CanvasController {
         onPagesChanged?()
     }
 
+    /// Ein anderes Gerät hat Seiten gelöscht und lädt die verschobenen Striche noch hoch (siehe
+    /// `SyncEngine.pageTarget`): Seine Seitenzahl gilt, sobald die alten Fassungen weg sind
+    private func adoptRemotePageTarget() {
+        guard pdf == nil, remotePageTarget == nil, let target = sync.pageTarget(doc.id) else { return }
+        remotePageTarget = target
+        remoteTargetSince = Date()
+        fitToRemotePageCount()
+    }
+
     /// Notizbuch auf die gemeldete Seitenzahl bringen, aber nie eine Seite mit Notizen abschneiden.
     /// Erledigt, sobald die verschobenen Striche da sind (oder nach einer halben Minute).
     private func fitToRemotePageCount() {
@@ -1516,6 +1529,7 @@ extension CanvasController {
         }
         if want == target || Date().timeIntervalSince(remoteTargetSince ?? .distantPast) > 30 {
             remotePageTarget = nil
+            if want == target { sync.notePageTargetReached(doc.id) }
         }
         guard want != pageCount else { return }
         pageCount = want

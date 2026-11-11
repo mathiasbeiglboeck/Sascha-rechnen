@@ -69,8 +69,19 @@ final class StrokeIDCache {
     }
 
     private var digests: [Key: String] = [:]
-    /// Ohne Aufräumen (andere Dokumente) wächst der Speicher höchstens bis hierher
+    /// So groß wird der Speicher höchstens, solange die offene Leinwand nicht selbst aufräumt
     private static let maxWithoutPrune = 150_000
+
+    /// Wer den Speicher aufräumen darf (dann bleiben nur die Striche dieses Aufrufs)
+    enum Pruning {
+        /// Die offene Leinwand: ab dem Dreifachen ihrer Striche, mindestens 60 000 Einträgen
+        case canvas
+        /// Ein geschlossenes Dokument, während keine Leinwand offen ist: erst ab `maxWithoutPrune`
+        case closed
+        /// Ein anderes Dokument, während eine Leinwand offen ist: nie (sonst verlöre sie ihre IDs und müsste beim
+        /// nächsten Strich alles neu hashen); über `maxWithoutPrune` wird dann nichts mehr dazugemerkt
+        case never
+    }
 
     static func key(_ stroke: PKStroke, _ toPage: CGAffineTransform) -> Key {
         let t = StrokeCodec.pageTransform(stroke, toPage)
@@ -85,10 +96,8 @@ final class StrokeIDCache {
 
     /// IDs in Zeichnungsreihenfolge; gleiche Striche zählen mit (#2, #3 …).
     /// `toPage` rechnet die Striche in Seitenpunkte um, denn die ID gilt in Seitenpunkten.
-    /// `prune` nur für die offene Leinwand: Dann bleiben bei vielen Einträgen nur ihre Striche. Ein anderes
-    /// (vielleicht kleines) Dokument darf das nie auslösen, sonst müsste die Leinwand beim nächsten Strich
-    /// alle ihre Striche neu hashen.
-    func ids(for strokes: [PKStroke], toPage: CGAffineTransform = .identity, prune: Bool = false) -> [String] {
+    /// `pruning` sagt, ob dieser Aufruf den Speicher aufräumen darf (siehe `Pruning`).
+    func ids(for strokes: [PKStroke], toPage: CGAffineTransform = .identity, pruning: Pruning = .never) -> [String] {
         var seen: [String: Int] = [:]
         seen.reserveCapacity(strokes.count)
         var result: [String] = []
@@ -100,14 +109,20 @@ final class StrokeIDCache {
                 digest = hit
             } else {
                 digest = StrokeCodec.digest(stroke, toPage: toPage)
-                if prune || digests.count < Self.maxWithoutPrune { digests[key] = digest }
+                if pruning != .never || digests.count < Self.maxWithoutPrune { digests[key] = digest }
             }
             let n = (seen[digest] ?? 0) + 1
             seen[digest] = n
             result.append(n == 1 ? digest : "\(digest)#\(n)")
         }
         // Viele alte Einträge (verschobene Striche, andere Dokumente): nur die aktuellen behalten
-        if prune, digests.count > max(3 * strokes.count, 60_000) {
+        let limit: Int
+        switch pruning {
+        case .canvas: limit = max(3 * strokes.count, 60_000)
+        case .closed: limit = max(3 * strokes.count, Self.maxWithoutPrune)
+        case .never: limit = .max
+        }
+        if digests.count > limit {
             var keep: [Key: String] = [:]
             keep.reserveCapacity(strokes.count)
             for stroke in strokes {
@@ -236,12 +251,12 @@ enum StrokeCodec {
     /// Wendet entfernte Änderungen (Striche in Seitenpunkten) auf eine Zeichnung an; nil, wenn sich nichts ändert.
     /// Unveränderte Striche bleiben, wie sie sind: Neue werden nur angehängt, ohne die ganze Zeichnung umzurechnen.
     /// - Parameter scale: Punkte der Zeichnung je Seitenpunkt (Leinwand: Faktor k; Datei: 1)
-    static func apply(_ changes: RemoteChanges, to drawing: PKDrawing, scale: CGFloat = 1, prune: Bool = false)
-        -> (drawing: PKDrawing, wasEmpty: Bool)? {
+    static func apply(_ changes: RemoteChanges, to drawing: PKDrawing, scale: CGFloat = 1,
+                      pruning: StrokeIDCache.Pruning = .never) -> (drawing: PKDrawing, wasEmpty: Bool)? {
         guard !changes.isEmpty else { return nil }
         let strokes = drawing.strokes
         let toPage = scale == 1 ? CGAffineTransform.identity : CGAffineTransform(scaleX: 1 / scale, y: 1 / scale)
-        let ids = StrokeIDCache.shared.ids(for: strokes, toPage: toPage, prune: prune)
+        let ids = StrokeIDCache.shared.ids(for: strokes, toPage: toPage, pruning: pruning)
         var present = Set<String>(minimumCapacity: ids.count + changes.added.count)
         var kept: [PKStroke] = []
         var removedAny = false

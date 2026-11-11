@@ -45,9 +45,8 @@ struct StrokeSnapshot {
     var alsoGone: Set<String> = []
 
     /// IDs über den Zwischenspeicher: Nur neue Striche werden gehasht
-    /// - Parameter prune: nur für die offene Leinwand (siehe `StrokeIDCache.ids`)
-    init(_ strokes: [PKStroke], toPage: CGAffineTransform, prune: Bool = false) {
-        let ids = StrokeIDCache.shared.ids(for: strokes, toPage: toPage, prune: prune)
+    init(_ strokes: [PKStroke], toPage: CGAffineTransform, pruning: StrokeIDCache.Pruning = .never) {
+        let ids = StrokeIDCache.shared.ids(for: strokes, toPage: toPage, pruning: pruning)
         self.strokes = zip(ids, strokes).map { (id: $0.0, stroke: $0.1) }
         self.toPage = toPage
     }
@@ -202,31 +201,58 @@ final class SyncEngine: ObservableObject {
     /// neue IDs; in einem Stück wären das viele MB, die bei schlechter Verbindung immer wieder von vorn begännen.
     private static let chunkSize = 300
 
-    /// Ein großes Hochladen in Paketen, etwa nach einer Seitenänderung (alle Striche darunter haben neue IDs), oder
-    /// ein unterbrochenes. Was nicht dazugehört (inzwischen neu Geschriebenes, Radiertes), geht vor, damit es nicht
-    /// hinter dem Rest wartet. Die alten Fassungen verschobener Striche verschwinden erst mit dem letzten Paket:
-    /// So fehlen sie nirgends, auch am Server nicht, solange das Hochladen dauert oder unterbrochen ist.
+    /// Ein großes Hochladen in Paketen, etwa nach einer Seitenänderung (alle Striche darunter haben neue IDs).
+    /// Was nicht dazugehört (inzwischen neu Geschriebenes, Lasso-Kopien, Radiertes), geht vor, damit es nicht
+    /// hinter dem Rest wartet. Die abgelösten alten Fassungen verschwinden erst mit dem letzten Paket: So fehlen
+    /// die Striche nirgends, auch am Server nicht, solange das Hochladen dauert oder unterbrochen ist.
     private struct Bulk {
-        /// Zeitpunkt der Seitenänderung: Später geschriebene Striche gehören nicht dazu
-        var since: Date?
-        /// Noch nicht hochgeladene Striche (nil = das Hochladen hat noch nicht begonnen)
+        /// Erkennt ein überholtes Hochladen (das nach einer neuen Seitenänderung nichts mehr ändern darf)
+        var generation: Int
+        /// Beginn: Später geschriebene Striche gehören nicht dazu
+        var since: Date
+        /// Striche, die zum großen Hochladen gehören (nil = noch unbekannt); alle anderen gehen vor
         var waiting: Set<String>?
-        /// Löschungen, die erst mit dem letzten Paket gehen (nil = beim ersten Abgleich festlegen: alles, was dann
-        /// fehlt, sind die alten Fassungen)
-        var lastRemoves: Set<String>?
+        /// Abgelöste alte Fassungen: Ihre Löschung geht erst mit dem letzten Paket (nil = beim ersten Abgleich alles,
+        /// was dann fehlt)
+        var retired: Set<String>?
     }
     private var bulks: [UUID: Bulk] = [:]
+    private var bulkGenerations = 0
+
+    /// Seitenzahl nach der Seitenänderung eines anderen Geräts, solange dessen verschobene Striche noch kommen:
+    /// Bis dahin reichen die alten Fassungen weiter hinunter. Ein geschlossenes Dokument (und eine Leinwand, die es
+    /// jetzt öffnet) schrumpft wieder darauf, sobald sie weg sind.
+    private var pageTargets: [UUID: Int] = [:]
+    func pageTarget(_ id: UUID) -> Int? { pageTargets[id] }
+    func notePageTargetReached(_ id: UUID) { pageTargets[id] = nil }
 
     /// Die offene Leinwand hat Seiten geändert: Der nächste Abgleich lädt viel hoch (siehe `Bulk`)
-    func noteBulkChange(_ id: UUID) {
-        bulks[id] = Bulk(since: Date())
+    @discardableResult
+    func noteBulkChange(_ id: UUID) -> Int {
+        bulkGenerations += 1
+        bulks[id] = Bulk(generation: bulkGenerations, since: Date())
+        // Die eigene Seitenänderung ist die neueste
+        pageTargets[id] = nil
+        return bulkGenerations
+    }
+
+    /// Die IDs der Zeichnung nach der Seitenänderung sind bekannt: Was sonst noch neu ist, geht vor; was am Server
+    /// steht, aber nicht mehr darin vorkommt, sind die abgelösten alten Fassungen. Läuft gerade noch ein Abgleich
+    /// von davor, kommt von ihm vielleicht noch eine alte Fassung an den Server: Dann legt das erst der nächste
+    /// Abgleich fest (alles, was dann fehlt)
+    func noteBulkContents(_ id: UUID, generation: Int, ids: Set<String>) {
+        guard var bulk = bulks[id], bulk.generation == generation else { return }
+        bulk.waiting = ids
+        if bulk.retired == nil, !busy.contains(id) { bulk.retired = state(id).confirmed.subtracting(ids) }
+        bulks[id] = bulk
     }
 
     /// Schickt die lokalen Änderungen (Unterschied von `snapshot` zum letzten Abgleich) und holt die entfernten.
     /// Die entfernten Änderungen gehen an die offene Leinwand oder direkt in die Datei, nie verloren.
     /// Viele neue Striche gehen in Paketen, in Zeichnungsreihenfolge (so liegen sie überall gleich übereinander);
-    /// nach jedem Paket ist der Stand gesichert. Nur was während eines langen Hochladens neu geschrieben wird,
-    /// geht vor dem Rest hinaus, damit es nicht hinter einer großen Verschiebung wartet.
+    /// nach jedem Paket ist der Stand gesichert. Was nicht zu einem großen Hochladen gehört, geht vor (siehe `Bulk`).
+    /// Gelöscht wird, sobald das zuerst Geschickte oben ist; Löschungen unbekannter Herkunft während eines großen
+    /// Hochladens (etwa nach einem Neustart mittendrin) erst mit dem letzten Paket.
     /// - Parameter snapshot: aktueller Stand der Zeichnung, oder nil, wenn sich lokal nichts geändert hat
     @discardableResult
     func syncStrokes(_ id: UUID, snapshot: StrokeSnapshot?) async -> Bool {
@@ -235,10 +261,13 @@ final class SyncEngine: ObservableObject {
         defer { busy.remove(id) }
 
         let state = self.state(id)
+        // Abgleich der offenen Leinwand: Er hört auf, sobald sie Neues hat, Seiten ändert oder geschlossen wird
+        let startedOpen = openController?.doc.id == id
         var adds: [(id: String, stroke: PKStroke)] = []
-        // Mit dem ersten bzw. erst mit dem letzten Paket
-        var firstRemoves: [String] = []
-        var lastRemoves: [String] = []
+        var earlyRemoves: [String] = []
+        var lateRemoves: [String] = []
+        // So viele Striche am Anfang von `adds` gehören nicht zum großen Hochladen
+        var freshCount = 0
         var toPage = CGAffineTransform.identity
         if let snapshot {
             toPage = snapshot.toPage
@@ -248,26 +277,34 @@ final class SyncEngine: ObservableObject {
             adds = snapshot.strokes.filter { !state.confirmed.contains($0.id) && !snapshot.alsoGone.contains($0.id) }
             let removes = state.confirmed.subtracting(current)
             if var bulk = bulks[id] {
-                let held = bulk.lastRemoves ?? removes
-                bulk.lastRemoves = held
-                firstRemoves = Array(removes.subtracting(held))
-                lastRemoves = Array(removes.intersection(held))
-                if adds.count > Self.chunkSize {
-                    let b = bulk
-                    func isFresh(_ a: (id: String, stroke: PKStroke)) -> Bool {
-                        if let waiting = b.waiting { return !waiting.contains(a.id) }
-                        if let since = b.since { return a.stroke.path.creationDate > since }
-                        return false
-                    }
-                    let fresh = adds.filter { isFresh($0) }
-                    if !fresh.isEmpty, fresh.count < adds.count {
-                        adds = fresh + adds.filter { !isFresh($0) }
-                    }
-                }
+                let retired = bulk.retired ?? removes
+                bulk.retired = retired
                 bulks[id] = bulk
+                earlyRemoves = Array(removes.subtracting(retired))
+                lateRemoves = Array(removes.intersection(retired))
+                let b = bulk
+                func isFresh(_ a: (id: String, stroke: PKStroke)) -> Bool {
+                    a.stroke.path.creationDate > b.since || b.waiting.map { !$0.contains(a.id) } == true
+                }
+                let fresh = adds.filter { isFresh($0) }
+                if !fresh.isEmpty, fresh.count < adds.count {
+                    adds = fresh + adds.filter { !isFresh($0) }
+                }
+                freshCount = fresh.count
+            } else if adds.count > Self.chunkSize {
+                // Großes Hochladen ohne bekannte Seitenänderung: Die Löschungen könnten die alten Fassungen sein
+                bulkGenerations += 1
+                bulks[id] = Bulk(generation: bulkGenerations, since: Date(), retired: removes)
+                lateRemoves = Array(removes)
             } else {
-                firstRemoves = Array(removes)
+                earlyRemoves = Array(removes)
             }
+        }
+        let generation = bulks[id]?.generation
+        /// Was vom großen Hochladen ab `next` noch fehlt (für den nächsten Abgleich, falls dieser nicht fertig wird)
+        func noteWaiting(from next: Int) {
+            guard adds.count > Self.chunkSize, let generation, bulks[id]?.generation == generation else { return }
+            bulks[id]?.waiting = Set(adds[max(next, freshCount)...].map { $0.id })
         }
 
         struct Response: Decodable {
@@ -276,15 +313,16 @@ final class SyncEngine: ObservableObject {
             var changes: [Change]
         }
         let started = Date()
-        if adds.count > Self.chunkSize, bulks[id] == nil { bulks[id] = Bulk(lastRemoves: Set(lastRemoves)) }
+        // Radiertes geht mit dem Paket, in dem das zuerst Geschickte endet (Lasso: erst die Kopien, dann weg mit
+        // dem Original), die abgelösten alten Fassungen mit dem letzten
+        let earlyChunk = freshCount == 0 ? 0 : (freshCount - 1) / Self.chunkSize
         var next = 0
+        var chunk = 0
         repeat {
             let part = adds[next..<min(next + Self.chunkSize, adds.count)]
-            // Radiertes gleich mit dem ersten Paket. Die alten Fassungen verschobener Striche erst mit dem letzten:
-            // Dann sind die verschobenen schon alle am Server, bevor ihre alte Fassung verschwindet
-            var gone = next == 0 ? firstRemoves : []
-            if next + part.count >= adds.count { gone += lastRemoves }
-            if adds.count > Self.chunkSize { bulks[id]?.waiting = Set(adds[next...].map { $0.id }) }
+            var gone = chunk == earlyChunk ? earlyRemoves : []
+            if next + part.count >= adds.count { gone += lateRemoves }
+            noteWaiting(from: next)
             do {
                 let add = part.map { a -> [String: String] in
                     var stroke = a.stroke
@@ -325,15 +363,21 @@ final class SyncEngine: ObservableObject {
                 return false
             }
             next += part.count
-            // Hat die offene Leinwand inzwischen Neues, zuerst das schicken (der Rest folgt im nächsten Abgleich).
-            // Ebenso, wenn sie Seiten ändern will: Sie wartet sonst auf alle übrigen Pakete
-            if next < adds.count, let c = openController, c.doc.id == id, c.hasUnsyncedLocalChanges || c.isRestructuring {
-                bulks[id]?.waiting = Set(adds[next...].map { $0.id })
-                return true
+            chunk += 1
+            // Die offene Leinwand hat Neues (zuerst das schicken, der Rest folgt im nächsten Abgleich) oder will
+            // Seiten ändern. Oder die Leinwand, für die dieser Abgleich lief, ist zu: Dann macht der Abgleich des
+            // geschlossenen Dokuments weiter
+            if next < adds.count {
+                let canvasNow = openController?.doc.id == id ? openController : nil
+                if canvasNow.map({ $0.hasUnsyncedLocalChanges || $0.isRestructuring }) ?? startedOpen {
+                    noteWaiting(from: next)
+                    return true
+                }
             }
         } while next < adds.count
-        // Alles oben: Das große Hochladen ist fertig (ein bloßes Holen ändert daran nichts)
-        if snapshot != nil { bulks[id] = nil }
+        // Alles oben: Das große Hochladen ist fertig (ein bloßes Holen ändert daran nichts, und ein inzwischen neu
+        // begonnenes, etwa nach einer weiteren Seitenänderung, bleibt)
+        if snapshot != nil, bulks[id]?.generation == generation { bulks[id] = nil }
         return true
     }
 
@@ -345,9 +389,11 @@ final class SyncEngine: ObservableObject {
         }
         guard let doc = store.documents.first(where: { $0.id == id }) else { return }
         let drawing = store.loadDrawing(doc)
-        if let merged = StrokeCodec.apply(changes, to: drawing, prune: openController == nil)?.drawing {
-            store.saveDrawing(merged, for: id, pageCount: PageLayout.pagesNeeded(for: merged, kind: doc.kind, current: doc.pageCount),
-                              touch: false)
+        if let merged = StrokeCodec.apply(changes, to: drawing, pruning: openController == nil ? .closed : .never)?.drawing {
+            let target = pageTargets[id]
+            let pages = PageLayout.pagesNeeded(for: merged, kind: doc.kind, current: target ?? doc.pageCount)
+            if let target, pages <= target { pageTargets[id] = nil }
+            store.saveDrawing(merged, for: id, pageCount: pages, touch: false)
         }
     }
 
@@ -359,7 +405,8 @@ final class SyncEngine: ObservableObject {
         }
         // Inzwischen wieder geöffnet: Dann gleicht die Leinwand ab, nicht die (ältere) Datei
         guard openController?.doc.id != id, let doc = store.documents.first(where: { $0.id == id }) else { return }
-        let snapshot = StrokeSnapshot(store.loadDrawing(doc).strokes, toPage: .identity, prune: openController == nil)
+        let snapshot = StrokeSnapshot(store.loadDrawing(doc).strokes, toPage: .identity,
+                                      pruning: openController == nil ? .closed : .never)
         guard await syncStrokes(id, snapshot: snapshot) else { return }
         // Währenddessen wieder geöffnet: Das Geholte wartet auf der Leinwand, nicht in der Datei. Den Stand sichert
         // dann die Leinwand, sobald ihre Zeichnung gespeichert ist (sonst wäre er der Datei voraus)
@@ -419,6 +466,7 @@ final class SyncEngine: ObservableObject {
                     if local != nil, openController?.doc.id != r.id {
                         states[r.id] = nil
                         bulks[r.id] = nil
+                        pageTargets[r.id] = nil
                         store.delete(local!)
                     }
                     continue
@@ -445,6 +493,7 @@ final class SyncEngine: ObservableObject {
                     if remotePages > localPages, !busyHere {
                         merged.pagesVersion = remotePages
                         merged.pageCount = max(r.pageCount, 1)
+                        if r.kind == .notebook { pageTargets[r.id] = merged.pageCount }
                         changed = true
                         structure = true
                     }
@@ -465,6 +514,7 @@ final class SyncEngine: ObservableObject {
                     // hielte der Abgleich alle früher bekannten Striche für hier gelöscht
                     states[r.id] = nil
                     bulks[r.id] = nil
+                    pageTargets[r.id] = nil
                     try? FileManager.default.removeItem(at: stateURL(r.id))
                     if r.kind == .pdf {
                         guard r.hasPDF == true else { continue }
@@ -518,6 +568,7 @@ final class SyncEngine: ObservableObject {
     func noteDeleted(_ id: UUID) {
         states[id] = nil
         bulks[id] = nil
+        pageTargets[id] = nil
         guard isConfigured else { return }
         pendingDeletes.insert(id.uuidString)
     }
