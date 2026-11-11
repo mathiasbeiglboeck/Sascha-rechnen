@@ -1,5 +1,11 @@
 import Foundation
 import PencilKit
+import os
+
+/// Protokoll für die Zeitmessung (am Mac in der Konsole zu sehen: Subsystem de.beiglboeck.notizbuch, Kategorie sync)
+enum Log {
+    static let sync = Logger(subsystem: "de.beiglboeck.notizbuch", category: "sync")
+}
 
 /// Metadaten, wie der Server sie liefert (Datum in Sekunden seit 1970)
 struct RemoteMeta: Codable {
@@ -12,6 +18,9 @@ struct RemoteMeta: Codable {
     var deleted: Bool?
     var strokeSeq: Int?
     var hasPDF: Bool?
+    var folder: String?
+    var pdfVersion: Int?
+    var pagesVersion: Int?
 }
 
 /// Was dieses Gerät über den Sync-Stand eines Dokuments weiß (liegt als sync.json im Dokumentordner)
@@ -22,6 +31,25 @@ struct DocSyncState: Codable {
     var ids: [String] = []
     /// meta.modified (Sekunden seit 1970) beim letzten Abgleich
     var syncedModified: Double = 0
+}
+
+/// Stand einer Zeichnung für den Abgleich
+struct StrokeSnapshot {
+    /// Striche mit ihrer ID, in Zeichnungsreihenfolge
+    var strokes: [(id: String, stroke: PKStroke)]
+    /// Rechnet die Striche in Seitenpunkte um
+    var toPage: CGAffineTransform
+    /// Gelten als vorhanden, obwohl sie (noch) nicht in `strokes` sind: fremde Striche, die auf die Leinwand warten
+    var alsoPresent: Set<String> = []
+    /// Gelten als entfernt, obwohl sie noch in `strokes` sind: fremde Löschungen, die noch warten
+    var alsoGone: Set<String> = []
+
+    /// IDs über den Zwischenspeicher: Nur neue Striche werden gehasht
+    init(_ strokes: [PKStroke], toPage: CGAffineTransform, pruning: StrokeIDCache.Pruning = .never) {
+        let ids = StrokeIDCache.shared.ids(for: strokes, toPage: toPage, pruning: pruning)
+        self.strokes = zip(ids, strokes).map { (id: $0.0, stroke: $0.1) }
+        self.toPage = toPage
+    }
 }
 
 enum SyncError: LocalizedError {
@@ -50,10 +78,39 @@ final class SyncEngine: ObservableObject {
 
     let store: DocumentStore
     /// Das gerade geöffnete Dokument bekommt entfernte Änderungen direkt auf die Leinwand
-    weak var openController: CanvasController?
+    weak var openController: CanvasController? {
+        didSet { if let id = openController?.doc.id { openings[id, default: 0] += 1 } }
+    }
+    /// Wie oft ein Dokument geöffnet wurde: Ein Abgleich seiner Datei merkt so, dass inzwischen eine Leinwand darin
+    /// geschrieben haben kann (seine Datei ist dann neuer als der Stand, mit dem er begann)
+    private var openings: [UUID: Int] = [:]
+    /// Wie oft ein Abgleich der Datei vollständig war: Wer darauf gewartet hat, braucht keinen eigenen mehr
+    private var closedPasses: [UUID: Int] = [:]
 
     private var busy = Set<UUID>()
-    private var librarySyncing = false
+    /// Sync-Stand je Dokument im Speicher (die Platte liest und schreibt nur selten)
+    private var states: [UUID: DocState] = [:]
+
+    private final class DocState {
+        var seq: Int
+        /// IDs der Striche, die beim letzten Abgleich auf beiden Seiten vorhanden waren
+        var confirmed: Set<String>
+        var syncedModified: Double
+
+        init(_ s: DocSyncState) {
+            seq = s.seq
+            confirmed = Set(s.ids)
+            syncedModified = s.syncedModified
+        }
+
+        var stored: DocSyncState { DocSyncState(seq: seq, ids: Array(confirmed), syncedModified: syncedModified) }
+    }
+    /// Der laufende Abgleich der Bibliothek (nil = keiner)
+    private var libraryTask: Task<Void, Never>?
+    /// Während eines Abgleichs angefragt: danach gleich noch einmal
+    private var libraryAgain = false
+    /// PDFs, deren neue Fassung (nach Löschen oder Einfügen von Seiten) noch nicht am Server ist
+    private(set) var pdfUploadPending = Set<UUID>()
     private let session: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 20
@@ -120,36 +177,143 @@ final class SyncEngine: ObservableObject {
 
     private func stateURL(_ id: UUID) -> URL { store.folder(id).appendingPathComponent("sync.json") }
 
-    func loadState(_ id: UUID) -> DocSyncState {
-        guard let data = try? Data(contentsOf: stateURL(id)) else { return DocSyncState() }
-        return (try? JSONDecoder().decode(DocSyncState.self, from: data)) ?? DocSyncState()
+    private func state(_ id: UUID) -> DocState {
+        if let s = states[id] { return s }
+        var stored = DocSyncState()
+        if let data = try? Data(contentsOf: stateURL(id)),
+           let decoded = try? JSONDecoder().decode(DocSyncState.self, from: data) {
+            stored = decoded
+        }
+        let s = DocState(stored)
+        states[id] = s
+        return s
     }
 
-    private func saveState(_ state: DocSyncState, _ id: UUID) {
-        if let data = try? JSONEncoder().encode(state) { try? data.write(to: stateURL(id), options: .atomic) }
+    /// Höchste Änderungsnummer des Servers, die dieses Gerät für das Dokument schon geholt hat
+    func knownSeq(_ id: UUID) -> Int { state(id).seq }
+
+    /// Schreibt den Sync-Stand auf die Platte, nach allen schon angestoßenen Zeichnungen.
+    /// Nur aufrufen, wenn die Zeichnung (auf der Platte oder unterwegs dorthin) alles enthält, was der Stand als
+    /// vorhanden kennt. Sonst hielte der nächste Abgleich nach einem Absturz fremde Striche für gelöscht und
+    /// löschte sie auch am Server. Ein älterer Stand auf der Platte schadet dagegen nie (dann wird eben doppelt geschickt).
+    func persistState(_ id: UUID) {
+        guard let s = states[id] else { return }
+        let stored = s.stored
+        store.enqueueWrite(to: stateURL(id)) { try? JSONEncoder().encode(stored) }
     }
 
     // MARK: Striche
 
+    /// Höchstens so viele neue Striche je Anfrage. Nach einer Seitenänderung bekommen alle Striche darunter
+    /// neue IDs; in einem Stück wären das viele MB, die bei schlechter Verbindung immer wieder von vorn begännen.
+    private static let chunkSize = 300
+
+    /// Ein großes Hochladen in Paketen, etwa nach einer Seitenänderung (alle Striche darunter haben neue IDs).
+    /// Was nicht dazugehört (inzwischen neu Geschriebenes, Lasso-Kopien, Radiertes), geht vor, damit es nicht
+    /// hinter dem Rest wartet. Die abgelösten alten Fassungen verschwinden erst mit dem letzten Paket: So fehlen
+    /// die Striche nirgends, auch am Server nicht, solange das Hochladen dauert oder unterbrochen ist.
+    private struct Bulk {
+        /// Erkennt ein überholtes Hochladen (das nach einer neuen Seitenänderung nichts mehr ändern darf)
+        var generation: Int
+        /// Beginn: Später geschriebene Striche gehören nicht dazu
+        var since: Date
+        /// Striche, die zum großen Hochladen gehören (nil = noch unbekannt); alle anderen gehen vor
+        var waiting: Set<String>?
+        /// Abgelöste alte Fassungen: Ihre Löschung geht erst mit dem letzten Paket (nil = beim ersten Abgleich alles,
+        /// was dann fehlt)
+        var retired: Set<String>?
+    }
+    private var bulks: [UUID: Bulk] = [:]
+    private var bulkGenerations = 0
+
+    /// Seitenzahl nach der Seitenänderung eines anderen Geräts, solange dessen verschobene Striche noch kommen:
+    /// Bis dahin reichen die alten Fassungen weiter hinunter. Ein geschlossenes Dokument (und eine Leinwand, die es
+    /// jetzt öffnet) schrumpft wieder darauf, sobald sie weg sind.
+    private var pageTargets: [UUID: Int] = [:]
+    func pageTarget(_ id: UUID) -> Int? { pageTargets[id] }
+    func notePageTargetReached(_ id: UUID) { pageTargets[id] = nil }
+
+    /// Die offene Leinwand hat Seiten geändert: Der nächste Abgleich lädt viel hoch (siehe `Bulk`)
+    @discardableResult
+    func noteBulkChange(_ id: UUID) -> Int {
+        bulkGenerations += 1
+        bulks[id] = Bulk(generation: bulkGenerations, since: Date())
+        // Die eigene Seitenänderung ist die neueste
+        pageTargets[id] = nil
+        return bulkGenerations
+    }
+
+    /// Die IDs der Zeichnung nach der Seitenänderung sind bekannt: Was sonst noch neu ist, geht vor; was am Server
+    /// steht, aber nicht mehr darin vorkommt, sind die abgelösten alten Fassungen. Läuft gerade noch ein Abgleich
+    /// von davor, kommt von ihm vielleicht noch eine alte Fassung an den Server: Dann legt das erst der nächste
+    /// Abgleich fest (alles, was dann fehlt)
+    func noteBulkContents(_ id: UUID, generation: Int, ids: Set<String>) {
+        guard var bulk = bulks[id], bulk.generation == generation else { return }
+        bulk.waiting = ids
+        if bulk.retired == nil, !busy.contains(id) { bulk.retired = state(id).confirmed.subtracting(ids) }
+        bulks[id] = bulk
+    }
+
     /// Schickt die lokalen Änderungen (Unterschied von `snapshot` zum letzten Abgleich) und holt die entfernten.
     /// Die entfernten Änderungen gehen an die offene Leinwand oder direkt in die Datei, nie verloren.
-    /// - Parameter snapshot: aktuelle Zeichnung in Seitenpunkten, oder nil, wenn sich lokal nichts geändert hat
+    /// Viele neue Striche gehen in Paketen, in Zeichnungsreihenfolge (so liegen sie überall gleich übereinander);
+    /// nach jedem Paket ist der Stand gesichert. Was nicht zu einem großen Hochladen gehört, geht vor (siehe `Bulk`).
+    /// Gelöscht wird, sobald das zuerst Geschickte oben ist; Löschungen unbekannter Herkunft während eines großen
+    /// Hochladens (etwa nach einem Neustart mittendrin) erst mit dem letzten Paket.
+    /// - Parameter snapshot: aktueller Stand der Zeichnung, oder nil, wenn sich lokal nichts geändert hat
     @discardableResult
-    func syncStrokes(_ id: UUID, snapshot: PKDrawing?) async -> Bool {
+    func syncStrokes(_ id: UUID, snapshot: StrokeSnapshot?) async -> Bool {
         guard isConfigured, !busy.contains(id) else { return false }
         busy.insert(id)
         defer { busy.remove(id) }
 
-        var state = loadState(id)
-        var add: [[String: String]] = []
-        var remove: [String] = []
-        var ids = Set(state.ids)
+        let state = self.state(id)
+        // Abgleich der offenen Leinwand: Er hört auf, sobald sie Neues hat, Seiten ändert oder geschlossen wird.
+        // Abgleich der Datei: Er hört auf, sobald das Dokument inzwischen offen war
+        let startedOpen = openController?.doc.id == id
+        let openedBefore = openings[id, default: 0]
+        var adds: [(id: String, stroke: PKStroke)] = []
+        var earlyRemoves: [String] = []
+        var lateRemoves: [String] = []
+        // So viele Striche am Anfang von `adds` gehören nicht zum großen Hochladen
+        var freshCount = 0
+        var toPage = CGAffineTransform.identity
         if let snapshot {
-            let encoded = StrokeCodec.encodeAll(snapshot.strokes)
-            let current = Set(encoded.map(\.id))
-            add = encoded.filter { !ids.contains($0.id) }.map { ["id": $0.id, "data": $0.data] }
-            remove = Array(ids.subtracting(current))
-            ids = current
+            toPage = snapshot.toPage
+            var current = Set<String>(minimumCapacity: snapshot.strokes.count + snapshot.alsoPresent.count)
+            for s in snapshot.strokes where !snapshot.alsoGone.contains(s.id) { current.insert(s.id) }
+            current.formUnion(snapshot.alsoPresent)
+            adds = snapshot.strokes.filter { !state.confirmed.contains($0.id) && !snapshot.alsoGone.contains($0.id) }
+            let removes = state.confirmed.subtracting(current)
+            if var bulk = bulks[id] {
+                let retired = bulk.retired ?? removes
+                bulk.retired = retired
+                bulks[id] = bulk
+                earlyRemoves = Array(removes.subtracting(retired))
+                lateRemoves = Array(removes.intersection(retired))
+                let b = bulk
+                func isFresh(_ a: (id: String, stroke: PKStroke)) -> Bool {
+                    a.stroke.path.creationDate > b.since || b.waiting.map { !$0.contains(a.id) } == true
+                }
+                let fresh = adds.filter { isFresh($0) }
+                if !fresh.isEmpty, fresh.count < adds.count {
+                    adds = fresh + adds.filter { !isFresh($0) }
+                }
+                freshCount = fresh.count
+            } else if adds.count > Self.chunkSize {
+                // Großes Hochladen ohne bekannte Seitenänderung: Die Löschungen könnten die alten Fassungen sein
+                bulkGenerations += 1
+                bulks[id] = Bulk(generation: bulkGenerations, since: Date(), retired: removes)
+                lateRemoves = Array(removes)
+            } else {
+                earlyRemoves = Array(removes)
+            }
+        }
+        let generation = bulks[id]?.generation
+        /// Was vom großen Hochladen ab `next` noch fehlt (für den nächsten Abgleich, falls dieser nicht fertig wird)
+        func noteWaiting(from next: Int) {
+            guard adds.count > Self.chunkSize, let generation, bulks[id]?.generation == generation else { return }
+            bulks[id]?.waiting = Set(adds[max(next, freshCount)...].map { $0.id })
         }
 
         struct Response: Decodable {
@@ -157,29 +321,76 @@ final class SyncEngine: ObservableObject {
             var seq: Int
             var changes: [Change]
         }
-        do {
-            let body = try JSONSerialization.data(withJSONObject: ["since": state.seq, "add": add, "remove": remove])
-            let data = try await request("POST", "/api/doc/\(Self.path(id))/sync", body: body)
-            let response = try JSONDecoder().decode(Response.self, from: data)
-            var changes = RemoteChanges()
-            for c in response.changes {
-                if let d = c.data {
-                    changes.added.append((c.id, d))
-                    ids.insert(c.id)
-                } else {
-                    changes.removed.insert(c.id)
-                    ids.remove(c.id)
+        let started = Date()
+        // Radiertes geht mit dem Paket, in dem das zuerst Geschickte endet (Lasso: erst die Kopien, dann weg mit
+        // dem Original), die abgelösten alten Fassungen mit dem letzten
+        let earlyChunk = freshCount == 0 ? 0 : (freshCount - 1) / Self.chunkSize
+        var next = 0
+        var chunk = 0
+        repeat {
+            let part = adds[next..<min(next + Self.chunkSize, adds.count)]
+            var gone = chunk == earlyChunk ? earlyRemoves : []
+            if next + part.count >= adds.count { gone += lateRemoves }
+            noteWaiting(from: next)
+            do {
+                let add = part.map { a -> [String: String] in
+                    var stroke = a.stroke
+                    stroke.transform = StrokeCodec.pageTransform(a.stroke, toPage)
+                    return ["id": a.id, "data": StrokeCodec.data(stroke)]
+                }
+                let body = try JSONSerialization.data(withJSONObject: ["since": state.seq, "add": add, "remove": gone])
+                let data = try await request("POST", "/api/doc/\(Self.path(id))/sync", body: body)
+                let response = try JSONDecoder().decode(Response.self, from: data)
+                state.confirmed.subtract(gone)
+                for a in part { state.confirmed.insert(a.id) }
+                // Das eigene Echo (was diese Anfrage gerade hochgeladen oder gelöscht hat) nicht zurück an die
+                // Leinwand geben: Hat sich die Zeichnung inzwischen geändert (z. B. Seiten eingefügt, Striche
+                // verschoben), würde ein alter Strich sonst wieder auftauchen. Der Server lässt es inzwischen
+                // selbst weg; das hier schützt auch gegen einen älteren Server.
+                var own = Set(gone)
+                for a in part { own.insert(a.id) }
+                var changes = RemoteChanges()
+                for c in response.changes where !own.contains(c.id) {
+                    if let d = c.data {
+                        changes.added.append((c.id, d))
+                        state.confirmed.insert(c.id)
+                    } else {
+                        changes.removed.insert(c.id)
+                        state.confirmed.remove(c.id)
+                    }
+                }
+                state.seq = response.seq
+                deliver(changes, to: id)
+                // Ein geschlossenes Dokument hat die Änderungen jetzt in seiner Datei (oder unterwegs dorthin);
+                // die offene Leinwand sichert ihren Stand selbst, sobald ihre Zeichnung gespeichert ist
+                if openController?.doc.id != id { persistState(id) }
+                if !add.isEmpty || !gone.isEmpty || !changes.isEmpty {
+                    Log.sync.info("sync \(add.count) hoch, \(gone.count) weg, \(changes.added.count)+\(changes.removed.count) geholt, \(Int(Date().timeIntervalSince(started) * 1000)) ms")
+                }
+            } catch {
+                status = error.localizedDescription
+                return false
+            }
+            next += part.count
+            chunk += 1
+            // Die offene Leinwand hat Neues (zuerst das schicken, der Rest folgt im nächsten Abgleich) oder will
+            // Seiten ändern. Oder dieser Stand ist überholt, weil die Leinwand inzwischen zu ist bzw. das Dokument
+            // offen war: Dann macht gleich ein Abgleich seiner Datei weiter
+            if next < adds.count {
+                let canvasNow = openController?.doc.id == id ? openController : nil
+                let stop = canvasNow.map { $0.hasUnsyncedLocalChanges || $0.isRestructuring }
+                    ?? (startedOpen || openings[id, default: 0] != openedBefore)
+                if stop {
+                    noteWaiting(from: next)
+                    if canvasNow == nil { Task { [weak self] in await self?.syncClosed(id) } }
+                    return true
                 }
             }
-            state.seq = response.seq
-            state.ids = Array(ids)
-            saveState(state, id)
-            deliver(changes, to: id)
-            return true
-        } catch {
-            status = error.localizedDescription
-            return false
-        }
+        } while next < adds.count
+        // Alles oben: Das große Hochladen ist fertig (ein bloßes Holen ändert daran nichts, und ein inzwischen neu
+        // begonnenes, etwa nach einer weiteren Seitenänderung, bleibt)
+        if snapshot != nil, bulks[id]?.generation == generation { bulks[id] = nil }
+        return true
     }
 
     private func deliver(_ changes: RemoteChanges, to id: UUID) {
@@ -190,26 +401,69 @@ final class SyncEngine: ObservableObject {
         }
         guard let doc = store.documents.first(where: { $0.id == id }) else { return }
         let drawing = store.loadDrawing(doc)
-        if let merged = StrokeCodec.apply(changes, to: drawing) {
-            store.saveDrawing(merged, for: id, pageCount: PageLayout.pagesNeeded(for: merged, kind: doc.kind, current: doc.pageCount))
+        if let merged = StrokeCodec.apply(changes, to: drawing, pruning: openController == nil ? .closed : .never)?.drawing {
+            let target = pageTargets[id]
+            let pages = PageLayout.pagesNeeded(for: merged, kind: doc.kind, current: target ?? doc.pageCount)
+            if let target, pages <= target { pageTargets[id] = nil }
+            store.saveDrawing(merged, for: id, pageCount: pages, touch: false)
         }
     }
 
     /// Abgleich eines Dokuments, das gerade nicht offen ist: Zeichnung von der Platte
     func syncClosed(_ id: UUID) async {
-        guard let doc = store.documents.first(where: { $0.id == id }) else { return }
-        guard await syncStrokes(id, snapshot: store.loadDrawing(doc)) else { return }
-        var state = loadState(id)
-        state.syncedModified = store.documents.first(where: { $0.id == id })?.modified.timeIntervalSince1970 ?? 0
-        saveState(state, id)
+        let passes = closedPasses[id, default: 0]
+        // Eben geschlossen: Läuft noch ein Abgleich der Leinwand, dessen Ende abwarten. Läuft danach immer noch einer
+        // (etwa der Rest eines großen Hochladens, der schon mit der Datei weitermacht), bleibt es bei ihm; ebenso,
+        // wenn inzwischen einer fertig wurde (er begann nach diesem Aufruf, hat also schon alles)
+        for _ in 0..<100 where busy.contains(id) {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        // Inzwischen wieder geöffnet: Dann gleicht die Leinwand ab, nicht die (ältere) Datei
+        guard !busy.contains(id), closedPasses[id, default: 0] == passes, openController?.doc.id != id,
+              let doc = store.documents.first(where: { $0.id == id }) else { return }
+        let opened = openings[id, default: 0]
+        let snapshot = StrokeSnapshot(store.loadDrawing(doc).strokes, toPage: .identity,
+                                      pruning: openController == nil ? .closed : .never)
+        guard await syncStrokes(id, snapshot: snapshot) else { return }
+        // Währenddessen wieder geöffnet: Das Geholte wartet auf der Leinwand, nicht in der Datei. Den Stand sichert
+        // dann die Leinwand, sobald ihre Zeichnung gespeichert ist (sonst wäre er der Datei voraus). War es offen und
+        // ist schon wieder zu, fehlt hier, was dort dazukam: Dann gilt der Abgleich nicht als vollständig, und der
+        // nächste holt es nach
+        guard openController?.doc.id != id, openings[id, default: 0] == opened else { return }
+        state(id).syncedModified = store.documents.first(where: { $0.id == id })?.modified.timeIntervalSince1970 ?? 0
+        closedPasses[id, default: 0] += 1
+        persistState(id)
     }
 
     // MARK: Bibliothek
 
+    /// Gleicht die Bibliothek ab. Läuft schon ein Abgleich, kommt danach noch einer, und der Aufruf wartet auf dessen Ende.
     func syncLibrary() async {
-        guard isConfigured, !librarySyncing else { return }
-        librarySyncing = true
-        defer { librarySyncing = false }
+        guard isConfigured else { return }
+        if let running = libraryTask {
+            libraryAgain = true
+            await running.value
+            return
+        }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            repeat {
+                self.libraryAgain = false
+                await self.syncLibraryOnce()
+            } while self.libraryAgain
+            self.libraryTask = nil
+        }
+        libraryTask = task
+        await task.value
+    }
+
+    /// Nach dem Löschen oder Einfügen von Seiten in einem PDF: Diese Fassung muss vor den verschobenen Strichen
+    /// auf den Server
+    func notePDFUploadPending(_ id: UUID) {
+        pdfUploadPending.insert(id)
+    }
+
+    private func syncLibraryOnce() async {
         do {
             // 1. Lokal gelöschte Dokumente als Grabstein hochladen
             for idString in pendingDeletes {
@@ -229,18 +483,59 @@ final class SyncEngine: ObservableObject {
             for r in remote {
                 let local = store.documents.first { $0.id == r.id }
                 if r.deleted == true {
-                    if local != nil, openController?.doc.id != r.id { store.delete(local!) }
+                    if local != nil, openController?.doc.id != r.id {
+                        states[r.id] = nil
+                        bulks[r.id] = nil
+                        pageTargets[r.id] = nil
+                        store.delete(local!)
+                    }
                     continue
                 }
                 if let local {
+                    var merged = local
+                    var changed = false
+                    let remotePages = r.pagesVersion ?? 0, localPages = local.pagesVersion ?? 0
+                    // Ändert die offene Leinwand gerade selbst Seiten, ihr nicht dazwischen das PDF austauschen;
+                    // danach ist ihre Seitenänderung die neuere
+                    let busyHere = openController?.doc.id == r.id && openController?.isRestructuring == true
+                    // Titel, Ordner usw.: letzte Änderung gewinnt
                     if r.modified.timeIntervalSince1970 > local.modified.timeIntervalSince1970 + 0.001 {
-                        var merged = local
                         merged.title = r.title
-                        merged.pageCount = max(local.pageCount, r.pageCount)
+                        merged.folder = r.folder
                         merged.modified = r.modified
-                        store.save(merged)
+                        // Gleicher Seitenstand: Die Seitenzahl wächst nur (Schreiben auf der letzten Seite)
+                        if remotePages == localPages { merged.pageCount = max(local.pageCount, r.pageCount) }
+                        changed = true
+                    }
+                    // Seitenzahl und PDF folgen der neuesten Seitenänderung, unabhängig vom übrigen Stand:
+                    // Ein Gerät, das nur fremde Striche übernommen hat, ist dadurch nicht „neuer“
+                    var structure = false
+                    if remotePages > localPages, !busyHere {
+                        merged.pagesVersion = remotePages
+                        merged.pageCount = max(r.pageCount, 1)
+                        if r.kind == .notebook { pageTargets[r.id] = merged.pageCount }
+                        changed = true
+                        structure = true
+                    }
+                    var pdfChanged = false
+                    if r.kind == .pdf, r.hasPDF == true, (r.pdfVersion ?? 0) > (local.pdfVersion ?? 0), !busyHere {
+                        let pdf = try await request("GET", "/api/pdf/\(Self.path(r.id))")
+                        try pdf.write(to: store.pdfURL(r.id), options: .atomic)
+                        merged.pdfVersion = r.pdfVersion
+                        changed = true
+                        pdfChanged = true
+                    }
+                    if changed { store.save(merged) }
+                    if structure || pdfChanged, let c = openController, c.doc.id == r.id {
+                        c.remoteStructureChanged(pageCount: merged.pageCount, pdfChanged: pdfChanged)
                     }
                 } else {
+                    // Neu auf diesem Gerät (oder nach dem Löschen wieder da): ohne alten Sync-Stand beginnen, sonst
+                    // hielte der Abgleich alle früher bekannten Striche für hier gelöscht
+                    states[r.id] = nil
+                    bulks[r.id] = nil
+                    pageTargets[r.id] = nil
+                    try? FileManager.default.removeItem(at: stateURL(r.id))
                     if r.kind == .pdf {
                         guard r.hasPDF == true else { continue }
                         let pdf = try await request("GET", "/api/pdf/\(Self.path(r.id))")
@@ -252,24 +547,31 @@ final class SyncEngine: ObservableObject {
                     // Striche auf dem Server liegen immer im aktuellen Seitenlayout
                     store.save(NoteDocument(id: r.id, title: r.title, kind: r.kind, created: r.created,
                                             modified: r.modified, pageCount: max(r.pageCount, 1),
-                                            layoutVersion: PageLayout.currentVersion))
+                                            layoutVersion: PageLayout.currentVersion, folder: r.folder,
+                                            pdfVersion: r.pdfVersion, pagesVersion: r.pagesVersion))
                 }
             }
 
-            // 3. Eigene Dokumente hochladen, wenn neu oder neuer
+            // 3. Eigene Dokumente hochladen, wenn neu oder neuer, oder wenn hier eine neuere Seitenänderung liegt
+            //    (der Server übernimmt die dann auch in einen sonst neueren Stand)
             for local in store.documents {
                 let r = remoteByID[local.id]
-                guard r == nil || local.modified.timeIntervalSince1970 > r!.modified.timeIntervalSince1970 + 0.001 else { continue }
-                if local.kind == .pdf, r?.hasPDF != true {
+                let metaNewer = r == nil || local.modified.timeIntervalSince1970 > r!.modified.timeIntervalSince1970 + 0.001
+                let pagesNewer = (local.pagesVersion ?? 0) > (r?.pagesVersion ?? 0)
+                let pdfNewer = local.kind == .pdf && (r?.hasPDF != true || (local.pdfVersion ?? 0) > (r?.pdfVersion ?? 0))
+                if !pdfNewer { pdfUploadPending.remove(local.id) }
+                guard metaNewer || pagesNewer || pdfNewer else { continue }
+                if pdfNewer {
                     let pdf = try Data(contentsOf: store.pdfURL(local.id))
                     _ = try await request("PUT", "/api/pdf/\(Self.path(local.id))", body: pdf, contentType: "application/pdf")
                 }
                 _ = try await request("PUT", "/api/library/\(Self.path(local.id))", body: try Self.encoder.encode(local))
+                pdfUploadPending.remove(local.id)
             }
 
             // 4. Striche der nicht geöffneten Dokumente
             for local in store.documents where local.id != openController?.doc.id {
-                let state = loadState(local.id)
+                let state = self.state(local.id)
                 let remoteSeq = remoteByID[local.id]?.strokeSeq ?? 0
                 if remoteSeq > state.seq || local.modified.timeIntervalSince1970 > state.syncedModified + 0.001 {
                     await syncClosed(local.id)
@@ -284,6 +586,9 @@ final class SyncEngine: ObservableObject {
 
     /// Merkt ein lokal gelöschtes Dokument vor, damit es auch auf den anderen Geräten verschwindet
     func noteDeleted(_ id: UUID) {
+        states[id] = nil
+        bulks[id] = nil
+        pageTargets[id] = nil
         guard isConfigured else { return }
         pendingDeletes.insert(id.uuidString)
     }

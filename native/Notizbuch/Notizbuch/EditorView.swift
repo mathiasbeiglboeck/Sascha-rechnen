@@ -3,6 +3,8 @@ import UIKit
 
 enum ToolMode {
     case pen, eraser, lasso
+    /// Zeigestift: leuchtet, verschwindet nach etwa zehn Sekunden, wird nicht gespeichert
+    case pointer
 }
 
 /// Stift, Farbe, Dicke und ob die Menüs sichtbar sind
@@ -28,13 +30,15 @@ final class ToolState: ObservableObject {
     @Published var flash: String?
     /// Zahl der Gäste, die gerade live zusehen (nil = nicht geteilt)
     @Published var guests: Int?
+    /// Seitenübersicht (drei Spalten) ist offen
+    @Published var overviewShown = false
 
     weak var canvas: CanvasController?
     private var flashTask: Task<Void, Never>?
 
     /// Doppeltippen am Pencil: Radierer ↔ Stift (vom Lasso aus zum Radierer)
     func show(_ message: String, seconds: Double = 1.6) {
-        flash = message
+        flash = message.isEmpty ? nil : message
         flashTask?.cancel()
         flashTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(seconds))
@@ -89,6 +93,15 @@ struct EditorView: View {
                 CanvasRepresentable(doc: doc, store: store, sync: sync, tools: tools)
                     .ignoresSafeArea()
             }
+        // Die Übersicht liegt über der Leinwand statt in einem eigenen Vollbild: So bleibt die Leinwand offen,
+        // gleicht weiter ab und bekommt fremde Striche direkt (ein Vollbild würde sie wie beim Schließen abmelden)
+        .overlay {
+            if tools.overviewShown, let canvas = tools.canvas {
+                PageOverview(controller: canvas) { tools.overviewShown = false }
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeOut(duration: 0.15), value: tools.overviewShown)
         .statusBarHidden(tools.menusHidden)
         .persistentSystemOverlays(tools.menusHidden ? .hidden : .automatic)
         .animation(.easeOut(duration: 0.2), value: tools.menusHidden)
@@ -105,6 +118,7 @@ struct CanvasRepresentable: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> CanvasController {
         let controller = CanvasController(doc: doc, store: store, sync: sync)
         controller.onFlash = { [weak tools] in tools?.show($0) }
+        controller.onFlashTimed = { [weak tools] in tools?.show($0, seconds: $1) }
         controller.onGuests = { [weak tools] in tools?.guests = $0 }
         controller.onToggleMenus = { [weak tools] in tools?.menusHidden.toggle() }
         controller.onToggleEraser = { [weak tools] in tools?.toggleEraser() }
@@ -127,10 +141,11 @@ struct ToolBar: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
-        HStack(spacing: sizeClass == .compact ? 8 : 14) {
+        HStack(spacing: sizeClass == .compact ? 7 : 14) {
             Button(action: onClose) {
                 Image(systemName: "chevron.left").font(.body.weight(.semibold))
             }
+            Button { tools.overviewShown = true } label: { Image(systemName: "square.grid.3x3") }
             divider
             if tools.viewOnly {
                 shareMenu
@@ -147,8 +162,14 @@ struct ToolBar: View {
                 widthButtons
             }
             divider
-            modeButton(.eraser, symbol: "eraser")
-            modeButton(.lasso, symbol: "lasso")
+            if sizeClass == .compact {
+                // Am iPhone ist zu wenig Platz: Werkzeuge in einem Menü
+                modeMenu
+            } else {
+                modeButton(.pointer, symbol: "scribble", tint: Color(uiColor: PointerOverlay.ownColor))
+                modeButton(.eraser, symbol: "eraser")
+                modeButton(.lasso, symbol: "lasso")
+            }
             Button { tools.canvas?.undo() } label: { Image(systemName: "arrow.uturn.backward") }
             Button { tools.canvas?.redo() } label: { Image(systemName: "arrow.uturn.forward") }
             divider
@@ -161,7 +182,7 @@ struct ToolBar: View {
         }
         .font(.body)
         .tint(.primary)
-        .padding(.horizontal, 16)
+        .padding(.horizontal, sizeClass == .compact ? 12 : 16)
         .padding(.vertical, 8)
         .background(.regularMaterial, in: Capsule())
         .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
@@ -210,11 +231,36 @@ struct ToolBar: View {
         canvas.share(kind, from: CGRect(x: b.midX, y: 60, width: 1, height: 1))
     }
 
-    private func modeButton(_ mode: ToolMode, symbol: String) -> some View {
+    /// Stift, Zeigestift, Radierer und Lasso in einem Menü; zeigt das aktuelle Werkzeug
+    private var modeMenu: some View {
+        Menu {
+            Button { tools.mode = .pen } label: { Label("Stift", systemImage: "pencil.tip") }
+            Button { tools.mode = .pointer } label: { Label("Zeigestift", systemImage: "scribble") }
+            Button { tools.mode = .eraser } label: { Label("Radierer", systemImage: "eraser") }
+            Button { tools.mode = .lasso } label: { Label("Lasso", systemImage: "lasso") }
+        } label: {
+            Image(systemName: Self.symbol(for: tools.mode))
+                .foregroundStyle(tools.mode == .pointer ? Color(uiColor: PointerOverlay.ownColor) : Color.primary)
+                .padding(5)
+                .background(tools.mode == .pen ? Color.clear : Color.primary.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+        }
+    }
+
+    private static func symbol(for mode: ToolMode) -> String {
+        switch mode {
+        case .pen: return "pencil.tip"
+        case .pointer: return "scribble"
+        case .eraser: return "eraser"
+        case .lasso: return "lasso"
+        }
+    }
+
+    private func modeButton(_ mode: ToolMode, symbol: String, tint: Color? = nil) -> some View {
         Button {
             tools.mode = tools.mode == mode ? .pen : mode
         } label: {
             Image(systemName: symbol)
+                .foregroundStyle(tint ?? Color.primary)
                 .padding(5)
                 .background(tools.mode == mode ? Color.primary.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 7))
         }

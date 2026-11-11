@@ -19,13 +19,34 @@ struct NoteDocument: Codable, Identifiable, Hashable {
     var pageCount: Int
     /// Version des Seitenlayouts, mit dem die Striche gespeichert sind (fehlt = 1)
     var layoutVersion: Int?
+    /// Ordner in der Übersicht (nil = oberste Ebene)
+    var folder: String?
+    /// Stand des PDFs selbst (Zeitpunkt in ms); ändert sich, wenn Seiten gelöscht oder eingefügt werden
+    var pdfVersion: Int? = nil
+    /// Zeitpunkt (ms) der letzten Seitenänderung (löschen, einfügen) auf irgendeinem Gerät. Seitenzahl und
+    /// PDF-Version folgen der neuesten Seitenänderung, nicht der letzten Änderung am Dokument überhaupt
+    var pagesVersion: Int? = nil
 }
 
 @MainActor
 final class DocumentStore: ObservableObject {
     @Published private(set) var documents: [NoteDocument] = []
+    /// Zählt Schreibvorgänge der Zeichnung je Dokument (für Vorschaubilder; `modified` ändert sich
+    /// bei übernommenen fremden Strichen nicht)
+    @Published private(set) var inkVersions: [UUID: Int] = [:]
     let root: URL
     private let fm = FileManager.default
+    /// Schreibt Zeichnungen und den Sync-Stand im Hintergrund, der Reihe nach
+    private let io = DispatchQueue(label: "de.beiglboeck.notizbuch.io", qos: .userInitiated)
+    /// Zeichnungen, die gerade geschrieben werden: Wer liest, bekommt sie, nie einen älteren Stand von der Platte
+    private var writing: [UUID: PendingDrawing] = [:]
+    private var writes = 0
+
+    private struct PendingDrawing {
+        let number: Int
+        let drawing: PKDrawing
+        let toPage: CGAffineTransform
+    }
 
     init() {
         root = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -53,23 +74,23 @@ final class DocumentStore: ObservableObject {
         .sorted { $0.modified > $1.modified }
     }
 
-    func createNotebook() -> NoteDocument {
+    func createNotebook(inFolder: String? = nil) -> NoteDocument {
         let now = Date()
         let doc = NoteDocument(id: UUID(), title: "Notizen " + now.formatted(date: .abbreviated, time: .omitted),
                                kind: .notebook, created: now, modified: now, pageCount: 1,
-                               layoutVersion: PageLayout.currentVersion)
+                               layoutVersion: PageLayout.currentVersion, folder: inFolder)
         try? fm.createDirectory(at: folder(doc.id), withIntermediateDirectories: true)
         save(doc)
         return doc
     }
 
-    func importPDF(from url: URL) throws -> NoteDocument {
+    func importPDF(from url: URL, inFolder: String? = nil) throws -> NoteDocument {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         let now = Date()
         let doc = NoteDocument(id: UUID(), title: url.deletingPathExtension().lastPathComponent,
                                kind: .pdf, created: now, modified: now, pageCount: 0,
-                               layoutVersion: PageLayout.currentVersion)
+                               layoutVersion: PageLayout.currentVersion, folder: inFolder)
         try fm.createDirectory(at: folder(doc.id), withIntermediateDirectories: true)
         try fm.copyItem(at: url, to: pdfURL(doc.id))
         save(doc)
@@ -87,6 +108,29 @@ final class DocumentStore: ObservableObject {
         }
     }
 
+    /// Fester Ordner für Durchlaufendes: PDFs von Claude und ChatGPT landen hier
+    static let tempFolder = "temp"
+    /// Nach so vielen Tagen ohne Änderung wird ein Dokument im temp-Ordner gelöscht
+    static let tempDays = 14
+
+    /// Löscht Dokumente im temp-Ordner, die seit `tempDays` Tagen nicht geändert wurden; gibt ihre IDs zurück
+    func purgeTemp(keeping open: UUID?) -> [UUID] {
+        let limit = Date().addingTimeInterval(-Double(Self.tempDays) * 86400)
+        let old = documents.filter { $0.folder == Self.tempFolder && $0.modified < limit && $0.id != open }
+        for doc in old { delete(doc) }
+        return old.map(\.id)
+    }
+
+    /// Verschiebt ein Dokument in einen Ordner (nil = oberste Ebene); gilt nach dem Sync auf allen Geräten
+    func move(_ doc: NoteDocument, to folder: String?) {
+        var d = doc
+        let name = folder?.trimmingCharacters(in: .whitespacesAndNewlines)
+        d.folder = (name?.isEmpty ?? true) ? nil : name
+        guard d.folder != doc.folder else { return }
+        d.modified = Date()
+        save(d)
+    }
+
     func rename(_ doc: NoteDocument, to title: String) {
         var d = doc
         d.title = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -95,6 +139,7 @@ final class DocumentStore: ObservableObject {
     }
 
     func delete(_ doc: NoteDocument) {
+        writing[doc.id] = nil
         try? fm.removeItem(at: folder(doc.id))
         documents.removeAll { $0.id == doc.id }
     }
@@ -102,6 +147,9 @@ final class DocumentStore: ObservableObject {
     // MARK: Zeichnung
 
     func loadDrawing(_ doc: NoteDocument) -> PKDrawing {
+        if let p = writing[doc.id] {
+            return p.toPage.isIdentity ? p.drawing : p.drawing.transformed(using: p.toPage)
+        }
         guard let data = try? Data(contentsOf: drawingURL(doc.id)),
               let drawing = try? PKDrawing(data: data) else { return PKDrawing() }
         guard (doc.layoutVersion ?? 1) < PageLayout.currentVersion else { return drawing }
@@ -123,11 +171,78 @@ final class DocumentStore: ObservableObject {
         return migrated
     }
 
-    func saveDrawing(_ drawing: PKDrawing, for id: UUID, pageCount: Int) {
-        try? drawing.dataRepresentation().write(to: drawingURL(id), options: .atomic)
+    /// Speichert die Zeichnung im Hintergrund: Umrechnen und Kodieren dauert bei großen Dokumenten,
+    /// und der Stift soll dabei nie stocken. Bis die Datei geschrieben ist, liefert `loadDrawing` diesen Stand.
+    /// - Parameters:
+    ///   - toPage: rechnet die Zeichnung in Seitenpunkte um (identity: liegt schon in Seitenpunkten)
+    ///   - touch: false, wenn nur Striche von anderen Geräten übernommen werden. Dann bleibt
+    ///     `modified` stehen: Sonst würde der eigene (ältere) Stand von Titel, Ordner usw. beim nächsten
+    ///     Abgleich als „neuer“ gelten und den wirklich neueren Stand der anderen überschreiben.
+    ///   - base: Stand nach dem letzten Laden oder Speichern. Ist die Zeichnung genau gleich (PencilKit meldet
+    ///     beim Öffnen manchmal eine „Änderung“), wird nichts geschrieben.
+    func saveDrawing(_ drawing: PKDrawing, toPage: CGAffineTransform = .identity, for id: UUID, pageCount: Int,
+                     touch: Bool = true, unlessEqualTo base: PKDrawing? = nil, force: Bool = false) {
+        writes += 1
+        let number = writes
+        writing[id] = PendingDrawing(number: number, drawing: drawing, toPage: toPage)
+        // Seitenordnung beim Auftrag: Ändert sie sich bis zum Ende des Schreibens, gilt dessen Seitenzahl nicht mehr
+        let pagesVersion = documents.first(where: { $0.id == id })?.pagesVersion
+        let url = drawingURL(id)
+        let box = UncheckedBox((drawing, base))
+        let task = UIApplication.shared.beginBackgroundTask(withName: "Zeichnung speichern")
+        io.async { [weak self] in
+            let (drawing, base) = box.value
+            // Gleich wie `base`: nicht schreiben (außer mit `force`) und nicht als Bearbeitung zählen
+            var same = false
+            if let base { same = base.dataRepresentation() == drawing.dataRepresentation() }
+            let write = !same || force
+            if write {
+                let page = toPage.isIdentity ? drawing : drawing.transformed(using: toPage)
+                try? page.dataRepresentation().write(to: url, options: .atomic)
+            }
+            DispatchQueue.main.async {
+                self?.finishedWriting(id, number: number, wrote: write, pageCount: pageCount, touch: touch && !same,
+                                      pagesVersion: pagesVersion)
+                UIApplication.shared.endBackgroundTask(task)
+            }
+        }
+    }
+
+    private func finishedWriting(_ id: UUID, number: Int, wrote: Bool, pageCount: Int, touch: Bool, pagesVersion: Int?) {
+        // Die Seitenzahl bestimmt nur das neueste Schreiben, und nur, wenn sich die Seitenordnung seit dem Auftrag
+        // nicht geändert hat: Sonst brächte es die alte Zahl unter die neue Seitenversion zurück
+        let latest = writing[id]?.number == number
+        if latest { writing[id] = nil }
+        if wrote { inkVersions[id, default: 0] += 1 }
         guard var doc = documents.first(where: { $0.id == id }) else { return }
+        let count = latest && doc.pagesVersion == pagesVersion ? pageCount : doc.pageCount
+        guard touch || doc.pageCount != count else { return }
+        if touch { doc.modified = Date() }
+        doc.pageCount = count
+        save(doc)
+    }
+
+    /// Schreibt eine kleine Datei (z. B. den Sync-Stand) nach allen schon angestoßenen Zeichnungen
+    func enqueueWrite(to url: URL, _ make: @escaping @Sendable () -> Data?) {
+        io.async {
+            if let data = make() { try? data.write(to: url, options: .atomic) }
+        }
+    }
+
+    /// Seiten wurden gelöscht oder eingefügt (bei PDFs auch das PDF selbst geändert): Die anderen Geräte
+    /// übernehmen Seitenzahl bzw. PDF, weil diese Version neuer ist als ihre
+    /// Neue Seitenversion samt neuer Seitenzahl, beides sofort in den Metadaten: Die Seitenzahl aus dem
+    /// Speichern der Zeichnung käme erst nach dem Schreiben, und ein Abgleich dazwischen schickte die neue
+    /// Version mit der alten Seitenzahl
+    func notePagesChanged(_ id: UUID, pdf: Bool, pageCount: Int) {
+        guard var doc = documents.first(where: { $0.id == id }) else { return }
+        doc.pageCount = max(pageCount, 1)
+        let now = Int(Date().timeIntervalSince1970 * 1000)
+        // Nie rückwärts, auch wenn die Uhr eines Geräts nachgeht
+        let version = max(now, (doc.pagesVersion ?? 0) + 1, (doc.pdfVersion ?? 0) + 1)
+        doc.pagesVersion = version
+        if pdf { doc.pdfVersion = version }
         doc.modified = Date()
-        doc.pageCount = pageCount
         save(doc)
     }
 
