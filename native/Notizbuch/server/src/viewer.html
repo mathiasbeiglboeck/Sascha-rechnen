@@ -738,7 +738,28 @@ function fadePointers(from) {
 }
 
 // ---------- Verbindung ----------
-function send(msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
+// Eigene Striche und Löschungen, deren Echo vom Server noch fehlt. Reißt die Verbindung ab, gehen sie nach dem
+// Wiederverbinden noch einmal hinaus, sobald der Server nachgeliefert hat, was er seit `seen` hat: Was er davon
+// kennt, ist dann bestätigt, der Rest kam nie an (auch, was ohne Verbindung entstand).
+const unconfirmed = new Map(); // id -> {type: "add", stroke} oder {type: "remove", id}, in der Reihenfolge der Schritte
+let resendPending = false, caughtUp = false;
+function send(msg) {
+  const id = msg.type === "add" ? msg.stroke.id : msg.type === "remove" ? msg.id : null;
+  if (id !== null) { unconfirmed.delete(id); unconfirmed.set(id, msg); }
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
+  else if (id !== null) resendPending = true; // z. B. Rückgängig, während die Verbindung erst aufgeht
+}
+// Ein Strich ist bestätigt, sobald der Server ihn kennt (auch schon wieder gelöscht), eine Löschung erst als Löschung
+function confirmed(id, data) {
+  const u = unconfirmed.get(id);
+  if (u && (u.type === "add" || !data)) unconfirmed.delete(id);
+}
+// Erst wenn der Server nach dem Verbinden nachgeliefert hat (und kein Neuladen mehr läuft, das ihn ablöst)
+function resendIfDue() {
+  if (!resendPending || !caughtUp || !ws || ws.readyState !== 1) return;
+  resendPending = false;
+  for (const msg of [...unconfirmed.values()]) ws.send(JSON.stringify(msg));
+}
 
 function connect() {
   let wanted = null;
@@ -749,13 +770,15 @@ function connect() {
   // und Verbinden geschrieben wurde), ebenso einen Hinweis, falls sich inzwischen die Seiten geändert haben
   if (doc) { q.set("since", seen); q.set("pv", doc.pagesVersion || 0); q.set("dv", doc.pdfVersion || 0); }
   const query = q.toString() ? "?" + q : "";
+  resendPending = unconfirmed.size > 0;
+  caughtUp = false;
   ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + base + "/ws" + query);
   ws.onopen = () => status("live", true);
   ws.onclose = (e) => {
-    if (e.code === 4001) return fail("Das Teilen wurde beendet.");
+    if (e.code === 4001) { gone = true; return fail("Das Teilen wurde beendet."); }
     if (gone) return;
     status("Verbindung unterbrochen …");
-    setTimeout(reconnect, 3000);
+    retryLater();
   };
   ws.onmessage = (e) => {
     let msg; try { msg = JSON.parse(e.data); } catch { return; }
@@ -764,6 +787,8 @@ function connect() {
       if (buffer) buffer.push(...(msg.changes || []));
       else applyChanges(msg.changes || []);
     } else if (msg.type === "you") {
+      // Der Server hat uns angenommen: Beim nächsten Abbruch wieder nach drei Sekunden versuchen
+      retries = 0; httpOk = false;
       setMyColor(msg.color);
     } else if (msg.type === "view" && follow) {
       const target = (msg.y0 * scale) + document.getElementById("pages").offsetTop - document.getElementById("bar").offsetHeight;
@@ -771,23 +796,51 @@ function connect() {
     } else if (msg.type === "pointer") {
       pointerAdd(msg.id, msg.from, msg.pts || [], !!msg.end, msg.color);
     } else if (msg.type === "pages") {
-      // Seiten gelöscht oder eingefügt: alles neu laden (Striche, Seiten, PDF)
-      reload().catch(() => {});
+      // Seiten gelöscht oder eingefügt: alles neu laden (Striche, Seiten, PDF). Klappt das nicht, neu verbinden:
+      // Der Server schickt den Hinweis dann wieder, und bis dahin geht nichts Eigenes auf die neue Seitenordnung.
+      // (Nicht auf onclose warten: Schließt der Browser selbst, meldet sich das erst nach Sekunden.) Die Pause
+      // wächst hier eigens, denn das Verbinden selbst klappt ja: Ein dauernd scheiterndes Laden (etwa ein PDF, das
+      // nicht kommt) soll nicht alle drei Sekunden alle Striche vom Server holen.
+      const sock = ws;
+      reload().then(() => { reloadFails = 0; }, () => {
+        if (gone || sock !== ws) return;
+        sock.onclose = null; sock.onmessage = null; sock.close();
+        status("Verbindung unterbrochen …");
+        retryIn(Math.min(3000 * 2 ** reloadFails++, 30000));
+      });
     } else if (msg.type === "presence") {
       status("live", true, msg.guests);
+      // Kommt als Letztes nach dem Verbinden: Der Server hat nachgeliefert, was er seit `seen` hat
+      caughtUp = true;
+      if (!loading) resendIfDue();
     }
   };
 }
 
 function applyChanges(list) {
   let y0 = Infinity, y1 = -Infinity;
+  const grow = (b) => { y0 = Math.min(y0, b.y0); y1 = Math.max(y1, b.y1); };
+  // Entfernte Striche erst am Ende auf einmal austragen und neu zeichnen: Nach einer Seitenänderung kommen Tausende,
+  // einzeln (jedes Mal die ganze Seite neu) hielt das den Browser viele Sekunden lang an
+  const dropped = new Set();
   for (const c of list) {
     if (c.seq > seen) seen = c.seq;
+    confirmed(c.id, c.data);
+    const old = strokes.get(c.id);
     if (c.data) {
-      if (strokes.has(c.id)) continue;
-      const r = addStroke(c.id, c.data); if (r) { y0 = Math.min(y0, r.y0); y1 = Math.max(y1, r.y1); }
-    } else {
-      removeStroke(c.id);
+      if (old) continue;
+      // Hier eben erst entfernt und gleich wieder da (Rückgängig): den alten Platz in der Reihenfolge freigeben
+      if (dropped.delete(c.id)) order = order.filter(o => o !== c.id);
+      const r = addStroke(c.id, c.data); if (r) grow(r);
+    } else if (old) {
+      strokes.delete(c.id); dropped.add(c.id); grow(old.bbox);
+    }
+  }
+  if (dropped.size) {
+    order = order.filter(o => !dropped.has(o));
+    if (sel && [...dropped].some(id => sel.ids.has(id))) {
+      for (const id of dropped) sel.ids.delete(id);
+      select(sel.ids.size ? sel.ids : null);
     }
   }
   ensurePages();
@@ -797,6 +850,28 @@ function applyChanges(list) {
 // Neu laden, immer nur eines nach dem anderen (sonst kämen Seiten doppelt); kommt währenddessen noch
 // ein Anlass, folgt genau ein weiteres Laden
 let loading = null, loadAgain = false, buffer = null, gone = false;
+// Neu verbinden nach 3 s. Scheitert es mehrmals hintereinander (antwortet der Server nicht, etwa wegen des
+// Tageslimits), mit wachsender Pause bis 30 s, damit nicht jeder Browser alle drei Sekunden anklopft. Kommt nur der
+// WebSocket nicht durch, Abfragen aber schon, bleibt es bei 5 s. Kommt das Netz zurück oder wird die Seite wieder
+// sichtbar, sofort, ohne die Pause abzuwarten.
+let retries = 0, retryTimer = 0, httpOk = false, reloadFails = 0;
+function retryLater() {
+  retryIn(httpOk ? 5000 : Math.min(3000 * 2 ** Math.max(0, retries - 2), 30000));
+  retries++;
+}
+function retryIn(ms) {
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => { retryTimer = 0; reconnect(); }, ms);
+}
+function reconnectNow() {
+  if (gone || !retryTimer) return; // nur, wenn gerade ein Versuch aussteht
+  clearTimeout(retryTimer); retryTimer = 0; retries = 0;
+  reconnect();
+}
+addEventListener("online", reconnectNow);
+addEventListener("pageshow", reconnectNow);
+addEventListener("focus", reconnectNow);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) reconnectNow(); });
 function reload() {
   if (loading) { loadAgain = true; return loading; }
   loading = (async () => {
@@ -806,9 +881,30 @@ function reload() {
   })();
   return loading;
 }
+// Nach einer Unterbrechung nur neu verbinden: Was inzwischen geschah, schickt der Server ab `seen` mit (bei geänderten
+// Seiten stattdessen einen Hinweis, dann wird neu geladen). Alles neu zu laden las bei jedem Wackler alle Striche samt
+// Grabsteinen und kostete am Server viel vom Tageslimit des Gratis-Tarifs. Ganz geladen wird nur, solange noch nichts da ist.
 async function reconnect() {
-  try { await reload(); } catch { if (!gone) setTimeout(reconnect, 5000); return; }
+  if (gone) return;
+  if (!doc) {
+    try { await reload(); } catch { if (!gone) retryLater(); return; }
+  } else if (retries >= 2) {
+    // Schon der letzte Versuch kam nicht durch: die Änderungen per Abfrage holen (manche Netze lassen keinen
+    // WebSocket durch). Nur bei sichtbarer Seite, eine Abfrage kostet am Server so viel wie ein Verbinden.
+    httpOk = !document.hidden && await poll().then(() => true, () => false);
+    if (gone) return;
+  }
   connect();
+}
+// Dasselbe Nachholen wie beim Verbinden, per Abfrage
+async function poll() {
+  const q = new URLSearchParams({ since: seen, pv: doc.pagesVersion || 0, dv: doc.pdfVersion || 0 });
+  const res = await fetch(base + "/changes?" + q, { cache: "no-store" });
+  if (res.status === 404) { gone = true; fail("Das Teilen wurde beendet."); throw new Error("ungültig"); }
+  if (!res.ok) throw new Error("Server antwortet nicht");
+  const msg = await res.json();
+  if (msg.pages) return reload();
+  if (buffer) buffer.push(...msg.changes); else applyChanges(msg.changes);
 }
 
 async function load(isReload) {
@@ -816,7 +912,9 @@ async function load(isReload) {
   let nextPdf = pdf;
   try {
     const res = await fetch(base + "/data", { cache: "no-store" });
-    if (!res.ok) { gone = true; fail("Dieser Link ist nicht (mehr) gültig."); throw new Error("ungültig"); }
+    if (res.status === 404) { gone = true; fail("Dieser Link ist nicht (mehr) gültig."); throw new Error("ungültig"); }
+    // Sonst (etwa Tageslimit des Servers erreicht): später noch einmal
+    if (!res.ok) throw new Error("Server antwortet nicht");
     const data = await res.json();
     // Ein neues PDF (Seiten gelöscht oder eingefügt) erst ganz laden, dann umschalten
     let heights = null;
@@ -833,7 +931,11 @@ async function load(isReload) {
     // Andere Seitenordnung: Eigene alte Schritte würden Striche an ihren alten Stellen zurückbringen
     if (isReload && doc && ((data.pagesVersion || 0) !== (doc.pagesVersion || 0) || (data.pdfVersion || 0) !== (doc.pdfVersion || 0))) {
       history.length = 0;
+      unconfirmed.clear(); // gelten wie die eigenen Schritte nur für die alte Seitenordnung
     }
+    // Was die Momentaufnahme schon so enthält, wie es hier gewollt war, ist angekommen
+    const snap = new Set(data.strokes.map((s) => s.id));
+    for (const [id, msg] of [...unconfirmed]) if (msg.type === "add" ? snap.has(id) : !snap.has(id)) unconfirmed.delete(id);
     if (isReload) { strokes.clear(); order = []; if (sel) select(null); }
     if (nextPdf !== pdf) { if (pdf) pdf.destroy(); pdf = nextPdf; }
     doc = data;
@@ -849,6 +951,7 @@ async function load(isReload) {
     const since = Number(data.seq) || 0;
     seen = since;
     applyChanges(since ? pending.filter(c => !(c.seq <= since)) : pending);
+    resendIfDue();
   } catch (e) {
     if (nextPdf && nextPdf !== pdf) nextPdf.destroy();
     // Alter Stand bleibt: was inzwischen kam, gehört dazu
@@ -868,7 +971,7 @@ addEventListener("resize", () => {
     if (w !== lastWidth) { lastWidth = w; buildPages(); }
   }, 200);
 });
-load(false).then(connect).catch(() => { if (!gone) setTimeout(reconnect, 5000); });
+load(false).then(connect).catch(() => { if (!gone) { status("Server antwortet nicht …"); retryLater(); } });
 </script>
 </body>
 </html>
