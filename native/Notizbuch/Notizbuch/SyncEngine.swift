@@ -45,8 +45,9 @@ struct StrokeSnapshot {
     var alsoGone: Set<String> = []
 
     /// IDs über den Zwischenspeicher: Nur neue Striche werden gehasht
-    init(_ strokes: [PKStroke], toPage: CGAffineTransform) {
-        let ids = StrokeIDCache.shared.ids(for: strokes, toPage: toPage)
+    /// - Parameter prune: nur für die offene Leinwand (siehe `StrokeIDCache.ids`)
+    init(_ strokes: [PKStroke], toPage: CGAffineTransform, prune: Bool = false) {
+        let ids = StrokeIDCache.shared.ids(for: strokes, toPage: toPage, prune: prune)
         self.strokes = zip(ids, strokes).map { (id: $0.0, stroke: $0.1) }
         self.toPage = toPage
     }
@@ -201,9 +202,15 @@ final class SyncEngine: ObservableObject {
     /// neue IDs; in einem Stück wären das viele MB, die bei schlechter Verbindung immer wieder von vorn begännen.
     private static let chunkSize = 300
 
+    /// Je Dokument die Striche eines Hochladens in Paketen, das noch nicht fertig ist (unterbrochen, weil auf der
+    /// Leinwand Neues dazukam, oder abgebrochen). Was seither neu geschrieben wurde, geht im nächsten Abgleich vor.
+    private var unfinished: [UUID: Set<String>] = [:]
+
     /// Schickt die lokalen Änderungen (Unterschied von `snapshot` zum letzten Abgleich) und holt die entfernten.
     /// Die entfernten Änderungen gehen an die offene Leinwand oder direkt in die Datei, nie verloren.
-    /// Viele neue Striche gehen in Paketen (neueste zuerst); nach jedem Paket ist der Stand gesichert.
+    /// Viele neue Striche gehen in Paketen, in Zeichnungsreihenfolge (so liegen sie überall gleich übereinander);
+    /// nach jedem Paket ist der Stand gesichert. Nur was während eines langen Hochladens neu geschrieben wird,
+    /// geht vor dem Rest hinaus, damit es nicht hinter einer großen Verschiebung wartet.
     /// - Parameter snapshot: aktueller Stand der Zeichnung, oder nil, wenn sich lokal nichts geändert hat
     @discardableResult
     func syncStrokes(_ id: UUID, snapshot: StrokeSnapshot?) async -> Bool {
@@ -220,9 +227,14 @@ final class SyncEngine: ObservableObject {
             var current = Set<String>(minimumCapacity: snapshot.strokes.count + snapshot.alsoPresent.count)
             for s in snapshot.strokes where !snapshot.alsoGone.contains(s.id) { current.insert(s.id) }
             current.formUnion(snapshot.alsoPresent)
-            // Neueste zuerst: Was gerade geschrieben wurde, soll nicht hinter einer großen Verschiebung warten
-            adds = snapshot.strokes.reversed().filter { !state.confirmed.contains($0.id) && !snapshot.alsoGone.contains($0.id) }
+            adds = snapshot.strokes.filter { !state.confirmed.contains($0.id) && !snapshot.alsoGone.contains($0.id) }
             removes = Array(state.confirmed.subtracting(current))
+            if let waiting = unfinished[id], adds.count > Self.chunkSize {
+                let fresh = adds.filter { !waiting.contains($0.id) }
+                if !fresh.isEmpty, fresh.count < adds.count, fresh.count <= Self.chunkSize {
+                    adds = fresh + adds.filter { waiting.contains($0.id) }
+                }
+            }
         }
 
         struct Response: Decodable {
@@ -232,11 +244,12 @@ final class SyncEngine: ObservableObject {
         }
         let started = Date()
         var next = 0
-        var first = true
         repeat {
             let part = adds[next..<min(next + Self.chunkSize, adds.count)]
-            // Löschungen sind klein und gehen alle mit dem ersten Paket
-            let gone = first ? removes : []
+            // Löschungen gehen mit dem letzten Paket: Nach einer Seitenänderung sind die verschobenen Striche
+            // dann schon alle am Server, bevor ihre alte Fassung verschwindet (sonst fehlten sie zwischendurch)
+            let gone = next + part.count >= adds.count ? removes : []
+            if adds.count > Self.chunkSize { unfinished[id] = Set(adds[next...].map { $0.id }) }
             do {
                 let add = part.map { a -> [String: String] in
                     var stroke = a.stroke
@@ -276,11 +289,15 @@ final class SyncEngine: ObservableObject {
                 status = error.localizedDescription
                 return false
             }
-            first = false
             next += part.count
-            // Hat die offene Leinwand inzwischen Neues, zuerst das schicken (der Rest folgt im nächsten Abgleich)
-            if next < adds.count, let c = openController, c.doc.id == id, c.hasUnsyncedLocalChanges { return true }
+            // Hat die offene Leinwand inzwischen Neues, zuerst das schicken (der Rest folgt im nächsten Abgleich).
+            // Ebenso, wenn sie Seiten ändern will: Sie wartet sonst auf alle übrigen Pakete
+            if next < adds.count, let c = openController, c.doc.id == id, c.hasUnsyncedLocalChanges || c.isRestructuring {
+                unfinished[id] = Set(adds[next...].map { $0.id })
+                return true
+            }
         } while next < adds.count
+        unfinished[id] = nil
         return true
     }
 
@@ -307,6 +324,9 @@ final class SyncEngine: ObservableObject {
         // Inzwischen wieder geöffnet: Dann gleicht die Leinwand ab, nicht die (ältere) Datei
         guard openController?.doc.id != id, let doc = store.documents.first(where: { $0.id == id }) else { return }
         guard await syncStrokes(id, snapshot: StrokeSnapshot(store.loadDrawing(doc).strokes, toPage: .identity)) else { return }
+        // Währenddessen wieder geöffnet: Das Geholte wartet auf der Leinwand, nicht in der Datei. Den Stand sichert
+        // dann die Leinwand, sobald ihre Zeichnung gespeichert ist (sonst wäre er der Datei voraus)
+        guard openController?.doc.id != id else { return }
         state(id).syncedModified = store.documents.first(where: { $0.id == id })?.modified.timeIntervalSince1970 ?? 0
         persistState(id)
     }
@@ -359,7 +379,10 @@ final class SyncEngine: ObservableObject {
             for r in remote {
                 let local = store.documents.first { $0.id == r.id }
                 if r.deleted == true {
-                    if local != nil, openController?.doc.id != r.id { store.delete(local!) }
+                    if local != nil, openController?.doc.id != r.id {
+                        states[r.id] = nil
+                        store.delete(local!)
+                    }
                     continue
                 }
                 if let local {
@@ -400,6 +423,10 @@ final class SyncEngine: ObservableObject {
                         c.remoteStructureChanged(pageCount: merged.pageCount, pdfChanged: pdfChanged)
                     }
                 } else {
+                    // Neu auf diesem Gerät (oder nach dem Löschen wieder da): ohne alten Sync-Stand beginnen, sonst
+                    // hielte der Abgleich alle früher bekannten Striche für hier gelöscht
+                    states[r.id] = nil
+                    try? FileManager.default.removeItem(at: stateURL(r.id))
                     if r.kind == .pdf {
                         guard r.hasPDF == true else { continue }
                         let pdf = try await request("GET", "/api/pdf/\(Self.path(r.id))")
@@ -450,6 +477,7 @@ final class SyncEngine: ObservableObject {
 
     /// Merkt ein lokal gelöschtes Dokument vor, damit es auch auf den anderen Geräten verschwindet
     func noteDeleted(_ id: UUID) {
+        states[id] = nil
         guard isConfigured else { return }
         pendingDeletes.insert(id.uuidString)
     }

@@ -166,8 +166,14 @@ export class Store extends DurableObject {
         this.deleteBlob(`pdf/${id}`);
       }
     }
-    // Seiten gelöscht oder eingefügt: offene Ansichten bauen ihre Seiten neu auf
-    if (before && !result.deleted && newerStructure(result, before)) this.broadcast(id, { type: "pages" });
+    // Seiten gelöscht oder eingefügt: offene Ansichten bauen ihre Seiten neu auf. Ältere Apps schicken keine
+    // Seitenversion; bei ihnen zeigt wie früher eine kleinere Seitenzahl das Löschen an
+    const legacyDelete = !("pagesVersion" in meta) && (Number(meta.pageCount) || 0) < (Number(before?.pageCount) || 0);
+    if (before && !result.deleted && (newerStructure(result, before) || legacyDelete)) {
+      // Mit dem neuen Seitenstand: Wer ihn schon hat (das Gerät, das die Seiten geändert hat), muss nichts tun
+      const pagesVersion = Number(result.pagesVersion) || 0, pdfVersion = Number(result.pdfVersion) || 0;
+      this.broadcast(id, { type: "pages", pagesVersion, pdfVersion });
+    }
     return result;
   }
 
@@ -212,21 +218,26 @@ export class Store extends DurableObject {
     // Apps holen die Striche selbst per Sync: ein kurzer Hinweis genügt. Mit der neuen Änderungsnummer:
     // Wer sie schon kennt (der Absender selbst), muss nicht nachfragen.
     this.broadcast(doc, { type: "changes", changes: [], seq: last }, `app:${doc}`);
-    // Browser bekommen die Striche mit, in Teilen von höchstens etwa 500 KB
-    // (nach einer Seitenänderung sind es alle Striche darunter auf einmal)
-    let part = [], size = 0;
-    const flush = () => {
-      if (part.length) this.broadcast(doc, { type: "changes", changes: part }, `guest:${doc}`);
-      part = [];
-      size = 0;
-    };
-    for (const c of changes) {
-      const n = (c.data ? c.data.length : 0) + c.id.length + 40;
-      if (size + n > 500000) flush();
-      part.push(c);
-      size += n;
+    // Browser bekommen die Striche mit (nach einer Seitenänderung sind es alle Striche darunter auf einmal)
+    inParts(changes, (part) => this.broadcast(doc, { type: "changes", changes: part }, `guest:${doc}`));
+  }
+
+  /// Was ein Gast zwischen seiner Momentaufnahme (/data) und dem Verbinden verpasst hat: die Striche seither,
+  /// und ein Hinweis, falls sich inzwischen die Seiten geändert haben. accept() läuft ohne Unterbrechung,
+  /// dazwischen kann also nichts geschrieben werden, was weder hier noch live ankommt.
+  catchUp(ws, doc, params) {
+    const since = Number(params.get("since")) || 0;
+    const rows = this.sql
+      .exec("SELECT id, data, alive, seq FROM strokes WHERE doc = ? AND seq > ? ORDER BY seq", doc, since)
+      .toArray();
+    const changes = rows.map((r) => ({ id: r.id, data: r.alive ? r.data : null, seq: r.seq }));
+    inParts(changes, (part) => ws.send(JSON.stringify({ type: "changes", changes: part })));
+    const row = this.sql.exec("SELECT meta FROM docs WHERE id = ?", doc).toArray()[0];
+    const meta = row ? JSON.parse(row.meta) : {};
+    if ((Number(meta.pagesVersion) || 0) !== (Number(params.get("pv")) || 0) ||
+        (Number(meta.pdfVersion) || 0) !== (Number(params.get("dv")) || 0)) {
+      ws.send(JSON.stringify({ type: "pages" }));
     }
-    flush();
   }
 
   // ---------- Live: WebSockets (Hibernation-API) ----------
@@ -241,6 +252,8 @@ export class Store extends DurableObject {
     if (role === "guest") {
       // Eigene Zeigestift-Farbe (gilt, solange die Verbindung steht)
       pair[1].send(JSON.stringify({ type: "you", color }));
+      const params = new URL(request.url).searchParams;
+      if (params.has("since")) this.catchUp(pair[1], doc, params);
       if (this.lastView?.[doc]) pair[1].send(JSON.stringify(this.lastView[doc]));
       this.presence(doc);
     } else {
@@ -251,16 +264,18 @@ export class Store extends DurableObject {
   }
 
   /// Farbe für einen neuen Gast: die gewünschte (die er vor einer Unterbrechung hatte), wenn sie frei ist,
-  /// sonst die erste freie; sind alle vergeben, reihum
+  /// sonst die am wenigsten vergebene (bei Gleichstand die erste in der Liste)
   guestColor(doc, wanted) {
-    const used = new Set();
+    const count = new Map(GUEST_COLORS.map((c) => [c, 0]));
     for (const ws of this.ctx.getWebSockets(`guest:${doc}`)) {
       const c = ws.deserializeAttachment()?.color;
-      if (c) used.add(c);
+      if (count.has(c)) count.set(c, count.get(c) + 1);
     }
     const want = wanted ? "#" + String(wanted).replace(/^#/, "").toLowerCase() : null;
-    if (want && GUEST_COLORS.includes(want) && !used.has(want)) return want;
-    return GUEST_COLORS.find((c) => !used.has(c)) || GUEST_COLORS[used.size % GUEST_COLORS.length];
+    if (want && count.get(want) === 0) return want;
+    let best = GUEST_COLORS[0];
+    for (const c of GUEST_COLORS) if (count.get(c) < count.get(best)) best = c;
+    return best;
   }
 
   broadcast(doc, msg, tag = `doc:${doc}`) {
@@ -418,6 +433,22 @@ export class Store extends DurableObject {
 // Reihenfolge, pdfVersion für das PDF selbst. Beide gehen nie zurück.
 function newerStructure(a, b) {
   return (Number(a.pagesVersion) || 0) > (Number(b.pagesVersion) || 0) || (Number(a.pdfVersion) || 0) > (Number(b.pdfVersion) || 0);
+}
+
+/// Änderungen für Browser in Nachrichten von höchstens etwa 500 KB
+function inParts(changes, send) {
+  let part = [], size = 0;
+  for (const c of changes) {
+    const n = (c.data ? c.data.length : 0) + c.id.length + 40;
+    if (size + n > 500000 && part.length) {
+      send(part);
+      part = [];
+      size = 0;
+    }
+    part.push(c);
+    size += n;
+  }
+  if (part.length) send(part);
 }
 
 /// Übernimmt in `target` die Seitenangaben aus `other`, wo sie neuer sind

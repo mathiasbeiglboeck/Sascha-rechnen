@@ -205,13 +205,17 @@ final class DocumentStore: ObservableObject {
     }
 
     private func finishedWriting(_ id: UUID, number: Int, changed: Bool, pageCount: Int, touch: Bool) {
-        if writing[id]?.number == number { writing[id] = nil }
-        guard changed else { return }
-        inkVersions[id, default: 0] += 1
+        // Die Seitenzahl bestimmt nur das neueste Schreiben: Ein älteres (etwa fremde Striche kurz vor einer
+        // Seitenänderung) brächte sonst die alte Zahl unter die neue Seitenversion zurück
+        let latest = writing[id]?.number == number
+        if latest { writing[id] = nil }
+        if changed { inkVersions[id, default: 0] += 1 }
         guard var doc = documents.first(where: { $0.id == id }) else { return }
-        guard touch || doc.pageCount != pageCount else { return }
-        if touch { doc.modified = Date() }
-        doc.pageCount = pageCount
+        let count = latest ? pageCount : doc.pageCount
+        let touchNow = changed && touch
+        guard touchNow || doc.pageCount != count else { return }
+        if touchNow { doc.modified = Date() }
+        doc.pageCount = count
         save(doc)
     }
 
@@ -224,8 +228,12 @@ final class DocumentStore: ObservableObject {
 
     /// Seiten wurden gelöscht oder eingefügt (bei PDFs auch das PDF selbst geändert): Die anderen Geräte
     /// übernehmen Seitenzahl bzw. PDF, weil diese Version neuer ist als ihre
-    func notePagesChanged(_ id: UUID, pdf: Bool) {
+    /// Neue Seitenversion samt neuer Seitenzahl, beides sofort in den Metadaten: Die Seitenzahl aus dem
+    /// Speichern der Zeichnung käme erst nach dem Schreiben, und ein Abgleich dazwischen schickte die neue
+    /// Version mit der alten Seitenzahl
+    func notePagesChanged(_ id: UUID, pdf: Bool, pageCount: Int) {
         guard var doc = documents.first(where: { $0.id == id }) else { return }
+        doc.pageCount = max(pageCount, 1)
         let now = Int(Date().timeIntervalSince1970 * 1000)
         // Nie rückwärts, auch wenn die Uhr eines Geräts nachgeht
         let version = max(now, (doc.pagesVersion ?? 0) + 1, (doc.pdfVersion ?? 0) + 1)

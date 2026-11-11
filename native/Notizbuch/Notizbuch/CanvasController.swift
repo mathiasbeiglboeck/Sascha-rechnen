@@ -30,6 +30,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private(set) var k: CGFloat = 0
     private var pendingSave: DispatchWorkItem?
     private var dirty = false
+    /// Eingefügte fremde Striche, die noch nicht in der Datei sind. Gespeichert wird dann höchstens einmal pro
+    /// Sekunde statt nach jedem fremden Strich (die ganze Zeichnung zu schreiben kostet bei großen Dokumenten)
+    private var remoteUnsaved = false
+    private var remoteSave: DispatchWorkItem?
     private var settingDrawing = false
     /// Stand nach dem letzten Setzen oder Speichern; ein gleicher Stand wird nicht noch einmal gespeichert
     private var baseline: PKDrawing?
@@ -148,7 +152,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         if detached { reattach() }
         syncTimer?.invalidate()
         syncTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.syncCycle() }
+            MainActor.assumeIsolated { self?.syncTick() }
         }
         syncCycle()
         connectLive()
@@ -166,11 +170,14 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             let top = view.safeAreaInsets.top + 56
             canvas.contentInset = UIEdgeInsets(top: top, left: 0, bottom: view.safeAreaInsets.bottom + 24, right: 0)
             canvas.verticalScrollIndicatorInsets = canvas.contentInset
-            setDrawing(store.loadDrawing(doc).transformed(using: CGAffineTransform(scaleX: newK, y: newK)))
+            // Erst Seiten und Größe der Leinwand, dann die Tinte: PencilKit legt seine Kacheln so gleich für die
+            // endgültige Größe an. Kurz danach noch einmal neu aufbauen: Selten blieb eine Kachel sonst leer.
             k = newK
             relayout()
+            setDrawing(store.loadDrawing(doc).transformed(using: CGAffineTransform(scaleX: newK, y: newK)))
             growIfNeeded()
             canvas.contentOffset = CGPoint(x: 0, y: -top)
+            redrawInkSoon()
             warmUpIDs()
             syncCycle()
         } else {
@@ -250,6 +257,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private var fetchAgain = false
     /// Höchste Änderungsnummer, die der Server per Hinweis gemeldet hat
     private var remoteSeqHint = 0
+    /// Beginn des letzten erfolgreichen Abgleichs: So aktuell ist hier der Stand des Servers
+    private var lastFetch = Date.distantPast
     private var localChanged = true
     private var usingTool = false
     /// Wann der Stift zuletzt abgesetzt wurde. PencilKit übernimmt den fertigen Strich erst kurz
@@ -293,6 +302,13 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         sync.isConfigured && k > 0 && !restructuring && !detached && UIApplication.shared.applicationState == .active
     }
 
+    /// Takt alle 3 Sekunden: holt auch, falls ein Hinweis des Servers verloren ging, und versucht Fehlgeschlagenes
+    /// noch einmal. Lief eben erst ein Abgleich (der holt immer mit), ist diese Runde überflüssig (spart Anfragen)
+    private func syncTick() {
+        if !localChanged, remoteSeqHint <= sync.knownSeq(doc.id), Date().timeIntervalSince(lastFetch) < 2.5 { return }
+        syncCycle()
+    }
+
     /// Gleicht ab: schickt eigene Änderungen und holt fremde. Läuft schon ein Abgleich, folgt gleich danach noch einer.
     private func syncCycle() {
         guard canSync else { return }
@@ -307,13 +323,15 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     }
 
     private func syncLoop() async {
-        // Große Dokumente: Erst wenn alle IDs bekannt sind, sonst hielte das Hashen die App an
-        for _ in 0..<3 {
-            guard let warmup = idWarmup else { break }
-            await warmup.value
-        }
         var again = true
         while again, canSync {
+            // Große Dokumente: erst wenn alle IDs bekannt sind (nach dem Öffnen oder Drehen), sonst hielte
+            // das Hashen die App an
+            for _ in 0..<3 {
+                guard let warmup = idWarmup else { break }
+                await warmup.value
+            }
+            guard canSync else { return }
             fetchAgain = false
             let holding = holdingStrokes
             if holding, Date() > nextHoldRetry {
@@ -328,12 +346,17 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             let snapshot = localChanged && !holding ? strokeSnapshot() : nil
             if snapshot != nil { localChanged = false }
             let hint = remoteSeqHint
+            let started = Date()
             let ok = await sync.syncStrokes(doc.id, snapshot: snapshot)
             guard ok else {
                 // Nächster Versuch mit dem Takt (alle 3 Sekunden), nicht sofort
                 if snapshot != nil { localChanged = true }
                 return
             }
+            // Eine Seitenänderung hat begonnen und das Hochladen in Paketen unterbrochen: Der Rest geht danach
+            // hinaus (auch wenn sie abgebrochen wird)
+            if snapshot != nil, restructuring { localChanged = true }
+            lastFetch = started
             let known = sync.knownSeq(doc.id)
             // Kam während der Anfrage kein neuer Hinweis, ist der alte erledigt (auch nach einem Neustart des Servers)
             if remoteSeqHint == hint { remoteSeqHint = min(remoteSeqHint, known) }
@@ -353,7 +376,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     /// schreibt gerade), zählen schon mit: Sonst hielte der Abgleich sie für hier gelöscht.
     private func strokeSnapshot() -> StrokeSnapshot {
         let start = CACurrentMediaTime()
-        var snapshot = StrokeSnapshot(canvas.drawing.strokes, toPage: toPage)
+        var snapshot = StrokeSnapshot(canvas.drawing.strokes, toPage: toPage, prune: true)
         if !pending.isEmpty {
             snapshot.alsoPresent = Set(pending.added.map { $0.id })
             snapshot.alsoGone = pending.removed
@@ -404,7 +427,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private func persistSyncStateNow() {
         persistWork?.cancel()
         persistWork = nil
-        guard pending.isEmpty, !dirty, k > 0 else { return }
+        guard pending.isEmpty, !dirty, !remoteUnsaved, k > 0 else { return }
         sync.persistState(doc.id)
     }
 
@@ -461,9 +484,16 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             canvas.bringSubviewToFront(pointerOverlay)
             pointerOverlay.add(id: id, author: author, points: points, end: obj["end"] as? Bool ?? false, color: color)
         case "pages":
-            // Ein anderes Gerät hat Seiten gelöscht oder eingefügt. Seine verschobenen Striche erst einfügen,
-            // wenn hier auch die neuen Seiten (und das neue PDF) da sind
-            structureSyncSince = Date()
+            // Ein anderes Gerät hat Seiten gelöscht oder eingefügt: neue Seitenzahl bzw. neues PDF holen. Gilt
+            // dieser Seitenstand hier schon (etwa das Echo der eigenen Seitenänderung), ist nichts zu tun
+            let local = store.documents.first { $0.id == doc.id }
+            if let pages = (obj["pagesVersion"] as? NSNumber)?.intValue, pages <= local?.pagesVersion ?? 0,
+               let pdfVersion = (obj["pdfVersion"] as? NSNumber)?.intValue, pdfVersion <= local?.pdfVersion ?? 0 {
+                return
+            }
+            // Bei PDFs die verschobenen Striche erst einfügen, wenn auch das neue PDF da ist (sonst lägen sie kurz
+            // auf den falschen Seiten). Im Notizbuch passen sie auch vorher.
+            if doc.kind == .pdf { structureSyncSince = Date() }
             let sync = self.sync
             Task { [weak self] in
                 await sync.syncLibrary()
@@ -560,7 +590,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         let start = CACurrentMediaTime()
         let changes = pending
         pending = RemoteChanges()
-        guard let result = StrokeCodec.apply(changes, to: canvas.drawing, scale: k) else { return }
+        guard let result = StrokeCodec.apply(changes, to: canvas.drawing, scale: k, prune: true) else { return }
         setDrawing(result.drawing)
         // Auf einer leeren Leinwand zeigt PencilKit den ersten Strich von außen sonst nicht an
         if result.wasEmpty { redrawInkSoon() }
@@ -568,12 +598,14 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         canvas.undoManager?.removeAllActions()
         fitToRemotePageCount()
         growIfNeeded()
-        // Eigene, noch nicht gespeicherte Änderungen sind in dieser Zeichnung mit drin
-        let touch = dirty
-        dirty = false
-        pendingSave?.cancel()
-        store.saveDrawing(result.drawing, toPage: toPage, for: doc.id, pageCount: pageCount, touch: touch)
-        schedulePersist()
+        // Gespeichert wird gleich, mit allem, was dann auf der Leinwand ist (kommen viele fremde Striche
+        // nacheinander, höchstens einmal pro Sekunde). So lange bleibt der Sync-Stand ungesichert.
+        remoteUnsaved = true
+        if remoteSave == nil {
+            let work = DispatchWorkItem { [weak self] in self?.saveNow() }
+            remoteSave = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
+        }
         onPagesChanged?()
         Log.sync.info("Eingefügt: +\(changes.added.count) −\(changes.removed.count) in \(CanvasController.ms(since: start)) ms")
     }
@@ -582,6 +614,9 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         settingDrawing = true
         canvas.drawing = drawing
         settingDrawing = false
+        // Ist noch etwas ungespeichert (etwa beim Neuzeichnen kurz nach dem Radieren), bleibt der Vergleichsstand
+        // der zuletzt gespeicherte: Das nächste Speichern sieht dann den Unterschied und schreibt
+        guard !dirty else { return }
         baseline = canvas.drawing
         toolUsedSinceSave = false
     }
@@ -928,13 +963,19 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     @objc func saveNow() {
         pendingSave?.cancel()
         pendingSave = nil
-        guard dirty, k > 0 else { return }
-        dirty = false
+        remoteSave?.cancel()
+        remoteSave = nil
+        guard dirty || remoteUnsaved, k > 0 else { return }
+        // Nur eigene Änderungen zählen als Bearbeitung (modified), übernommene fremde nicht
+        let touch = dirty
         let current = canvas.drawing
         // Bloßes Öffnen (PencilKit meldet manchmal verspätet eine „Änderung“) soll nichts speichern:
-        // Ohne Werkzeug seither vergleicht der Hintergrund mit dem letzten Stand
-        let base = toolUsedSinceSave ? nil : baseline
-        store.saveDrawing(current, toPage: toPage, for: doc.id, pageCount: pageCount, touch: true, unlessEqualTo: base)
+        // Ohne Werkzeug seither vergleicht der Hintergrund mit dem letzten Stand. Eingefügte fremde Striche
+        // stehen dagegen sicher noch nicht in der Datei
+        let base = toolUsedSinceSave || remoteUnsaved ? nil : baseline
+        dirty = false
+        remoteUnsaved = false
+        store.saveDrawing(current, toPage: toPage, for: doc.id, pageCount: pageCount, touch: touch, unlessEqualTo: base)
         baseline = current
         toolUsedSinceSave = false
         schedulePersist()
@@ -1131,6 +1172,8 @@ extension CanvasController {
         let y = min(max((layout.frames[i].minY - layout.gap) * s - top, -top), maxY)
         canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: y), animated: false)
         sendView(force: true)
+        // Nach einem großen Sprung blieb selten eine Kachel der Tinte leer; neu aufbauen lassen
+        redrawInkSoon()
     }
 
     /// Seiten, auf denen etwas steht
@@ -1249,6 +1292,15 @@ extension CanvasController {
         Task { [weak self] in
             guard let self else { return }
             await self.fetchRemoteNow()
+            // Eine eingefügte Seite fiele mit allem darauf weg. Steht inzwischen etwas darauf (auch von anderen
+            // Geräten oder Gästen), lieber nicht rückgängig machen
+            let before = self.layout
+            if self.pageDrawing().strokes.contains(where: { undo.inverse(before.page(at: $0.renderBounds.midY)) == nil }) {
+                self.pageUndo = undo
+                self.restructuring = false
+                done("Auf der eingefügten Seite steht inzwischen etwas. Zum Entfernen die Seite löschen.")
+                return
+            }
             if let backup = undo.pdfBackup {
                 let url = self.store.pdfURL(self.doc.id)
                 do {
@@ -1385,10 +1437,13 @@ extension CanvasController {
         redrawInkSoon()
         dirty = false
         pendingSave?.cancel()
+        remoteUnsaved = false
+        remoteSave?.cancel()
+        remoteSave = nil
         store.saveDrawing(drawing, for: doc.id, pageCount: pageCount, touch: true)
         // Neue Seitenversion: Andere Geräte übernehmen Seitenzahl bzw. PDF, auch wenn sie inzwischen selbst
         // etwas gespeichert haben
-        store.notePagesChanged(doc.id, pdf: pdfChanged)
+        store.notePagesChanged(doc.id, pdf: pdfChanged, pageCount: pageCount)
         if pdfChanged {
             // Die verschobenen Striche erst schicken, wenn das neue PDF am Server ist (höchstens 30 s warten)
             sync.notePDFUploadPending(doc.id)

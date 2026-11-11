@@ -95,6 +95,7 @@ const strokes = new Map(); // id -> {data, wire, bbox}
 let order = [];           // ids in Reihenfolge
 const history = [];       // eigene Schritte: {added: [id], erased: [{id, data}]}
 let ws = null, scale = 1;
+let seen = 0;              // höchste Änderungsnummer, die hier schon angekommen ist
 const els = [];           // je Seite {div, bg, ink, rendered}
 
 // ---------- Werkzeugleiste ----------
@@ -680,7 +681,12 @@ function send(msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg))
 function connect() {
   let wanted = null;
   try { wanted = localStorage.getItem(COLOR_KEY); } catch {}
-  const query = isColor(wanted) ? "?c=" + wanted.slice(1) : "";
+  const q = new URLSearchParams();
+  if (isColor(wanted)) q.set("c", wanted.slice(1));
+  // Was seit der Momentaufnahme dazukam, schickt der Server gleich mit (sonst fehlte, was zwischen Laden
+  // und Verbinden geschrieben wurde), ebenso einen Hinweis, falls sich inzwischen die Seiten geändert haben
+  if (doc) { q.set("since", seen); q.set("pv", doc.pagesVersion || 0); q.set("dv", doc.pdfVersion || 0); }
+  const query = q.toString() ? "?" + q : "";
   ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + base + "/ws" + query);
   ws.onopen = () => status("live");
   ws.onclose = (e) => {
@@ -714,6 +720,7 @@ function connect() {
 function applyChanges(list) {
   let y0 = Infinity, y1 = -Infinity;
   for (const c of list) {
+    if (c.seq > seen) seen = c.seq;
     if (c.data) {
       if (strokes.has(c.id)) continue;
       const r = addStroke(c.id, c.data); if (r) { y0 = Math.min(y0, r.y0); y1 = Math.max(y1, r.y1); }
@@ -777,6 +784,7 @@ async function load(isReload) {
     // Was live kam, während geladen wurde: nur, was neuer ist als die Momentaufnahme
     const pending = buffer; buffer = null;
     const since = Number(data.seq) || 0;
+    seen = since;
     applyChanges(since ? pending.filter(c => !(c.seq <= since)) : pending);
   } catch (e) {
     if (nextPdf && nextPdf !== pdf) nextPdf.destroy();
