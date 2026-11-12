@@ -121,6 +121,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(handleHover(_:)))
         canvas.addGestureRecognizer(hover)
+        appHover = hover
 
         let d = Self.eraserRadius * 2
         eraserCursor.frame = CGRect(x: 0, y: 0, width: d, height: d)
@@ -715,29 +716,51 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     /// PencilKits eigene Schwebe-Gesten, solange der Radierer sie abgeschaltet hat
     private var pausedPencilKitHover: [UIGestureRecognizer] = []
+    /// Die eigene Schwebe-Geste der App (Handballen, Radierer-Kreis); sie bleibt immer an
+    private weak var appHover: UIHoverGestureRecognizer?
+    /// Läuft die Pause gerade? Nur für das Protokoll
+    private var hoverPauseActive = false
 
     /// Schaltet PencilKits Schweben (die Vorschau unter dem schwebenden Pencil) beim eigenen Radierer ab und beim
     /// Wechsel zurück wieder an. Lief es über das Radieren hinweg weiter, erschien der erste Strich nach dem
-    /// Doppeltippen zum Stift erst beim Absetzen; erst Wegheben des Pencils räumte das auf. Das Wiedereinschalten
-    /// beginnt ein frisches Schweben, wie nach dem Wegheben. Die Gesten liegen unter der Fläche (die eigene der App
-    /// hängt an der Fläche selbst und bleibt an); fehlen sie, passiert nichts
+    /// Doppeltippen zum Stift erst beim Absetzen; erst Wegheben des Pencils räumte das auf. Beim Radierer bekommt
+    /// PencilKit so vom Pencil gar nichts mit, wie wenn er weg wäre, und das Wiedereinschalten beginnt ein frisches
+    /// Schweben. Fehlen die Gesten (andere PencilKit-Version), passiert nichts; das Protokoll (Kategorie ink) nennt,
+    /// was pausiert wurde
     private func setPencilKitHover(enabled: Bool) {
         if enabled {
             for g in pausedPencilKitHover { g.isEnabled = true }
             pausedPencilKitHover = []
+            hoverPauseActive = false
             return
         }
+        let before = pausedPencilKitHover.count
         // Bei jedem Aufruf nachsehen: PencilKit könnte eine Geste neu anlegen oder wieder einschalten
-        for g in canvas.subviews.flatMap(Self.hoverGestures(in:))
+        let onCanvas = (canvas.gestureRecognizers ?? []).filter { $0 !== appHover && Self.watchesPencil($0) }
+        let pencilKitViews = canvas.subviews.filter { $0 !== pagesView && $0 !== pointerOverlay }
+        for g in onCanvas + pencilKitViews.flatMap({ Self.pencilWatchers(in: $0) })
         where g.isEnabled && !pausedPencilKitHover.contains(where: { $0 === g }) {
             g.isEnabled = false
             pausedPencilKitHover.append(g)
         }
+        guard !hoverPauseActive || pausedPencilKitHover.count != before else { return }
+        hoverPauseActive = true
+        let names = pausedPencilKitHover.map { g in
+            "\(type(of: g))@\(g.view.map { String(describing: type(of: $0)) } ?? "-")"
+        }
+        let list = names.isEmpty ? "keine" : names.joined(separator: ", ")
+        Log.ink.info("Radierer: PencilKit-Gesten pausiert: \(list, privacy: .public)")
     }
 
-    private static func hoverGestures(in view: UIView) -> [UIGestureRecognizer] {
-        let own = (view.gestureRecognizers ?? []).filter { $0 is UIHoverGestureRecognizer }
-        return own + view.subviews.flatMap(hoverGestures(in:))
+    /// PencilKits Schwebe-Gesten und sein Beobachter, der dem Schweben jede Pencil-Berührung meldet (er nimmt selbst
+    /// nie eine an, Abschalten bricht also nichts ab)
+    private static func watchesPencil(_ g: UIGestureRecognizer) -> Bool {
+        g is UIHoverGestureRecognizer || NSStringFromClass(type(of: g)).contains("PencilObserver")
+    }
+
+    private static func pencilWatchers(in view: UIView) -> [UIGestureRecognizer] {
+        let own = (view.gestureRecognizers ?? []).filter { watchesPencil($0) }
+        return own + view.subviews.flatMap { pencilWatchers(in: $0) }
     }
 
     func undo() {
