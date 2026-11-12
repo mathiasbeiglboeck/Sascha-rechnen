@@ -208,12 +208,19 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             guard let self else { return }
             // Nicht mitten in einem Strich, sonst ginge er verloren
             if self.toolBusy { self.redrawInkSoon(); return }
-            let drawing = self.canvas.drawing
-            self.setDrawing(PKDrawing())
-            self.setDrawing(drawing)
+            self.redrawInkNow()
         }
         redrawWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    /// Baut die Tinte sofort neu auf; ein noch ausstehendes Neuzeichnen entfällt damit
+    private func redrawInkNow() {
+        redrawWork?.cancel()
+        redrawWork = nil
+        let drawing = canvas.drawing
+        setDrawing(PKDrawing())
+        setDrawing(drawing)
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -272,6 +279,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     /// ersetzt (fremde Striche einfügen), verliert den gerade geschriebenen Strich.
     private var lastToolEnd = Date.distantPast
     private var toolBusy: Bool { usingTool || Date().timeIntervalSince(lastToolEnd) < 0.5 }
+    /// Wie `lastToolEnd`, aber nur für PencilKits eigene Striche (nicht den Radierer der App)
+    private var lastInkEnd = Date.distantPast
+    /// Ist ein eben geschriebener Strich womöglich noch nicht in der Zeichnung?
+    private var inkSettling: Bool { Date().timeIntervalSince(lastInkEnd) < 0.5 }
     private var pendingWork: DispatchWorkItem?
     private var pending = RemoteChanges()
     /// Seitenzahl, die ein anderes Gerät nach Löschen oder Einfügen gemeldet hat (nur Notizbücher)
@@ -649,6 +660,11 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     // MARK: Werkzeuge
 
     func apply(color: UIColor, width: CGFloat, mode: ToolMode, viewOnly: Bool = false) {
+        // Radierer wird abgewählt: das Neuzeichnen nach dem Radieren jetzt erledigen, solange PencilKit noch nicht
+        // schreiben darf. Eine halbe Sekunde nach dem Radieren schwebt der Pencil nach dem Doppeltippen meist schon
+        // mit PencilKits Vorschau über dem Blatt; Setzen der Zeichnung versteckt dann PencilKits Live-Leinwand, und
+        // der erste Strich erschiene erst beim Absetzen
+        if erasing, mode != .eraser, !usingTool, !inkSettling, redrawWork != nil { redrawInkNow() }
         self.viewOnly = viewOnly
         inkColor = color
         inkWidth = width
@@ -660,8 +676,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     private func applyTool() {
         // Lasso von PencilKit: auswählen, verschieben; Antippen der Auswahl zeigt Ausschneiden, Kopieren,
-        // Duplizieren, Löschen; Antippen einer leeren Stelle zeigt Einsetzen
-        if lasso {
+        // Duplizieren, Löschen; Antippen einer leeren Stelle zeigt Einsetzen. Nicht im Nur-Sehen-Modus: Dort blieben
+        // PencilKits Lasso-Gesten aktiv, und eine Auswahl ließe sich verschieben. Der Stift löscht die Auswahl; mit
+        // „Bearbeiten“ ist das Lasso wieder da
+        if lasso && !viewOnly {
             if !(canvas.tool is PKLassoTool) { canvas.tool = PKLassoTool() }
         } else {
             canvas.tool = PKInkingTool(.pen, color: inkColor, width: inkWidth * max(k, 0.5))
@@ -777,8 +795,9 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             eraserCursor.isHidden = true
             if let start = eraseStart, start.strokes.count != canvas.drawing.strokes.count {
                 canvas.undoManager?.registerUndo(withTarget: self) { $0.replaceDrawingUndoably(with: start) }
-                // PencilKit lässt beim Entfernen manchmal einen feinen Rest des Strichs stehen
-                redrawInkSoon()
+                // PencilKit lässt beim Entfernen manchmal einen feinen Rest des Strichs stehen. Brach der Wechsel zum
+                // Stift die Geste ab (Pencil noch auf dem Glas, also keine Vorschau), gleich neu zeichnen, sonst später
+                if erasing || inkSettling { redrawInkSoon() } else { redrawInkNow() }
             }
             eraseStart = nil
             lastErasePoint = nil
@@ -877,6 +896,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
         usingTool = false
         lastToolEnd = Date()
+        lastInkEnd = lastToolEnd
         unlockScrollingSoon()
         applyPendingWhenIdle()
     }

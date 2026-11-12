@@ -14,7 +14,8 @@ import ObjectiveC
 /// - „Alles auswählen“ fällt immer weg. Bleibt nichts übrig, kommt kein Menü.
 /// - „Leerzeile (oben) einfügen“ fällt anhand von PencilKits eigenen Übersetzungen weg (die Einträge tragen zufällige
 ///   Kennungen), falls PencilKits Schalter dafür (siehe unten) fehlt.
-/// Ändert Apple die Methode oder die Klasse, wird nichts umgeleitet: Dann ist nur das Menü wieder wie früher.
+/// Ändert Apple Klasse, Methode oder Schalter, ist schlimmstenfalls alles wieder wie früher: das Menü und
+/// „Leerzeile einfügen“ samt Geste.
 ///
 /// „Leerzeile einfügen“ ist ganz aus: PencilKits eigener Schalter insertSpaceEnabled steuert den Menüeintrag und eine
 /// Lasso-Geste ohne Menü (vom äußersten Zehntel einer Seite bis ins äußerste Zehntel der anderen gezogen, fügt sie
