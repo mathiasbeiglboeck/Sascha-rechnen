@@ -202,12 +202,21 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     /// PencilKit behält beim Drehen die alten Kacheln der Tinte; nach der Animation neu aufbauen lassen
     private var redrawWork: DispatchWorkItem?
-    private func redrawInkSoon() {
+    /// Wartet das ausstehende Neuzeichnen, bis der Pencil nicht mehr schwebt? Nur nach dem Radieren (handleErase):
+    /// Setzen der Zeichnung unter dem schwebenden Pencil versteckt PencilKits Live-Leinwand, und der nächste Strich
+    /// erschiene erst beim Absetzen. Alle anderen Anlässe (Drehen, Seitensprung, fremde Striche) warten nicht
+    private var redrawWaitsForPencil = false
+    private func redrawInkSoon(waitForPencil: Bool = false) {
+        // Kommen mehrere Anlässe zusammen, wartet das Neuzeichnen nur, wenn alle warten dürfen
+        redrawWaitsForPencil = waitForPencil && (redrawWork == nil || redrawWaitsForPencil)
         redrawWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             // Nicht mitten in einem Strich, sonst ginge er verloren
-            if self.toolBusy { self.redrawInkSoon(); return }
+            if self.toolBusy || (self.redrawWaitsForPencil && self.pencilNear) {
+                self.redrawInkSoon(waitForPencil: self.redrawWaitsForPencil)
+                return
+            }
             self.redrawInkNow()
         }
         redrawWork = work
@@ -218,6 +227,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private func redrawInkNow() {
         redrawWork?.cancel()
         redrawWork = nil
+        redrawWaitsForPencil = false
         let drawing = canvas.drawing
         setDrawing(PKDrawing())
         setDrawing(drawing)
@@ -231,6 +241,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         pointerFlush?.cancel()
+        // Verschwindet die Fläche, während der Pencil schwebt, kommt das Ende des Schwebens vielleicht nie an
+        pencilHovering = false
         applyPending()
         saveNow()
         persistSyncStateNow()
@@ -283,6 +295,13 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private var lastInkEnd = Date.distantPast
     /// Ist ein eben geschriebener Strich womöglich noch nicht in der Zeichnung?
     private var inkSettling: Bool { Date().timeIntervalSince(lastInkEnd) < 0.5 }
+    /// Schwebt der Pencil gerade über der Fläche (eigene Schwebe-Geste der App)?
+    private var pencilHovering = false
+    /// Wann er zuletzt aufgehört hat zu schweben: aufgesetzt, weggehoben oder zur Leiste gewandert
+    private var lastHoverEnd = Date.distantPast
+    /// Schwebt der Pencil, oder schwebte er eben noch? Die kurze Nachfrist deckt den Moment zwischen dem Ende des
+    /// Schwebens und dem Aufsetzen ab, in dem der neue Strich noch nicht gemeldet ist, und PencilKits Aufräumen danach
+    private var pencilNear: Bool { pencilHovering || Date().timeIntervalSince(lastHoverEnd) < 0.25 }
     private var pendingWork: DispatchWorkItem?
     private var pending = RemoteChanges()
     /// Seitenzahl, die ein anderes Gerät nach Löschen oder Einfügen gemeldet hat (nur Notizbücher)
@@ -660,11 +679,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     // MARK: Werkzeuge
 
     func apply(color: UIColor, width: CGFloat, mode: ToolMode, viewOnly: Bool = false) {
-        // Radierer wird abgewählt: das Neuzeichnen nach dem Radieren jetzt erledigen, solange PencilKit noch nicht
-        // schreiben darf. Eine halbe Sekunde nach dem Radieren schwebt der Pencil nach dem Doppeltippen meist schon
-        // mit PencilKits Vorschau über dem Blatt; Setzen der Zeichnung versteckt dann PencilKits Live-Leinwand, und
-        // der erste Strich erschiene erst beim Absetzen
-        if erasing, mode != .eraser, !usingTool, !inkSettling, redrawWork != nil { redrawInkNow() }
+        // Radierer wird abgewählt, während der Pencil weg ist (etwa mit dem Finger über die Leiste): das Neuzeichnen
+        // nach dem Radieren gleich erledigen. Nach dem Doppeltippen schwebt er meist noch; dann wartet es, bis er weg
+        // ist (siehe redrawInkSoon)
+        if erasing, mode != .eraser, !usingTool, !inkSettling, !pencilNear, redrawWork != nil { redrawInkNow() }
         self.viewOnly = viewOnly
         inkColor = color
         inkWidth = width
@@ -692,6 +710,34 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         pointerGesture.isEnabled = pointing && !viewOnly
         if !isPad { canvas.panGestureRecognizer.minimumNumberOfTouches = viewOnly ? 1 : 2 }
         if !erasing { eraserCursor.isHidden = true }
+        setPencilKitHover(enabled: !(erasing && !viewOnly))
+    }
+
+    /// PencilKits eigene Schwebe-Gesten, solange der Radierer sie abgeschaltet hat
+    private var pausedPencilKitHover: [UIGestureRecognizer] = []
+
+    /// Schaltet PencilKits Schweben (die Vorschau unter dem schwebenden Pencil) beim eigenen Radierer ab und beim
+    /// Wechsel zurück wieder an. Lief es über das Radieren hinweg weiter, erschien der erste Strich nach dem
+    /// Doppeltippen zum Stift erst beim Absetzen; erst Wegheben des Pencils räumte das auf. Das Wiedereinschalten
+    /// beginnt ein frisches Schweben, wie nach dem Wegheben. Die Gesten liegen unter der Fläche (die eigene der App
+    /// hängt an der Fläche selbst und bleibt an); fehlen sie, passiert nichts
+    private func setPencilKitHover(enabled: Bool) {
+        if enabled {
+            for g in pausedPencilKitHover { g.isEnabled = true }
+            pausedPencilKitHover = []
+            return
+        }
+        // Bei jedem Aufruf nachsehen: PencilKit könnte eine Geste neu anlegen oder wieder einschalten
+        for g in canvas.subviews.flatMap(Self.hoverGestures(in:))
+        where g.isEnabled && !pausedPencilKitHover.contains(where: { $0 === g }) {
+            g.isEnabled = false
+            pausedPencilKitHover.append(g)
+        }
+    }
+
+    private static func hoverGestures(in view: UIView) -> [UIGestureRecognizer] {
+        let own = (view.gestureRecognizers ?? []).filter { $0 is UIHoverGestureRecognizer }
+        return own + view.subviews.flatMap(hoverGestures(in:))
     }
 
     func undo() {
@@ -795,9 +841,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             eraserCursor.isHidden = true
             if let start = eraseStart, start.strokes.count != canvas.drawing.strokes.count {
                 canvas.undoManager?.registerUndo(withTarget: self) { $0.replaceDrawingUndoably(with: start) }
-                // PencilKit lässt beim Entfernen manchmal einen feinen Rest des Strichs stehen. Brach der Wechsel zum
-                // Stift die Geste ab (Pencil noch auf dem Glas, also keine Vorschau), gleich neu zeichnen, sonst später
-                if erasing || inkSettling { redrawInkSoon() } else { redrawInkNow() }
+                // PencilKit lässt beim Entfernen manchmal einen feinen Rest des Strichs stehen: neu zeichnen, sobald
+                // der Pencil nicht mehr schwebt (siehe redrawInkSoon). Brach der Wechsel zum Stift die Geste ab
+                // (Pencil noch auf dem Glas), gleich
+                if erasing || inkSettling || pencilNear { redrawInkSoon(waitForPencil: true) } else { redrawInkNow() }
             }
             eraseStart = nil
             lastErasePoint = nil
@@ -855,9 +902,12 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     @objc private func handleHover(_ g: UIHoverGestureRecognizer) {
         switch g.state {
         case .began, .changed:
+            pencilHovering = true
             lockScrolling()
             if erasing && eraseStart == nil { moveCursor(to: g.location(in: view)) }
         default:
+            if pencilHovering { lastHoverEnd = Date() }
+            pencilHovering = false
             unlockScrollingSoon()
             if eraseStart == nil { eraserCursor.isHidden = true }
         }
