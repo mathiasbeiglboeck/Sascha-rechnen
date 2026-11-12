@@ -21,7 +21,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     let doc: NoteDocument
     private let store: DocumentStore
     private let sync: SyncEngine
-    let canvas = PKCanvasView()
+    let canvas = InkCanvasView()
     private let pagesView = UIView()
     private(set) var pdf: CGPDFDocument?
     private var pageCount: Int

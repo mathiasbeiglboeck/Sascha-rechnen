@@ -126,12 +126,12 @@ export class Store extends DurableObject {
   // ---------- Dokumente ----------
 
   library() {
-    const strokeSeqs = new Map(
-      this.sql.exec("SELECT doc, MAX(seq) AS s FROM strokes GROUP BY doc").toArray().map((r) => [r.doc, r.s]),
-    );
+    // Höchste Änderungsnummer je Dokument einzeln über den Index (doc, seq): eine gelesene Zeile je Dokument.
+    // Ein GROUP BY über alle Striche las bei jedem Abgleich der Bibliothek (alle 20 s je Gerät) jeden Strich samt
+    // Grabsteinen und erschöpfte so das Tageslimit des Gratis-Tarifs (5 Millionen gelesene Zeilen am Tag).
     return this.sql.exec("SELECT id, meta FROM docs").toArray().map((r) => ({
       ...JSON.parse(r.meta),
-      strokeSeq: strokeSeqs.get(r.id) || 0,
+      strokeSeq: this.sql.exec("SELECT MAX(seq) AS s FROM strokes WHERE doc = ?", r.id).one().s || 0,
       hasPDF: this.sql.exec("SELECT 1 FROM blobmeta WHERE key = ?", `pdf/${r.id}`).toArray().length > 0,
     }));
   }
@@ -192,27 +192,35 @@ export class Store extends DurableObject {
 
   /// Schreibt Striche und meldet sie allen, die das Dokument gerade live offen haben
   applyOps(doc, add, remove) {
+    if (!add.length && !remove.length) return; // Abfrage ohne eigene Änderungen (die häufigste): nichts zu lesen
     const changes = [];
     let last = 0;
     this.ctx.storage.transactionSync(() => {
+      // Änderungsnummern am Stück vergeben und den Zähler nur einmal schreiben: Jede geschriebene Zeile zählt gegen
+      // das Tageslimit des Gratis-Tarifs (100.000 am Tag), und nach einer Seitenänderung kommen Tausende Striche
+      let seq = this.sql.exec("SELECT v FROM counter WHERE k = 'seq'").toArray()[0]?.v || 0;
       for (const s of add) {
         if (!s || typeof s.id !== "string" || typeof s.data !== "string" || s.data.length > 500000) continue;
-        last = this.nextSeq();
+        last = ++seq;
+        // Vorhandene Zeilen ändern statt ersetzen: Ein Ersetzen schreibt jeden Index neu (eine Zeile mehr fürs Limit)
         this.sql.exec(
-          "INSERT OR REPLACE INTO strokes (doc, id, data, alive, seq) VALUES (?, ?, ?, 1, ?)",
+          "INSERT INTO strokes (doc, id, data, alive, seq) VALUES (?, ?, ?, 1, ?) " +
+            "ON CONFLICT(doc, id) DO UPDATE SET data = excluded.data, alive = 1, seq = excluded.seq",
           doc, s.id, s.data, last,
         );
         changes.push({ id: s.id, data: s.data, seq: last });
       }
       for (const id of remove) {
         if (typeof id !== "string") continue;
-        last = this.nextSeq();
+        last = ++seq;
         this.sql.exec(
-          "INSERT OR REPLACE INTO strokes (doc, id, data, alive, seq) VALUES (?, ?, NULL, 0, ?)",
+          "INSERT INTO strokes (doc, id, data, alive, seq) VALUES (?, ?, NULL, 0, ?) " +
+            "ON CONFLICT(doc, id) DO UPDATE SET data = NULL, alive = 0, seq = excluded.seq",
           doc, id, last,
         );
         changes.push({ id, data: null, seq: last });
       }
+      if (last) this.sql.exec("INSERT INTO counter (k, v) VALUES ('seq', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v", last);
     });
     if (!changes.length) return;
     // Apps holen die Striche selbst per Sync: ein kurzer Hinweis genügt. Mit der neuen Änderungsnummer:
@@ -222,22 +230,30 @@ export class Store extends DurableObject {
     inParts(changes, (part) => this.broadcast(doc, { type: "changes", changes: part }, `guest:${doc}`));
   }
 
-  /// Was ein Gast zwischen seiner Momentaufnahme (/data) und dem Verbinden verpasst hat: die Striche seither,
-  /// und ein Hinweis, falls sich inzwischen die Seiten geändert haben. accept() läuft ohne Unterbrechung,
-  /// dazwischen kann also nichts geschrieben werden, was weder hier noch live ankommt.
-  catchUp(ws, doc, params) {
-    const since = Number(params.get("since")) || 0;
-    const rows = this.sql
-      .exec("SELECT id, data, alive, seq FROM strokes WHERE doc = ? AND seq > ? ORDER BY seq", doc, since)
-      .toArray();
-    const changes = rows.map((r) => ({ id: r.id, data: r.alive ? r.data : null, seq: r.seq }));
-    inParts(changes, (part) => ws.send(JSON.stringify({ type: "changes", changes: part })));
+  /// Was ein Gast seit seinem Stand `since` verpasst hat (über den Index, nur die Zeilen danach). Haben sich
+  /// inzwischen die Seiten geändert, nur der Hinweis darauf: Der Gast lädt dann ohnehin alles neu, und nach einer
+  /// Seitenänderung wären es Tausende verschobene Striche, die er erst einzeln einarbeiten und dann verwerfen würde.
+  missed(doc, params) {
     const row = this.sql.exec("SELECT meta FROM docs WHERE id = ?", doc).toArray()[0];
     const meta = row ? JSON.parse(row.meta) : {};
     if ((Number(meta.pagesVersion) || 0) !== (Number(params.get("pv")) || 0) ||
         (Number(meta.pdfVersion) || 0) !== (Number(params.get("dv")) || 0)) {
-      ws.send(JSON.stringify({ type: "pages" }));
+      return { pages: true, changes: [] };
     }
+    const since = Number(params.get("since")) || 0;
+    const changes = this.sql
+      .exec("SELECT id, data, alive, seq FROM strokes WHERE doc = ? AND seq > ? ORDER BY seq", doc, since)
+      .toArray()
+      .map((r) => ({ id: r.id, data: r.alive ? r.data : null, seq: r.seq }));
+    return { pages: false, changes };
+  }
+
+  /// Beim Verbinden: was der Gast seit seiner Momentaufnahme (/data) oder vor einer Unterbrechung verpasst hat.
+  /// accept() läuft ohne Unterbrechung, dazwischen kann also nichts geschrieben werden, was weder hier noch live ankommt.
+  catchUp(ws, doc, params) {
+    const { pages, changes } = this.missed(doc, params);
+    if (pages) ws.send(JSON.stringify({ type: "pages" }));
+    inParts(changes, (part) => ws.send(JSON.stringify({ type: "changes", changes: part })));
   }
 
   // ---------- Live: WebSockets (Hibernation-API) ----------
@@ -343,13 +359,24 @@ export class Store extends DurableObject {
     return token;
   }
 
-  /// Gast-Zugriffe: /s/<token>/data, /s/<token>/pdf, /s/<token>/ws
+  /// Gast-Zugriffe: /s/<token>/data, /s/<token>/pdf, /s/<token>/ws, /s/<token>/changes
   guest(request, token, what) {
     const share = this.sql.exec("SELECT doc FROM shares WHERE token = ?", token || "").toArray()[0];
-    if (!share) return json({ error: "Dieser Link ist nicht (mehr) gültig." }, 404);
+    if (!share) {
+      // Browser verbinden nach einer Unterbrechung nur neu, ohne zu laden: So erfahren sie, dass der Link nicht mehr gilt
+      if (what === "ws" && request.headers.get("upgrade") === "websocket") {
+        const pair = new WebSocketPair();
+        pair[1].accept();
+        pair[1].close(4001, "Teilen beendet");
+        return new Response(null, { status: 101, webSocket: pair[0] });
+      }
+      return json({ error: "Dieser Link ist nicht (mehr) gültig." }, 404);
+    }
     const doc = share.doc;
     if (what === "ws") return this.accept(request, doc, "guest");
     if (what === "pdf") return this.blobResponse(`pdf/${doc}`);
+    // Für Browser, deren Netz keinen WebSocket durchlässt: dasselbe Nachholen wie beim Verbinden, per Abfrage
+    if (what === "changes") return json(this.missed(doc, new URL(request.url).searchParams));
     if (what === "data") {
       const row = this.sql.exec("SELECT meta FROM docs WHERE id = ?", doc).toArray()[0];
       const meta = row ? JSON.parse(row.meta) : { title: "Notizbuch", kind: "notebook", pageCount: 1 };
