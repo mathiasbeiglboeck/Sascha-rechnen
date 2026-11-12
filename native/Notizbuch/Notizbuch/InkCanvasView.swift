@@ -2,17 +2,19 @@ import UIKit
 import PencilKit
 import ObjectiveC
 
-/// Die Schreibfläche, ohne „Leerzeile einfügen“ und ohne ein Menü, das nur „Alles auswählen“ anbietet.
+/// Die Schreibfläche: PencilKits Menü nur im Lasso-Modus, und nie mit „Alles auswählen“ oder „Leerzeile einfügen“.
 ///
 /// PencilKit zeigt ein Menü, wenn man die Fläche lange berührt (am iPad etwa mit dem Finger, der eigentlich
-/// scrollen will) oder mit dem Lasso auf eine leere Stelle tippt. Dieses Menü baut PencilKits innere Fläche
-/// (PKTiledView) selbst, als Delegate ihrer UIEditMenuInteraction; öffentliche Wege (canPerformAction, buildMenu,
-/// ein eigener Delegate) erreichen es nicht. Deshalb wird genau diese eine Methode einmal umgeleitet:
+/// scrollen will) oder mit dem Lasso auf eine leere Stelle oder eine Auswahl tippt. Dieses Menü baut PencilKits
+/// innere Fläche (PKTiledView) selbst, als Delegate ihrer UIEditMenuInteraction; öffentliche Wege (canPerformAction,
+/// buildMenu, ein eigener Delegate) erreichen es nicht. Deshalb wird genau diese eine Methode einmal umgeleitet:
+/// - Außerhalb des Lasso-Modus (Stift, Radierer, Zeigestift, Nur-Sehen) kommt gar kein Menü, auch nicht, wenn
+///   kopierte Striche zum Einsetzen bereitliegen.
+/// - Mit dem Lasso bleiben Ausschneiden, Kopieren, Löschen, Duplizieren und Einsetzen.
+/// - „Alles auswählen“ fällt immer weg. Bleibt nichts übrig, kommt kein Menü.
 /// - „Leerzeile (oben) einfügen“ schaltet PencilKits eigener Schalter insertSpaceEnabled ab; wo es ihn nicht gibt,
 ///   fallen die Einträge anhand von PencilKits eigenen Übersetzungen weg (die Einträge tragen zufällige Kennungen).
 ///   Eine eingefügte Leerzeile verschiebt jeden Strich darunter, beim Abgleich ist das für jeden eine Änderung.
-/// - „Alles auswählen“ fällt nur weg, wenn es allein übrig bliebe: Dann kommt gar kein Menü.
-/// Ausschneiden, Kopieren, Einsetzen, Duplizieren und Löschen bleiben.
 /// Ändert Apple die Methode oder die Klasse, wird nichts umgeleitet: Dann ist nur das Menü wieder wie früher.
 final class InkCanvasView: PKCanvasView {
     override init(frame: CGRect) {
@@ -41,22 +43,29 @@ final class InkCanvasView: PKCanvasView {
               (2...4).allSatisfy({ typeIs(method_copyArgumentType(method, UInt32($0)), "@") })
         else { return debugLog("Methode fehlt oder hat eine andere Form") }
 
-        typealias Original = @convention(c) (AnyObject, Selector, AnyObject, AnyObject, NSArray) -> UIMenu?
+        // Die Argumente sind optional getippt: UIKit übergibt nie nil, ein nil in einem nicht-optionalen Typ wäre aber
+        // in Swift undefiniert
+        typealias Original = @convention(c) (AnyObject, Selector, AnyObject?, AnyObject?, NSArray?) -> UIMenu?
         let originalIMP = method_getImplementation(method)
         let original = unsafeBitCast(originalIMP, to: Original.self)
+        let getter = NSSelectorFromString("insertSpaceEnabled")
         let setter = NSSelectorFromString("setInsertSpaceEnabled:")
-        let replacement: @convention(block) (AnyObject, AnyObject, AnyObject, NSArray) -> UIMenu? = { me, interaction, configuration, suggested in
-            // PencilKits eigener Schalter für „Leerzeile einfügen“
-            if me.responds(to: setter), (me.value(forKey: "insertSpaceEnabled") as? Bool) == true {
+        let replacement: @convention(block) (AnyObject, AnyObject?, AnyObject?, NSArray?) -> UIMenu? = { me, interaction, configuration, suggested in
+            // PencilKits eigener Schalter für „Leerzeile einfügen“; ohne Getter würde value(forKey:) abstürzen
+            if me.responds(to: getter), me.responds(to: setter), (me.value(forKey: "insertSpaceEnabled") as? Bool) == true {
                 me.setValue(false, forKey: "insertSpaceEnabled")
             }
             #if DEBUG
-            NSLog("InkCanvasView: Menü für %@ über %@", String(describing: type(of: me)), String(describing: type(of: interaction)))
+            NSLog("InkCanvasView: Menü für %@ über %@", "\(type(of: me))", interaction.map { "\(type(of: $0))" } ?? "nil")
             #endif
-            guard let menu = original(me, sel, interaction, configuration, suggested) else {
+            // PencilKit baut sein Menü immer, auch wenn es danach nicht erscheint, damit sein Zustand wie sonst ist
+            let result = original(me, sel, interaction, configuration, suggested)
+            // Außerhalb des Lasso-Modus gehört ein langer Finger zum Scrollen: kein Menü
+            guard lassoIsActive(around: me) else { return UIMenu(children: []) }
+            guard let menu = result else {
                 // Ohne Menü von PencilKit zeigt UIKit die vorgeschlagenen Einträge: dieselben Regeln für diese
                 debugLog("PencilKit gab kein Menü zurück")
-                guard let kept = filtered(suggested as? [UIMenuElement] ?? []) else { return nil }
+                guard let kept = filtered((suggested as? [UIMenuElement]) ?? []) else { return nil }
                 return UIMenu(children: kept)
             }
             guard let kept = filtered(menu.children) else { return menu }
@@ -72,40 +81,49 @@ final class InkCanvasView: PKCanvasView {
         return String(cString: type) == expected
     }
 
-    /// Die Einträge ohne „Leerzeile einfügen“, und leer, wenn nur „Alles auswählen“ bliebe; nil, wenn nichts wegfällt
-    private static func filtered(_ elements: [UIMenuElement]) -> [UIMenuElement]? {
-        var kept = withoutInsertSpace(elements)
-        if kept.count == 1, isSelectAll(kept[0]) { kept = [] }
-        return kept.count == elements.count && zip(kept, elements).allSatisfy({ $0 === $1 }) ? nil : kept
+    /// Steht die Fläche, zu der PencilKits innere Ansicht gehört, im Lasso-Modus, und darf man darauf schreiben?
+    /// Findet sich keine Fläche, wird nur gefiltert, wie im Lasso-Modus.
+    private static func lassoIsActive(around tiledView: AnyObject) -> Bool {
+        var view = (tiledView as? UIView)?.superview
+        while let current = view, !(current is PKCanvasView) { view = current.superview }
+        guard let canvas = view as? PKCanvasView else { return true }
+        return canvas.tool is PKLassoTool && canvas.drawingGestureRecognizer.isEnabled
     }
 
-    /// Entfernt jedes „Leerzeile (oben) einfügen“, auch in Untermenüs; leer gewordene Untermenüs fallen weg
-    private static func withoutInsertSpace(_ elements: [UIMenuElement]) -> [UIMenuElement] {
-        elements.compactMap { element in
+    /// Die Einträge ohne „Alles auswählen“ und „Leerzeile (oben) einfügen“, auch in Untermenüs; leer gewordene
+    /// Untermenüs fallen weg. nil, wenn nichts wegfällt
+    private static func filtered(_ elements: [UIMenuElement]) -> [UIMenuElement]? {
+        var changed = false
+        let kept = elements.compactMap { element -> UIMenuElement? in
             if let menu = element as? UIMenu {
-                let kids = withoutInsertSpace(menu.children)
-                if kids.count == menu.children.count { return menu }
-                return kids.isEmpty ? nil : menu.replacingChildren(kids)
+                guard let children = filtered(menu.children) else { return menu }
+                changed = true
+                return children.isEmpty ? nil : menu.replacingChildren(children)
             }
-            if let action = element as? UIAction, insertSpaceTitles.contains(action.title) { return nil }
-            if let command = element as? UICommand,
-               NSStringFromSelector(command.action).lowercased().contains("insertspace") { return nil }
+            if isHidden(element) {
+                changed = true
+                return nil
+            }
             return element
         }
+        return changed ? kept : nil
     }
 
-    private static func isSelectAll(_ element: UIMenuElement) -> Bool {
-        if let action = element as? UIAction { return action.title == selectAllTitle }
-        if let command = element as? UICommand { return command.action == #selector(UIResponderStandardEditActions.selectAll(_:)) }
+    /// PencilKits Einträge sind UIActions mit zufälliger Kennung, daher zählt ihr Titel; Befehle zählen am Selektor
+    private static func isHidden(_ element: UIMenuElement) -> Bool {
+        if let action = element as? UIAction { return hiddenTitles.contains(action.title) }
+        if let command = element as? UICommand {
+            return command.action == #selector(UIResponderStandardEditActions.selectAll(_:))
+                || NSStringFromSelector(command.action).lowercased().contains("insertspace")
+        }
         return false
     }
 
-    /// Die Titel so, wie PencilKit sie selbst übersetzt (Schlüssel aus PencilKit.framework/…/Localizable.strings)
-    private static func pencilKitTitle(_ key: String) -> String {
-        Bundle(for: PKCanvasView.self).localizedString(forKey: key, value: key, table: "Localizable")
-    }
-    private static let selectAllTitle = pencilKitTitle("Select All")
-    private static let insertSpaceTitles: Set<String> = [pencilKitTitle("Insert Space"), pencilKitTitle("Insert Space Above")]
+    /// „Alles auswählen“, „Leerzeile einfügen“ und „Leerzeile oben einfügen“, so wie PencilKit sie selbst übersetzt
+    /// (Schlüssel aus PencilKit.framework/…/Localizable.strings)
+    private static let hiddenTitles: Set<String> = Set(["Select All", "Insert Space", "Insert Space Above"].map {
+        Bundle(for: PKCanvasView.self).localizedString(forKey: $0, value: $0, table: "Localizable")
+    })
 
     private static func debugLog(_ text: String) {
         #if DEBUG
