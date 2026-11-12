@@ -668,6 +668,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         }
         // Nur-Sehen-Modus (am iPhone Standard): nichts zeichnet, ein Finger scrollt
         canvas.drawingGestureRecognizer.isEnabled = !erasing && !pointing && !viewOnly
+        // PencilKits Lasso-Menü (Ausschneiden, Kopieren, Einsetzen …) nur, wenn man bearbeiten darf; siehe InkCanvasView
+        canvas.editingAllowed = !viewOnly
         eraserGesture.isEnabled = erasing && !viewOnly
         pointerGesture.isEnabled = pointing && !viewOnly
         if !isPad { canvas.panGestureRecognizer.minimumNumberOfTouches = viewOnly ? 1 : 2 }
