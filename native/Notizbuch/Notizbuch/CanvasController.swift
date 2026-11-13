@@ -269,9 +269,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     func leave() {
         left = true
         detach()
-        // Werkzeug und Gästezahl gehören jetzt dem nächsten Tab: Eine späte Antwort (etwa Teilen, das noch auf den
-        // Server wartet) darf dort nicht „Live-Teilen beenden“ anbieten, das dann jenes Dokument träfe
-        onGuests = { _ in }
+        // Die Seitenübersicht gehört jetzt zum nächsten Tab (ihr Rückruf hielte sonst diese Leinwand fest)
         onPagesChanged = nil
     }
 
@@ -1238,6 +1236,8 @@ extension CanvasController {
         let title = doc.title.replacingOccurrences(of: "/", with: "-")
         let pages = layout.frames.count
         if case .documentPDF = kind, pages > 10 { onFlashTimed("PDF mit \(pages) Seiten wird erstellt …", 30) }
+        // Hinweise auch, wenn diese Leinwand inzwischen zu ist (Tab gewechselt): Sie erscheinen dann im sichtbaren Tab
+        let flash = onFlashTimed
         Task { [weak self] in
             do {
                 let url = try await PageExport.run { () -> URL in
@@ -1257,14 +1257,14 @@ extension CanvasController {
                         return url
                     }
                 }
+                flash("", 0)
                 guard let self else { return }
-                self.onFlashTimed("", 0)
                 let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
                 sheet.popoverPresentationController?.sourceView = self.view
                 sheet.popoverPresentationController?.sourceRect = sourceRect
                 self.present(sheet, animated: true)
             } catch {
-                self?.onFlashTimed("Export fehlgeschlagen: \(error.localizedDescription)", 3)
+                flash("Export fehlgeschlagen: \(error.localizedDescription)", 3)
             }
         }
     }
@@ -1285,7 +1285,9 @@ extension CanvasController {
         let export = exporter
         onFlashTimed("Wird gesendet …", 60)
         let sync = self.sync
-        Task { [weak self] in
+        // Das Ergebnis auch melden, wenn diese Leinwand inzwischen zu ist (Tab gewechselt)
+        let flash = onFlashTimed
+        Task {
             do {
                 let pdf = try await PageExport.run { () -> Data in
                     let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".pdf")
@@ -1294,9 +1296,9 @@ extension CanvasController {
                     return try Data(contentsOf: url)
                 }
                 try await sync.sendToOutbox(to: recipient, name: name, data: pdf, type: "application/pdf")
-                self?.onFlashTimed(cut ? "Seiten 1–\(count) liegen bereit für \(who)" : "Ganzes Dokument liegt bereit für \(who)", 2.5)
+                flash(cut ? "Seiten 1–\(count) liegen bereit für \(who)" : "Ganzes Dokument liegt bereit für \(who)", 2.5)
             } catch {
-                self?.onFlashTimed("Senden fehlgeschlagen: \(error.localizedDescription)", 3)
+                flash("Senden fehlgeschlagen: \(error.localizedDescription)", 3)
             }
         }
     }
@@ -1311,7 +1313,9 @@ extension CanvasController {
         let export = exporter
         onFlashTimed("Wird gesendet …", 30)
         let sync = self.sync
-        Task { [weak self] in
+        // Das Ergebnis auch melden, wenn diese Leinwand inzwischen zu ist (Tab gewechselt)
+        let flash = onFlashTimed
+        Task {
             do {
                 let (pdf, png) = try await PageExport.run { () -> (Data, Data) in
                     let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".pdf")
@@ -1321,9 +1325,9 @@ extension CanvasController {
                 }
                 try await sync.sendToOutbox(to: recipient, name: base + ".pdf", data: pdf, type: "application/pdf")
                 try await sync.sendToOutbox(to: recipient, name: base + ".png", data: png, type: "image/png")
-                self?.onFlashTimed("Seite \(i + 1) liegt bereit für \(recipient == "claude" ? "Claude" : "ChatGPT")", 2.5)
+                flash("Seite \(i + 1) liegt bereit für \(recipient == "claude" ? "Claude" : "ChatGPT")", 2.5)
             } catch {
-                self?.onFlashTimed("Senden fehlgeschlagen: \(error.localizedDescription)", 3)
+                flash("Senden fehlgeschlagen: \(error.localizedDescription)", 3)
             }
         }
     }

@@ -57,7 +57,7 @@ final class TabsModel: ObservableObject {
     init(store: DocumentStore) {
         self.store = store
         let defaults = UserDefaults.standard
-        // Erst alles lesen, dann setzen (jedes Setzen schreibt den ganzen Stand zurück)
+        // Erst alles lesen, dann setzen: Schon das Setzen von `active` schreibt den Stand zurück
         let saved = (defaults.stringArray(forKey: "tabs") ?? []).compactMap(UUID.init(uuidString:))
         let savedActive = defaults.string(forKey: "activeTab").flatMap(UUID.init(uuidString:))
         let places = defaults.dictionary(forKey: "tabPlaces") as? [String: [Double]] ?? [:]
@@ -74,6 +74,8 @@ final class TabsModel: ObservableObject {
         }
         prune(store.documents)
         if let current = active, !ids.contains(current) { active = ids.last }
+        // Den ganzen wiederhergestellten Stand sichern (Zuweisungen hier im init schreiben nicht alle zurück)
+        persist()
         // Gelöschte Dokumente (hier oder auf einem anderen Gerät) verschwinden auch aus den Tabs
         watch = store.$documents.sink { [weak self] docs in
             MainActor.assumeIsolated { self?.prune(docs) }
@@ -163,7 +165,8 @@ final class TabsModel: ObservableObject {
             if let target = next.flatMap({ self.ids.contains($0) ? $0 : nil }) ?? self.ids.last {
                 self.show(target)
             } else {
-                self.active = nil
+                // Der letzte Tab: zurück zur Übersicht. `active` bleibt stehen, damit die Seite sichtbar bleibt,
+                // während der Editor wegfährt; ohne Tabs zählt es nicht (Öffnen setzt es neu)
                 self.editorShown = false
             }
         }

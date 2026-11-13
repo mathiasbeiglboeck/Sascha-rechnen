@@ -159,7 +159,12 @@ struct CanvasRepresentable: UIViewControllerRepresentable {
         let controller = CanvasController(doc: doc, store: store, sync: sync, start: start, topExtra: topExtra)
         controller.onFlash = { [weak tools] in tools?.show($0) }
         controller.onFlashTimed = { [weak tools] in tools?.show($0, seconds: $1) }
-        controller.onGuests = { [weak tools] in tools?.guests = $0 }
+        // Gästezahl nur für das Dokument, das gerade zu sehen ist: Eine späte Antwort einer schon verlassenen Leinwand
+        // (Teilen wartet noch auf den Server) gilt so wieder, wenn ihr Dokument vorne ist, aber nie für einen anderen Tab
+        let id = doc.id
+        controller.onGuests = { [weak tools] guests in
+            if tools?.canvas?.doc.id == id { tools?.guests = guests }
+        }
         controller.onToggleMenus = { [weak tools] in tools?.menusHidden.toggle() }
         controller.onToggleEraser = { [weak tools] in tools?.toggleEraser() }
         tools.canvas = controller
