@@ -52,6 +52,14 @@ final class ToolState: ObservableObject {
         }
     }
 
+    /// Ein anderes Dokument kommt auf die Leinwand (Tab-Wechsel, Öffnen): Was zum vorigen gehörte, fällt weg.
+    /// Werkzeug, Farbe und Dicke bleiben; am iPhone beginnt jedes Dokument wieder im Nur-Sehen-Modus
+    func prepareForDocument() {
+        overviewShown = false
+        guests = nil
+        if UIDevice.current.userInterfaceIdiom == .phone { viewOnly = true }
+    }
+
     func toggleEraser() {
         mode = mode == .eraser ? .pen : .eraser
         guard menusHidden else { return }
@@ -65,12 +73,20 @@ final class ToolState: ObservableObject {
     }
 }
 
+/// Der Editor mit den offenen Dokumenten als Tabs; sichtbar ist immer eines davon
 struct EditorView: View {
-    let doc: NoteDocument
+    @ObservedObject var tabs: TabsModel
+    @ObservedObject var tools: ToolState
     @EnvironmentObject private var store: DocumentStore
     @EnvironmentObject private var sync: SyncEngine
-    @Environment(\.dismiss) private var dismiss
-    @StateObject private var tools = ToolState()
+
+    /// Höhe der Tab-Zeile samt Abstand zur Leiste
+    static let tabRowHeight: CGFloat = 32
+
+    private var collapsed: Bool { UIDevice.current.userInterfaceIdiom == .pad && tools.menuCollapsed }
+    /// Tabs stehen über der Leiste, wenn sie eingeblendet und ausgeklappt ist; auch ein einzelner, damit sich jeder
+    /// Tab mit seinem Kreuz schließen lässt (der letzte führt zurück zur Übersicht)
+    private var tabsShown: Bool { !tools.menusHidden && !collapsed && !tabs.ids.isEmpty }
 
     var body: some View {
         // Leiste als Overlay: Wird sie breiter, darf das nie die Größe der Leinwand ändern
@@ -78,10 +94,16 @@ struct EditorView: View {
             .overlay(alignment: .top) {
                 ZStack(alignment: .top) {
                     if !tools.menusHidden {
-                        ToolBar(tools: tools, onClose: { dismiss() })
-                            .padding(.top, 6)
-                            .padding(.horizontal, 12)
-                            .transition(.move(edge: .top).combined(with: .opacity))
+                        VStack(spacing: 6) {
+                            if tabsShown {
+                                TabStrip(tabs: tabs)
+                                    .transition(.opacity)
+                            }
+                            ToolBar(tools: tools, onClose: { tabs.closeEditor() })
+                                .padding(.horizontal, 12)
+                        }
+                        .padding(.top, 6)
+                        .transition(.move(edge: .top).combined(with: .opacity))
                     }
 
                     if let flash = tools.flash {
@@ -89,14 +111,21 @@ struct EditorView: View {
                             .font(.callout.weight(.medium))
                             .padding(.horizontal, 14).padding(.vertical, 7)
                             .background(.ultraThinMaterial, in: Capsule())
-                            .padding(.top, tools.menusHidden ? 10 : 64)
+                            .padding(.top, tools.menusHidden ? 10 : 64 + (tabsShown ? Self.tabRowHeight : 0))
                             .transition(.opacity)
                     }
                 }
             }
             .background {
-                CanvasRepresentable(doc: doc, store: store, sync: sync, tools: tools)
-                    .ignoresSafeArea()
+                // Je Tab und Wechsel eine eigene Leinwand: Die vorige ist da schon geschlossen (TabsModel). Platz für
+                // die Tab-Zeile hat sie immer, auch bei eingeklappter Leiste: Die Zeile kommt und geht ohne neue
+                // Leinwand (Ausklappen, Menüs ein), ihr Rand oben gilt aber ab dem Öffnen
+                if let doc = tabs.activeDocument {
+                    CanvasRepresentable(doc: doc, store: store, sync: sync, tools: tools,
+                                        start: tabs.viewport(for: doc.id), topExtra: Self.tabRowHeight)
+                        .id("\(doc.id.uuidString)-\(tabs.generation)")
+                        .ignoresSafeArea()
+                }
             }
         // Die Übersicht liegt über der Leinwand statt in einem eigenen Vollbild: So bleibt die Leinwand offen,
         // gleicht weiter ab und bekommt fremde Striche direkt (ein Vollbild würde sie wie beim Schließen abmelden)
@@ -112,6 +141,7 @@ struct EditorView: View {
         .animation(.easeOut(duration: 0.2), value: tools.menusHidden)
         .animation(.easeOut(duration: 0.2), value: tools.menuCollapsed)
         .animation(.easeOut(duration: 0.2), value: tools.flash)
+        .animation(.easeOut(duration: 0.2), value: tabsShown)
     }
 }
 
@@ -120,12 +150,21 @@ struct CanvasRepresentable: UIViewControllerRepresentable {
     let store: DocumentStore
     let sync: SyncEngine
     @ObservedObject var tools: ToolState
+    /// Wo die Leinwand öffnet (zurück in einem Tab); nil = oben
+    var start: Viewport? = nil
+    /// Platz für die Tabs über der Leiste
+    var topExtra: CGFloat = 0
 
     func makeUIViewController(context: Context) -> CanvasController {
-        let controller = CanvasController(doc: doc, store: store, sync: sync)
+        let controller = CanvasController(doc: doc, store: store, sync: sync, start: start, topExtra: topExtra)
         controller.onFlash = { [weak tools] in tools?.show($0) }
         controller.onFlashTimed = { [weak tools] in tools?.show($0, seconds: $1) }
-        controller.onGuests = { [weak tools] in tools?.guests = $0 }
+        // Gästezahl nur für das Dokument, das gerade zu sehen ist: Eine späte Antwort einer schon verlassenen Leinwand
+        // (Teilen wartet noch auf den Server) gilt so wieder, wenn ihr Dokument vorne ist, aber nie für einen anderen Tab
+        let id = doc.id
+        controller.onGuests = { [weak tools] guests in
+            if tools?.canvas?.doc.id == id { tools?.guests = guests }
+        }
         controller.onToggleMenus = { [weak tools] in tools?.menusHidden.toggle() }
         controller.onToggleEraser = { [weak tools] in tools?.toggleEraser() }
         tools.canvas = controller
@@ -137,6 +176,12 @@ struct CanvasRepresentable: UIViewControllerRepresentable {
                          width: ToolState.widths[tools.widthIndex],
                          mode: tools.mode,
                          viewOnly: tools.viewOnly)
+    }
+
+    /// Die Leinwand verschwindet (Tab-Wechsel, Editor zu): spätestens jetzt speichern und abmelden. Meist ist das
+    /// schon geschehen (TabsModel schließt sie vor dem Wechsel), dann ändert es nichts
+    static func dismantleUIViewController(_ controller: CanvasController, coordinator: ()) {
+        controller.leave()
     }
 }
 

@@ -5,9 +5,10 @@ import UniformTypeIdentifiers
 struct LibraryView: View {
     @EnvironmentObject private var store: DocumentStore
     @EnvironmentObject private var sync: SyncEngine
+    /// Offene Dokumente: Antippen öffnet in einem neuen Tab
+    @EnvironmentObject private var tabs: TabsModel
     @Environment(\.scenePhase) private var scenePhase
     @State private var showSettings = false
-    @State private var openDoc: NoteDocument?
     @State private var importing = false
     @State private var renaming: NoteDocument?
     @State private var newTitle = ""
@@ -48,7 +49,7 @@ struct LibraryView: View {
                     }
                     ForEach(visibleDocs) { doc in
                         DocCard(doc: doc)
-                            .onTapGesture { openDoc = doc }
+                            .onTapGesture { tabs.open(doc) }
                             .draggable(doc.id.uuidString)
                             .contextMenu {
                                 Button {
@@ -76,7 +77,7 @@ struct LibraryView: View {
             // (sonst erfährt das andere Gerät erst nach dem Schließen von einem neuen Dokument)
             .task {
                 while !Task.isCancelled {
-                    for id in store.purgeTemp(keeping: openDoc?.id) { sync.noteDeleted(id) }
+                    for id in store.purgeTemp(keeping: Set(tabs.ids)) { sync.noteDeleted(id) }
                     await sync.syncLibrary()
                     try? await Task.sleep(for: .seconds(20))
                 }
@@ -88,6 +89,22 @@ struct LibraryView: View {
                 SyncSettingsView().environmentObject(sync)
             }
             .background(Color(red: 0.95, green: 0.95, blue: 0.93))
+            // Zurück zu den offenen Tabs, ohne ein weiteres Dokument zu öffnen
+            .safeAreaInset(edge: .bottom) {
+                if !tabs.ids.isEmpty {
+                    Button { tabs.showEditor() } label: {
+                        Label(openTabsLabel, systemImage: "square.on.square")
+                            .font(.subheadline.weight(.medium))
+                            .lineLimit(1)
+                            .padding(.horizontal, 16).padding(.vertical, 10)
+                            .background(.regularMaterial, in: Capsule())
+                            .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+                    }
+                    .tint(.primary)
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 8)
+                }
+            }
             .overlay {
                 if visibleDocs.isEmpty && (currentFolder != nil || folders.isEmpty) {
                     ContentUnavailableView(currentFolder == nil ? "Noch leer" : "Ordner ist leer", systemImage: "square.and.pencil",
@@ -115,14 +132,15 @@ struct LibraryView: View {
                     }
                     Button { importing = true } label: { Label("PDF importieren", systemImage: "doc.badge.plus") }
                     Button {
-                        openDoc = store.createNotebook(inFolder: currentFolder)
+                        tabs.open(store.createNotebook(inFolder: currentFolder))
                         Task { await sync.syncLibrary() }
                     } label: { Label("Neues Notizbuch", systemImage: "square.and.pencil") }
                 }
             }
             .fileImporter(isPresented: $importing, allowedContentTypes: [.pdf]) { result in
                 do {
-                    openDoc = try store.importPDF(from: result.get(), inFolder: currentFolder)
+                    let doc = try store.importPDF(from: result.get(), inFolder: currentFolder)
+                    tabs.open(doc)
                     Task { await sync.syncLibrary() }
                 } catch {
                     importError = error.localizedDescription
@@ -140,15 +158,15 @@ struct LibraryView: View {
                 }
                 guard url.pathExtension.lowercased() == "pdf" else { return }
                 do {
+                    // In einem neuen Tab, auch wenn gerade ein Dokument offen ist
                     let doc = try store.importPDF(from: url)
-                    openDoc = nil
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { openDoc = doc }
+                    tabs.open(doc)
                 } catch {
                     importError = error.localizedDescription
                 }
             }
-            .fullScreenCover(item: $openDoc, onDismiss: { store.reload() }) { doc in
-                EditorView(doc: doc).environmentObject(store).environmentObject(sync)
+            .fullScreenCover(isPresented: $tabs.editorShown, onDismiss: { store.reload() }) {
+                EditorView(tabs: tabs, tools: tabs.tools).environmentObject(store).environmentObject(sync)
             }
             .alert("Umbenennen", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
                 TextField("Titel", text: $newTitle)
@@ -254,6 +272,12 @@ extension LibraryView {
         for doc in store.documents where doc.folder == name { store.move(doc, to: nil) }
         emptyFoldersRaw = emptyFolders.filter { $0 != name }.joined(separator: "\n")
         Task { await sync.syncLibrary() }
+    }
+
+    /// Ein offenes Dokument: sein Titel; mehrere: wie viele
+    private var openTabsLabel: String {
+        if tabs.ids.count == 1, let id = tabs.ids.first { return "Zurück zu „\(tabs.title(for: id))“" }
+        return "Zurück zu \(tabs.ids.count) Tabs"
     }
 
     private var syncLine: String {

@@ -64,10 +64,17 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     private var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
 
-    init(doc: NoteDocument, store: DocumentStore, sync: SyncEngine) {
+    /// Wo die Leinwand öffnet: zurück in einem Tab dort, wo er zuletzt stand (nil = oben)
+    private let start: Viewport?
+    /// Zusätzlicher Rand oben für die Tab-Zeile über der Leiste
+    private let topExtra: CGFloat
+
+    init(doc: NoteDocument, store: DocumentStore, sync: SyncEngine, start: Viewport? = nil, topExtra: CGFloat = 0) {
         self.doc = doc
         self.store = store
         self.sync = sync
+        self.start = start
+        self.topExtra = topExtra
         pageCount = max(doc.pageCount, 1)
         super.init(nibName: nil, bundle: nil)
     }
@@ -150,6 +157,14 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        // Verlassener Tab: meldet sich nicht wieder an, die nächste Leinwand ist schon offen
+        guard !left else { return }
+        if !appeared {
+            appeared = true
+            // Rückgängig gilt nur für diese Leinwand. Das Fenster teilt einen Stapel für alle: Schritte einer früheren
+            // Leinwand (anderer Tab, geschlossenes Dokument) würden sonst auf deren nicht mehr sichtbare Zeichnung wirken
+            canvas.undoManager?.removeAllActions()
+        }
         if detached { reattach() }
         syncTimer?.invalidate()
         syncTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
@@ -167,18 +182,23 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         guard abs(newK - k) > 0.0001 else { return }
 
         if k == 0 {
-            // Erstes Layout: Ränder einmalig festlegen und Zeichnung laden
-            let top = view.safeAreaInsets.top + 56
+            // Erstes Layout: Ränder einmalig festlegen und Zeichnung laden (stehen Tabs über der Leiste, oben mehr Platz)
+            let top = view.safeAreaInsets.top + 56 + topExtra
             canvas.contentInset = UIEdgeInsets(top: top, left: 0, bottom: view.safeAreaInsets.bottom + 24, right: 0)
             canvas.verticalScrollIndicatorInsets = canvas.contentInset
             // Erst Seiten und Größe der Leinwand, dann die Tinte: PencilKit legt seine Kacheln so gleich für die
             // endgültige Größe an. Kurz danach noch einmal neu aufbauen: Selten blieb eine Kachel sonst leer.
             k = newK
             relayout()
+            // Zurück in einem Tab: Zoom wie zuletzt, auch das vor der Tinte
+            if let zoom = start?.zoom, abs(zoom - 1) > 0.001 {
+                canvas.zoomScale = min(max(zoom, canvas.minimumZoomScale), canvas.maximumZoomScale)
+                updateContentSize()
+            }
             setDrawing(store.loadDrawing(doc).transformed(using: CGAffineTransform(scaleX: newK, y: newK)))
             growIfNeeded()
             adoptRemotePageTarget()
-            canvas.contentOffset = CGPoint(x: 0, y: -top)
+            canvas.contentOffset = startOffset(top: top)
             redrawInkSoon()
             warmUpIDs()
             syncCycle()
@@ -236,6 +256,46 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        detach()
+    }
+
+    /// Endgültig verlassen (Tab-Wechsel oder Editor zu): Erscheint die Ansicht doch noch einmal, bleibt sie abgemeldet
+    private var left = false
+    /// Schon einmal erschienen (danach nur noch nach dem Verschwinden, etwa unter einem Vollbild)
+    private var appeared = false
+
+    /// Der Tab wechselt oder schließt: wie das Verschwinden der Ansicht (speichern, abgleichen, abmelden), aber sofort,
+    /// bevor die nächste Leinwand öffnet. Ihr späteres Verschwinden ändert dann nichts mehr
+    func leave() {
+        left = true
+        detach()
+        // Die Seitenübersicht gehört jetzt zum nächsten Tab (ihr Rückruf hielte sonst diese Leinwand fest)
+        onPagesChanged = nil
+    }
+
+    /// Ist ein Strich unterwegs oder eben abgesetzt (PencilKit übernimmt ihn erst kurz danach in die Zeichnung)?
+    /// Dann wartet ein Tab-Wechsel, sonst ginge der Strich verloren
+    var isSettling: Bool { toolBusy }
+
+    /// Sichtbare Stelle in Seitenpunkten (linker oberer Rand unter der Leiste) und Zoom; dort öffnet der Tab wieder
+    var viewport: Viewport? {
+        guard k > 0 else { return nil }
+        let s = k * canvas.zoomScale
+        return Viewport(x: canvas.contentOffset.x / s, y: (canvas.contentOffset.y + canvas.contentInset.top) / s,
+                        zoom: canvas.zoomScale)
+    }
+
+    /// Wo die Leinwand beim Öffnen steht: oben, oder zurück in einem Tab an seiner letzten Stelle
+    private func startOffset(top: CGFloat) -> CGPoint {
+        guard let start else { return CGPoint(x: 0, y: -top) }
+        let s = k * canvas.zoomScale
+        let maxX = max(canvas.contentSize.width - canvas.bounds.width, 0)
+        let maxY = max(canvas.contentSize.height + canvas.contentInset.bottom - canvas.bounds.height, -top)
+        return CGPoint(x: min(max(start.x * s, 0), maxX), y: min(max(start.y * s - top, -top), maxY))
+    }
+
+    private func detach() {
+        guard !detached else { return }
         detached = true
         syncTimer?.invalidate()
         syncTimer = nil
@@ -244,8 +304,14 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         pointerFlush?.cancel()
         // Verschwindet die Fläche, während der Pencil schwebt, kommt das Ende des Schwebens vielleicht nie an
         pencilHovering = false
+        busyRetry?.cancel()
+        busyRetry = nil
         applyPending()
         saveNow()
+        // Solange die Leinwand noch im Fenster ist: Ihre Schritte aus dem gemeinsamen Rückgängig-Stapel nehmen, sonst
+        // träfe Rückgängig in der nächsten Leinwand diese hier (und die App-eigenen Radier-Schritte eine schon
+        // freigegebene)
+        canvas.undoManager?.removeAllActions()
         persistSyncStateNow()
         if sync.openController === self { sync.openController = nil }
         let sync = self.sync, id = doc.id
@@ -371,6 +437,12 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
                 await warmup.value
             }
             guard canSync else { return }
+            // Gleicht gerade die eben geschlossene Fassung dieses Dokuments ab (schnell zu seinem Tab
+            // zurückgewechselt): gleich danach, ohne vorher umsonst den Stand der Leinwand zu erfassen
+            if sync.isBusy(doc.id) {
+                retryWhenFree()
+                return
+            }
             fetchAgain = false
             let holding = holdingStrokes
             if holding, Date() > nextHoldRetry {
@@ -388,8 +460,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             let started = Date()
             let ok = await sync.syncStrokes(doc.id, snapshot: snapshot)
             guard ok else {
-                // Nächster Versuch mit dem Takt (alle 3 Sekunden), nicht sofort
+                // Nächster Versuch mit dem Takt (alle 3 Sekunden), nicht sofort; nur wenn ein anderer Abgleich
+                // dieses Dokuments im Weg war, gleich nach ihm
                 if snapshot != nil { localChanged = true }
+                if sync.isBusy(doc.id) { retryWhenFree() }
                 return
             }
             // Eine Seitenänderung hat begonnen und das Hochladen in Paketen unterbrochen: Der Rest geht danach
@@ -402,6 +476,19 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             schedulePersist()
             again = fetchAgain || (localChanged && !holdingStrokes) || remoteSeqHint > known
         }
+    }
+
+    /// Wartender Versuch, sobald der andere Abgleich dieses Dokuments fertig ist; höchstens einer, egal wie oft
+    /// Takt, Striche oder Hinweise des Servers inzwischen abgleichen wollen
+    private var busyRetry: DispatchWorkItem?
+    private func retryWhenFree() {
+        guard busyRetry == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            self?.busyRetry = nil
+            self?.syncCycle()
+        }
+        busyRetry = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
     }
 
     private var holdingStrokes: Bool {
@@ -1148,7 +1235,12 @@ extension CanvasController {
         let export = exporter
         let title = doc.title.replacingOccurrences(of: "/", with: "-")
         let pages = layout.frames.count
-        if case .documentPDF = kind, pages > 10 { onFlashTimed("PDF mit \(pages) Seiten wird erstellt …", 30) }
+        // Großes PDF: Hinweis, bis es fertig ist (nur diesen räumt das Ende wieder weg, keinen fremden)
+        let showsProgress: Bool
+        if case .documentPDF = kind, pages > 10 { showsProgress = true } else { showsProgress = false }
+        if showsProgress { onFlashTimed("PDF mit \(pages) Seiten wird erstellt …", 30) }
+        // Hinweise auch, wenn diese Leinwand inzwischen zu ist (Tab gewechselt): Sie erscheinen dann im sichtbaren Tab
+        let flash = onFlashTimed
         Task { [weak self] in
             do {
                 let url = try await PageExport.run { () -> URL in
@@ -1168,14 +1260,14 @@ extension CanvasController {
                         return url
                     }
                 }
+                if showsProgress { flash("", 0) }
                 guard let self else { return }
-                self.onFlashTimed("", 0)
                 let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
                 sheet.popoverPresentationController?.sourceView = self.view
                 sheet.popoverPresentationController?.sourceRect = sourceRect
                 self.present(sheet, animated: true)
             } catch {
-                self?.onFlashTimed("Export fehlgeschlagen: \(error.localizedDescription)", 3)
+                flash("Export fehlgeschlagen: \(error.localizedDescription)", 3)
             }
         }
     }
@@ -1196,7 +1288,9 @@ extension CanvasController {
         let export = exporter
         onFlashTimed("Wird gesendet …", 60)
         let sync = self.sync
-        Task { [weak self] in
+        // Das Ergebnis auch melden, wenn diese Leinwand inzwischen zu ist (Tab gewechselt)
+        let flash = onFlashTimed
+        Task {
             do {
                 let pdf = try await PageExport.run { () -> Data in
                     let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".pdf")
@@ -1205,9 +1299,9 @@ extension CanvasController {
                     return try Data(contentsOf: url)
                 }
                 try await sync.sendToOutbox(to: recipient, name: name, data: pdf, type: "application/pdf")
-                self?.onFlashTimed(cut ? "Seiten 1–\(count) liegen bereit für \(who)" : "Ganzes Dokument liegt bereit für \(who)", 2.5)
+                flash(cut ? "Seiten 1–\(count) liegen bereit für \(who)" : "Ganzes Dokument liegt bereit für \(who)", 2.5)
             } catch {
-                self?.onFlashTimed("Senden fehlgeschlagen: \(error.localizedDescription)", 3)
+                flash("Senden fehlgeschlagen: \(error.localizedDescription)", 3)
             }
         }
     }
@@ -1222,7 +1316,9 @@ extension CanvasController {
         let export = exporter
         onFlashTimed("Wird gesendet …", 30)
         let sync = self.sync
-        Task { [weak self] in
+        // Das Ergebnis auch melden, wenn diese Leinwand inzwischen zu ist (Tab gewechselt)
+        let flash = onFlashTimed
+        Task {
             do {
                 let (pdf, png) = try await PageExport.run { () -> (Data, Data) in
                     let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".pdf")
@@ -1232,9 +1328,9 @@ extension CanvasController {
                 }
                 try await sync.sendToOutbox(to: recipient, name: base + ".pdf", data: pdf, type: "application/pdf")
                 try await sync.sendToOutbox(to: recipient, name: base + ".png", data: png, type: "image/png")
-                self?.onFlashTimed("Seite \(i + 1) liegt bereit für \(recipient == "claude" ? "Claude" : "ChatGPT")", 2.5)
+                flash("Seite \(i + 1) liegt bereit für \(recipient == "claude" ? "Claude" : "ChatGPT")", 2.5)
             } catch {
-                self?.onFlashTimed("Senden fehlgeschlagen: \(error.localizedDescription)", 3)
+                flash("Senden fehlgeschlagen: \(error.localizedDescription)", 3)
             }
         }
     }

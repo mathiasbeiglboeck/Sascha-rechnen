@@ -113,10 +113,11 @@ final class DocumentStore: ObservableObject {
     /// Nach so vielen Tagen ohne Änderung wird ein Dokument im temp-Ordner gelöscht
     static let tempDays = 14
 
-    /// Löscht Dokumente im temp-Ordner, die seit `tempDays` Tagen nicht geändert wurden; gibt ihre IDs zurück
-    func purgeTemp(keeping open: UUID?) -> [UUID] {
+    /// Löscht Dokumente im temp-Ordner, die seit `tempDays` Tagen nicht geändert wurden (außer den in Tabs offenen);
+    /// gibt ihre IDs zurück
+    func purgeTemp(keeping open: Set<UUID>) -> [UUID] {
         let limit = Date().addingTimeInterval(-Double(Self.tempDays) * 86400)
-        let old = documents.filter { $0.folder == Self.tempFolder && $0.modified < limit && $0.id != open }
+        let old = documents.filter { $0.folder == Self.tempFolder && $0.modified < limit && !open.contains($0.id) }
         for doc in old { delete(doc) }
         return old.map(\.id)
     }
