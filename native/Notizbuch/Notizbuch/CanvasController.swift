@@ -1235,7 +1235,10 @@ extension CanvasController {
         let export = exporter
         let title = doc.title.replacingOccurrences(of: "/", with: "-")
         let pages = layout.frames.count
-        if case .documentPDF = kind, pages > 10 { onFlashTimed("PDF mit \(pages) Seiten wird erstellt …", 30) }
+        // Großes PDF: Hinweis, bis es fertig ist (nur diesen räumt das Ende wieder weg, keinen fremden)
+        let showsProgress: Bool
+        if case .documentPDF = kind, pages > 10 { showsProgress = true } else { showsProgress = false }
+        if showsProgress { onFlashTimed("PDF mit \(pages) Seiten wird erstellt …", 30) }
         // Hinweise auch, wenn diese Leinwand inzwischen zu ist (Tab gewechselt): Sie erscheinen dann im sichtbaren Tab
         let flash = onFlashTimed
         Task { [weak self] in
@@ -1257,7 +1260,7 @@ extension CanvasController {
                         return url
                     }
                 }
-                flash("", 0)
+                if showsProgress { flash("", 0) }
                 guard let self else { return }
                 let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
                 sheet.popoverPresentationController?.sourceView = self.view
