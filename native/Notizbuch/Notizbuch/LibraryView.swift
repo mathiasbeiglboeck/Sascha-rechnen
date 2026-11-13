@@ -171,7 +171,12 @@ struct LibraryView: View {
             .alert("Umbenennen", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
                 TextField("Titel", text: $newTitle)
                 Button("Abbrechen", role: .cancel) {}
-                Button("OK") { if let doc = renaming { store.rename(doc, to: newTitle) } }
+                Button("OK") {
+                    if let doc = renaming {
+                        store.rename(doc, to: newTitle)
+                        Task { await sync.syncLibrary() }
+                    }
+                }
             }
             .confirmationDialog("„\(deleting?.title ?? "")“ löschen?",
                                 isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
@@ -382,7 +387,8 @@ struct DocCard: View {
                 if doc.kind == .pdf {
                     Image(systemName: "doc.richtext").foregroundStyle(.secondary)
                 }
-                Text(doc.title).font(.subheadline.weight(.medium)).lineLimit(1)
+                // Zu lang: Mitte kürzen, das Ende (Uhrzeit, Kapitel) unterscheidet oft
+                Text(doc.title).font(.subheadline.weight(.medium)).lineLimit(1).truncationMode(.middle)
             }
             Text(doc.modified.formatted(date: .abbreviated, time: .shortened))
                 .font(.caption).foregroundStyle(.secondary)

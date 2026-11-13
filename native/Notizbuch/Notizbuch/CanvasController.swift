@@ -1221,6 +1221,15 @@ extension CanvasController {
                    ink: canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k)))
     }
 
+    /// Aktueller Name (inzwischen vielleicht umbenannt, auch auf einem anderen Gerät)
+    private var currentTitle: String { store.documents.first { $0.id == doc.id }?.title ?? doc.title }
+
+    /// Name als Dateiname (Export, Briefkasten): „/“ trennt Ordner, „:“ (in der Uhrzeit neuer Notizbücher) zeigt
+    /// der Mac als „/“, und Windows oder OneDrive nehmen es gar nicht
+    static func fileName(_ title: String) -> String {
+        title.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: ".")
+    }
+
     func share(_ kind: ShareKind, from sourceRect: CGRect) {
         saveNow()
         let i = currentPageIndex
@@ -1233,7 +1242,7 @@ extension CanvasController {
             return
         }
         let export = exporter
-        let title = doc.title.replacingOccurrences(of: "/", with: "-")
+        let title = Self.fileName(currentTitle)
         let pages = layout.frames.count
         // Großes PDF: Hinweis, bis es fertig ist (nur diesen räumt das Ende wieder weg, keinen fremden)
         let showsProgress: Bool
@@ -1283,7 +1292,8 @@ extension CanvasController {
         }
         let count = min(layout.frames.count, Self.maxPagesToAI)
         let cut = layout.frames.count > count
-        let name = cut ? "\(doc.title) – Seiten 1-\(count).pdf" : "\(doc.title).pdf"
+        let title = Self.fileName(currentTitle)
+        let name = cut ? "\(title) – Seiten 1-\(count).pdf" : "\(title).pdf"
         let who = recipient == "claude" ? "Claude" : "ChatGPT"
         let export = exporter
         onFlashTimed("Wird gesendet …", 60)
@@ -1312,7 +1322,7 @@ extension CanvasController {
             onFlashTimed("Erst den Server einrichten (Zahnrad in der Übersicht)", 2.5)
             return
         }
-        let base = "\(doc.title) – Seite \(i + 1)"
+        let base = "\(Self.fileName(currentTitle)) – Seite \(i + 1)"
         let export = exporter
         onFlashTimed("Wird gesendet …", 30)
         let sync = self.sync

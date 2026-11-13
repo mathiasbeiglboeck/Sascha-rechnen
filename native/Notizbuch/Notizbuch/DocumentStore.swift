@@ -133,10 +133,15 @@ final class DocumentStore: ObservableObject {
         save(d)
     }
 
+    /// Benennt ein Dokument um; gilt nach dem Sync auf allen Geräten. Wie beim Verschieben mit neuem Zeitstempel:
+    /// Sonst bliebe auf den anderen Geräten der alte Name, und ihre nächste Änderung brächte ihn hierher zurück
     func rename(_ doc: NoteDocument, to title: String) {
-        var d = doc
-        d.title = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !d.title.isEmpty else { return }
+        let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Der aktuelle Stand, nicht der vom Öffnen des Dialogs (ein Abgleich kann ihn inzwischen geändert haben)
+        var d = documents.first(where: { $0.id == doc.id }) ?? doc
+        guard !name.isEmpty, name != d.title else { return }
+        d.title = name
+        d.modified = Date()
         save(d)
     }
 
