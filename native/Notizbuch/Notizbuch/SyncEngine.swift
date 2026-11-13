@@ -2,9 +2,12 @@ import Foundation
 import PencilKit
 import os
 
-/// Protokoll für die Zeitmessung (am Mac in der Konsole zu sehen: Subsystem de.beiglboeck.notizbuch, Kategorie sync)
+/// Protokoll (am Mac in der Konsole zu sehen: Subsystem de.beiglboeck.notizbuch)
 enum Log {
+    /// Zeitmessung des Abgleichs
     static let sync = Logger(subsystem: "de.beiglboeck.notizbuch", category: "sync")
+    /// Werkzeuge und PencilKit (etwa welche Schwebe-Gesten der Radierer pausiert)
+    static let ink = Logger(subsystem: "de.beiglboeck.notizbuch", category: "ink")
 }
 
 /// Metadaten, wie der Server sie liefert (Datum in Sekunden seit 1970)

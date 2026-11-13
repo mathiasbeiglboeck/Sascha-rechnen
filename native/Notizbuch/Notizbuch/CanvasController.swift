@@ -121,6 +121,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(handleHover(_:)))
         canvas.addGestureRecognizer(hover)
+        appHover = hover
 
         let d = Self.eraserRadius * 2
         eraserCursor.frame = CGRect(x: 0, y: 0, width: d, height: d)
@@ -202,18 +203,35 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     /// PencilKit behält beim Drehen die alten Kacheln der Tinte; nach der Animation neu aufbauen lassen
     private var redrawWork: DispatchWorkItem?
-    private func redrawInkSoon() {
+    /// Wartet das ausstehende Neuzeichnen, bis der Pencil nicht mehr schwebt? Nur nach dem Radieren (handleErase):
+    /// Setzen der Zeichnung unter dem schwebenden Pencil versteckt PencilKits Live-Leinwand, und der nächste Strich
+    /// erschiene erst beim Absetzen. Alle anderen Anlässe (Drehen, Seitensprung, fremde Striche) warten nicht
+    private var redrawWaitsForPencil = false
+    private func redrawInkSoon(waitForPencil: Bool = false) {
+        // Kommen mehrere Anlässe zusammen, wartet das Neuzeichnen nur, wenn alle warten dürfen
+        redrawWaitsForPencil = waitForPencil && (redrawWork == nil || redrawWaitsForPencil)
         redrawWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             // Nicht mitten in einem Strich, sonst ginge er verloren
-            if self.toolBusy { self.redrawInkSoon(); return }
-            let drawing = self.canvas.drawing
-            self.setDrawing(PKDrawing())
-            self.setDrawing(drawing)
+            if self.toolBusy || (self.redrawWaitsForPencil && self.pencilNear) {
+                self.redrawInkSoon(waitForPencil: self.redrawWaitsForPencil)
+                return
+            }
+            self.redrawInkNow()
         }
         redrawWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    /// Baut die Tinte sofort neu auf; ein noch ausstehendes Neuzeichnen entfällt damit
+    private func redrawInkNow() {
+        redrawWork?.cancel()
+        redrawWork = nil
+        redrawWaitsForPencil = false
+        let drawing = canvas.drawing
+        setDrawing(PKDrawing())
+        setDrawing(drawing)
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -224,6 +242,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         pointerFlush?.cancel()
+        // Verschwindet die Fläche, während der Pencil schwebt, kommt das Ende des Schwebens vielleicht nie an
+        pencilHovering = false
         applyPending()
         saveNow()
         persistSyncStateNow()
@@ -272,6 +292,17 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     /// ersetzt (fremde Striche einfügen), verliert den gerade geschriebenen Strich.
     private var lastToolEnd = Date.distantPast
     private var toolBusy: Bool { usingTool || Date().timeIntervalSince(lastToolEnd) < 0.5 }
+    /// Wie `lastToolEnd`, aber nur für PencilKits eigene Striche (nicht den Radierer der App)
+    private var lastInkEnd = Date.distantPast
+    /// Ist ein eben geschriebener Strich womöglich noch nicht in der Zeichnung?
+    private var inkSettling: Bool { Date().timeIntervalSince(lastInkEnd) < 0.5 }
+    /// Schwebt der Pencil gerade über der Fläche (eigene Schwebe-Geste der App)?
+    private var pencilHovering = false
+    /// Wann er zuletzt aufgehört hat zu schweben: aufgesetzt, weggehoben oder zur Leiste gewandert
+    private var lastHoverEnd = Date.distantPast
+    /// Schwebt der Pencil, oder schwebte er eben noch? Die kurze Nachfrist deckt den Moment zwischen dem Ende des
+    /// Schwebens und dem Aufsetzen ab, in dem der neue Strich noch nicht gemeldet ist, und PencilKits Aufräumen danach
+    private var pencilNear: Bool { pencilHovering || Date().timeIntervalSince(lastHoverEnd) < 0.25 }
     private var pendingWork: DispatchWorkItem?
     private var pending = RemoteChanges()
     /// Seitenzahl, die ein anderes Gerät nach Löschen oder Einfügen gemeldet hat (nur Notizbücher)
@@ -649,6 +680,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     // MARK: Werkzeuge
 
     func apply(color: UIColor, width: CGFloat, mode: ToolMode, viewOnly: Bool = false) {
+        // Radierer wird abgewählt, während der Pencil weg ist (etwa mit dem Finger über die Leiste): das Neuzeichnen
+        // nach dem Radieren gleich erledigen. Nach dem Doppeltippen schwebt er meist noch; dann wartet es, bis er weg
+        // ist (siehe redrawInkSoon)
+        if erasing, mode != .eraser, !usingTool, !inkSettling, !pencilNear, redrawWork != nil { redrawInkNow() }
         self.viewOnly = viewOnly
         inkColor = color
         inkWidth = width
@@ -660,18 +695,72 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     private func applyTool() {
         // Lasso von PencilKit: auswählen, verschieben; Antippen der Auswahl zeigt Ausschneiden, Kopieren,
-        // Duplizieren, Löschen; Antippen einer leeren Stelle zeigt Einsetzen
-        if lasso {
+        // Duplizieren, Löschen; Antippen einer leeren Stelle zeigt Einsetzen. Nicht im Nur-Sehen-Modus: Dort blieben
+        // PencilKits Lasso-Gesten aktiv, und eine Auswahl ließe sich verschieben. Der Stift löscht die Auswahl; mit
+        // „Bearbeiten“ ist das Lasso wieder da
+        if lasso && !viewOnly {
             if !(canvas.tool is PKLassoTool) { canvas.tool = PKLassoTool() }
         } else {
             canvas.tool = PKInkingTool(.pen, color: inkColor, width: inkWidth * max(k, 0.5))
         }
         // Nur-Sehen-Modus (am iPhone Standard): nichts zeichnet, ein Finger scrollt
         canvas.drawingGestureRecognizer.isEnabled = !erasing && !pointing && !viewOnly
+        // PencilKits Lasso-Menü (Ausschneiden, Kopieren, Einsetzen …) nur, wenn man bearbeiten darf; siehe InkCanvasView
+        canvas.editingAllowed = !viewOnly
         eraserGesture.isEnabled = erasing && !viewOnly
         pointerGesture.isEnabled = pointing && !viewOnly
         if !isPad { canvas.panGestureRecognizer.minimumNumberOfTouches = viewOnly ? 1 : 2 }
         if !erasing { eraserCursor.isHidden = true }
+        setPencilKitHover(enabled: !(erasing && !viewOnly))
+    }
+
+    /// PencilKits eigene Schwebe-Gesten, solange der Radierer sie abgeschaltet hat
+    private var pausedPencilKitHover: [UIGestureRecognizer] = []
+    /// Die eigene Schwebe-Geste der App (Handballen, Radierer-Kreis); sie bleibt immer an
+    private weak var appHover: UIHoverGestureRecognizer?
+    /// Läuft die Pause gerade? Nur für das Protokoll
+    private var hoverPauseActive = false
+
+    /// Schaltet PencilKits Schweben (die Vorschau unter dem schwebenden Pencil) beim eigenen Radierer ab und beim
+    /// Wechsel zurück wieder an. Lief es über das Radieren hinweg weiter, erschien der erste Strich nach dem
+    /// Doppeltippen zum Stift erst beim Absetzen; erst Wegheben des Pencils räumte das auf. Beim Radierer bekommt
+    /// PencilKit so vom Pencil gar nichts mit, wie wenn er weg wäre, und das Wiedereinschalten beginnt ein frisches
+    /// Schweben. Fehlen die Gesten (andere PencilKit-Version), passiert nichts; das Protokoll (Kategorie ink) nennt,
+    /// was pausiert wurde
+    private func setPencilKitHover(enabled: Bool) {
+        if enabled {
+            for g in pausedPencilKitHover { g.isEnabled = true }
+            pausedPencilKitHover = []
+            hoverPauseActive = false
+            return
+        }
+        let before = pausedPencilKitHover.count
+        // Bei jedem Aufruf nachsehen: PencilKit könnte eine Geste neu anlegen oder wieder einschalten
+        let onCanvas = (canvas.gestureRecognizers ?? []).filter { $0 !== appHover && Self.watchesPencil($0) }
+        let pencilKitViews = canvas.subviews.filter { $0 !== pagesView && $0 !== pointerOverlay }
+        for g in onCanvas + pencilKitViews.flatMap({ Self.pencilWatchers(in: $0) })
+        where g.isEnabled && !pausedPencilKitHover.contains(where: { $0 === g }) {
+            g.isEnabled = false
+            pausedPencilKitHover.append(g)
+        }
+        guard !hoverPauseActive || pausedPencilKitHover.count != before else { return }
+        hoverPauseActive = true
+        let names = pausedPencilKitHover.map { g in
+            "\(type(of: g))@\(g.view.map { String(describing: type(of: $0)) } ?? "-")"
+        }
+        let list = names.isEmpty ? "keine" : names.joined(separator: ", ")
+        Log.ink.info("Radierer: PencilKit-Gesten pausiert: \(list, privacy: .public)")
+    }
+
+    /// PencilKits Schwebe-Gesten und sein Beobachter, der dem Schweben jede Pencil-Berührung meldet (er nimmt selbst
+    /// nie eine an, Abschalten bricht also nichts ab)
+    private static func watchesPencil(_ g: UIGestureRecognizer) -> Bool {
+        g is UIHoverGestureRecognizer || NSStringFromClass(type(of: g)).contains("PencilObserver")
+    }
+
+    private static func pencilWatchers(in view: UIView) -> [UIGestureRecognizer] {
+        let own = (view.gestureRecognizers ?? []).filter { watchesPencil($0) }
+        return own + view.subviews.flatMap { pencilWatchers(in: $0) }
     }
 
     func undo() {
@@ -775,8 +864,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             eraserCursor.isHidden = true
             if let start = eraseStart, start.strokes.count != canvas.drawing.strokes.count {
                 canvas.undoManager?.registerUndo(withTarget: self) { $0.replaceDrawingUndoably(with: start) }
-                // PencilKit lässt beim Entfernen manchmal einen feinen Rest des Strichs stehen
-                redrawInkSoon()
+                // PencilKit lässt beim Entfernen manchmal einen feinen Rest des Strichs stehen: neu zeichnen, sobald
+                // der Pencil nicht mehr schwebt (siehe redrawInkSoon). Brach der Wechsel zum Stift die Geste ab
+                // (Pencil noch auf dem Glas), gleich
+                if erasing || inkSettling || pencilNear { redrawInkSoon(waitForPencil: true) } else { redrawInkNow() }
             }
             eraseStart = nil
             lastErasePoint = nil
@@ -834,9 +925,12 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     @objc private func handleHover(_ g: UIHoverGestureRecognizer) {
         switch g.state {
         case .began, .changed:
+            pencilHovering = true
             lockScrolling()
             if erasing && eraseStart == nil { moveCursor(to: g.location(in: view)) }
         default:
+            if pencilHovering { lastHoverEnd = Date() }
+            pencilHovering = false
             unlockScrollingSoon()
             if eraseStart == nil { eraserCursor.isHidden = true }
         }
@@ -875,6 +969,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
         usingTool = false
         lastToolEnd = Date()
+        lastInkEnd = lastToolEnd
         unlockScrollingSoon()
         applyPendingWhenIdle()
     }
