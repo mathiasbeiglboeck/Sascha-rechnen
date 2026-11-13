@@ -319,7 +319,8 @@ struct TabStrip: View {
             .buttonStyle(.plain)
             .accessibilityLabel("Tab schließen")
         }
-        .frame(maxWidth: 190)
+        // Breit genug für einen ganzen Standardnamen („Notizen 28. Sept. 2026, 20:08“); erst längere Namen werden gekürzt
+        .frame(maxWidth: 220)
         .foregroundStyle(isActive ? Color.primary : Color.secondary)
         .background {
             Capsule().fill(.regularMaterial).opacity(isActive ? 1 : 0.55)

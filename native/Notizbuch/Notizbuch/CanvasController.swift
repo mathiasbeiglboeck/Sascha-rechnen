@@ -1224,10 +1224,32 @@ extension CanvasController {
     /// Aktueller Name (inzwischen vielleicht umbenannt, auch auf einem anderen Gerät)
     private var currentTitle: String { store.documents.first { $0.id == doc.id }?.title ?? doc.title }
 
-    /// Name als Dateiname (Export, Briefkasten): „/“ trennt Ordner, „:“ (in der Uhrzeit neuer Notizbücher) zeigt
-    /// der Mac als „/“, und Windows oder OneDrive nehmen es gar nicht
+    /// Name als Dateiname (Export, Briefkasten). Was Mac, Windows oder OneDrive in Dateinamen nicht nehmen, wird
+    /// ersetzt oder fällt weg: „/“ trennt Ordner, „:“ (in der Uhrzeit neuer Notizbücher) zeigt der Mac als „/“,
+    /// \ | * ? " < > lehnen Windows und OneDrive ab, ebenso Punkte und Leerzeichen am Ende; ein Punkt am Anfang
+    /// versteckt die Datei. Sehr lange Namen werden gekürzt (Dateinamen haben höchstens 255 Bytes)
     static func fileName(_ title: String) -> String {
-        title.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: ".")
+        var name = ""
+        for ch in title {
+            switch ch {
+            case "/", "\\", "|": name.append("-")
+            case ":": name.append(".")
+            case "*", "?", "\"", "<", ">": continue
+            default:
+                // Steuerzeichen (Zeilenumbruch, Tabulator …) als Leerzeichen
+                let control = ch.unicodeScalars.contains { $0.value < 0x20 || (0x7F...0x9F).contains($0.value) }
+                name.append(control ? " " : ch)
+            }
+        }
+        let edges = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "."))
+        // Platz für Zusätze wie „ – Seiten 1-50.pdf“
+        var short = ""
+        for ch in name.trimmingCharacters(in: edges) {
+            if short.utf8.count + String(ch).utf8.count > 200 { break }
+            short.append(ch)
+        }
+        short = short.trimmingCharacters(in: edges)
+        return short.isEmpty ? "Notizen" : short
     }
 
     func share(_ kind: ShareKind, from sourceRect: CGRect) {
