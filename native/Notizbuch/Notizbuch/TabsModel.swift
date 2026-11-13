@@ -304,10 +304,11 @@ struct TabStrip: View {
     private func tab(_ id: UUID) -> some View {
         let isActive = id == tabs.active
         return HStack(spacing: 0) {
+            // Zu lang: Mitte kürzen, denn Namen unterscheiden sich oft erst am Ende (Uhrzeit, Kapitel, Blatt 2)
             Text(tabs.title(for: id))
                 .font(.caption)
                 .lineLimit(1)
-                .truncationMode(.tail)
+                .truncationMode(.middle)
                 .padding(.leading, 12)
             Button { tabs.close(id) } label: {
                 Image(systemName: "xmark")

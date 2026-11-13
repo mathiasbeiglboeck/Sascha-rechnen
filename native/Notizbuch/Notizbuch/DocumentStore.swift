@@ -76,7 +76,8 @@ final class DocumentStore: ObservableObject {
 
     func createNotebook(inFolder: String? = nil) -> NoteDocument {
         let now = Date()
-        let doc = NoteDocument(id: UUID(), title: "Notizen " + now.formatted(date: .abbreviated, time: .omitted),
+        // Mit Uhrzeit: Notizbücher vom selben Tag (und ihre Tabs) sind so zu unterscheiden
+        let doc = NoteDocument(id: UUID(), title: "Notizen " + now.formatted(date: .abbreviated, time: .shortened),
                                kind: .notebook, created: now, modified: now, pageCount: 1,
                                layoutVersion: PageLayout.currentVersion, folder: inFolder)
         try? fm.createDirectory(at: folder(doc.id), withIntermediateDirectories: true)
