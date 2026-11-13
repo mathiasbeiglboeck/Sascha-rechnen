@@ -107,10 +107,14 @@ struct EditorView: View {
                     }
 
                     if let flash = tools.flash {
+                        // Lange Hinweise (etwa mit einem Dokumentnamen) brechen am iPhone um: dann mittig, und die
+                        // Ecken runden sich wie eine Kapsel, ohne den Text anzuschneiden
                         Text(flash)
                             .font(.callout.weight(.medium))
+                            .multilineTextAlignment(.center)
                             .padding(.horizontal, 14).padding(.vertical, 7)
-                            .background(.ultraThinMaterial, in: Capsule())
+                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 17, style: .continuous))
+                            .padding(.horizontal, 16)
                             .padding(.top, tools.menusHidden ? 10 : 64 + (tabsShown ? Self.tabRowHeight : 0))
                             .transition(.opacity)
                     }

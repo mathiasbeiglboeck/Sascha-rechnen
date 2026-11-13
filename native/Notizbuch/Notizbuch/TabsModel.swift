@@ -174,9 +174,18 @@ final class TabsModel: ObservableObject {
 
     // MARK: Intern
 
+    /// Wann der Editor zuletzt aufging
+    private var presentedAt = Date.distantPast
+
+    /// Das Kreuz eines Tabs wirkt erst, wenn der Editor ganz aufgegangen ist, und nicht mehr, während er wegfährt:
+    /// Ein schneller zweiter Tipp auf „Neu“ (der Knopf liegt in der Übersicht genau dort) schlösse sonst den eben
+    /// angelegten Tab wieder
+    var tabsClosable: Bool { editorShown && Date().timeIntervalSince(presentedAt) > 0.6 }
+
     private func presentEditor() {
         tools.menusHidden = false
         tools.prepareForDocument()
+        presentedAt = Date()
         editorShown = true
     }
 
@@ -304,12 +313,16 @@ struct TabStrip: View {
     private func tab(_ id: UUID) -> some View {
         let isActive = id == tabs.active
         return HStack(spacing: 0) {
+            // Zu lang: Mitte kürzen, denn Namen unterscheiden sich oft erst am Ende (Uhrzeit, Kapitel, Blatt 2)
             Text(tabs.title(for: id))
                 .font(.caption)
                 .lineLimit(1)
-                .truncationMode(.tail)
+                .truncationMode(.middle)
                 .padding(.leading, 12)
-            Button { tabs.close(id) } label: {
+            Button {
+                guard tabs.tabsClosable else { return }
+                tabs.close(id)
+            } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 8, weight: .bold))
                     .frame(width: 26, height: 26)
@@ -318,7 +331,11 @@ struct TabStrip: View {
             .buttonStyle(.plain)
             .accessibilityLabel("Tab schließen")
         }
-        .frame(maxWidth: 190)
+        // So breit wie der Name, höchstens 220 Punkte: Ein ganzer Standardname („Notizen 28. Sept. 2026, 20:08“) passt,
+        // erst längere Namen werden gekürzt. Fest, damit sich die Tabs die Breite nicht gleichmäßig teilen (am iPhone
+        // würde ein langer Name neben einem kurzen sonst gekürzt, obwohl Platz ist)
+        .frame(maxWidth: 220)
+        .fixedSize(horizontal: true, vertical: false)
         .foregroundStyle(isActive ? Color.primary : Color.secondary)
         .background {
             Capsule().fill(.regularMaterial).opacity(isActive ? 1 : 0.55)
