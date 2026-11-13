@@ -96,6 +96,8 @@ struct LibraryView: View {
                         Label(openTabsLabel, systemImage: "square.on.square")
                             .font(.subheadline.weight(.medium))
                             .lineLimit(1)
+                            // Zu lang (kleines iPhone): Mitte kürzen, damit die Uhrzeit am Ende sichtbar bleibt
+                            .truncationMode(.middle)
                             .padding(.horizontal, 16).padding(.vertical, 10)
                             .background(.regularMaterial, in: Capsule())
                             .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
