@@ -1221,6 +1221,37 @@ extension CanvasController {
                    ink: canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k)))
     }
 
+    /// Aktueller Name (inzwischen vielleicht umbenannt, auch auf einem anderen Gerät)
+    private var currentTitle: String { store.documents.first { $0.id == doc.id }?.title ?? doc.title }
+
+    /// Name als Dateiname (Export, Briefkasten). Was Mac, Windows oder OneDrive in Dateinamen nicht nehmen, wird
+    /// ersetzt oder fällt weg: „/“ trennt Ordner, „:“ (in der Uhrzeit neuer Notizbücher) zeigt der Mac als „/“,
+    /// \ | * ? " < > lehnen Windows und OneDrive ab, ebenso Punkte und Leerzeichen am Ende; ein Punkt am Anfang
+    /// versteckt die Datei. Sehr lange Namen werden gekürzt (Dateinamen haben höchstens 255 Bytes)
+    static func fileName(_ title: String) -> String {
+        var name = ""
+        for ch in title {
+            switch ch {
+            case "/", "\\", "|": name.append("-")
+            case ":": name.append(".")
+            case "*", "?", "\"", "<", ">": continue
+            default:
+                // Steuerzeichen (Zeilenumbruch, Tabulator …) als Leerzeichen
+                let control = ch.unicodeScalars.contains { $0.value < 0x20 || (0x7F...0x9F).contains($0.value) }
+                name.append(control ? " " : ch)
+            }
+        }
+        let edges = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "."))
+        // Platz für Zusätze wie „ – Seiten 1-50.pdf“
+        var short = ""
+        for ch in name.trimmingCharacters(in: edges) {
+            if short.utf8.count + String(ch).utf8.count > 200 { break }
+            short.append(ch)
+        }
+        short = short.trimmingCharacters(in: edges)
+        return short.isEmpty ? "Notizen" : short
+    }
+
     func share(_ kind: ShareKind, from sourceRect: CGRect) {
         saveNow()
         let i = currentPageIndex
@@ -1233,7 +1264,7 @@ extension CanvasController {
             return
         }
         let export = exporter
-        let title = doc.title.replacingOccurrences(of: "/", with: "-")
+        let title = Self.fileName(currentTitle)
         let pages = layout.frames.count
         // Großes PDF: Hinweis, bis es fertig ist (nur diesen räumt das Ende wieder weg, keinen fremden)
         let showsProgress: Bool
@@ -1283,7 +1314,8 @@ extension CanvasController {
         }
         let count = min(layout.frames.count, Self.maxPagesToAI)
         let cut = layout.frames.count > count
-        let name = cut ? "\(doc.title) – Seiten 1-\(count).pdf" : "\(doc.title).pdf"
+        let title = Self.fileName(currentTitle)
+        let name = cut ? "\(title) – Seiten 1-\(count).pdf" : "\(title).pdf"
         let who = recipient == "claude" ? "Claude" : "ChatGPT"
         let export = exporter
         onFlashTimed("Wird gesendet …", 60)
@@ -1312,7 +1344,7 @@ extension CanvasController {
             onFlashTimed("Erst den Server einrichten (Zahnrad in der Übersicht)", 2.5)
             return
         }
-        let base = "\(doc.title) – Seite \(i + 1)"
+        let base = "\(Self.fileName(currentTitle)) – Seite \(i + 1)"
         let export = exporter
         onFlashTimed("Wird gesendet …", 30)
         let sync = self.sync

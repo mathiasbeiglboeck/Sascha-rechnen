@@ -76,7 +76,8 @@ final class DocumentStore: ObservableObject {
 
     func createNotebook(inFolder: String? = nil) -> NoteDocument {
         let now = Date()
-        let doc = NoteDocument(id: UUID(), title: "Notizen " + now.formatted(date: .abbreviated, time: .omitted),
+        // Mit Uhrzeit: Notizbücher vom selben Tag (und ihre Tabs) sind so zu unterscheiden
+        let doc = NoteDocument(id: UUID(), title: "Notizen " + now.formatted(date: .abbreviated, time: .shortened),
                                kind: .notebook, created: now, modified: now, pageCount: 1,
                                layoutVersion: PageLayout.currentVersion, folder: inFolder)
         try? fm.createDirectory(at: folder(doc.id), withIntermediateDirectories: true)
@@ -122,20 +123,32 @@ final class DocumentStore: ObservableObject {
         return old.map(\.id)
     }
 
-    /// Verschiebt ein Dokument in einen Ordner (nil = oberste Ebene); gilt nach dem Sync auf allen Geräten
+    /// Verschiebt ein Dokument in einen Ordner (nil = oberste Ebene); gilt nach dem Sync auf allen Geräten.
+    /// Ausgehend vom aktuellen Stand, nicht von dem beim Öffnen des Menüs: Ein Abgleich kann ihn inzwischen geändert
+    /// haben (etwa einen Namen von einem anderen Gerät, den die alte Kopie sonst überall zurückbrächte)
     func move(_ doc: NoteDocument, to folder: String?) {
-        var d = doc
+        // Inzwischen gelöscht: nicht wieder anlegen
+        guard var d = documents.first(where: { $0.id == doc.id }) else { return }
         let name = folder?.trimmingCharacters(in: .whitespacesAndNewlines)
-        d.folder = (name?.isEmpty ?? true) ? nil : name
-        guard d.folder != doc.folder else { return }
+        let target = (name?.isEmpty ?? true) ? nil : name
+        guard target != d.folder else { return }
+        d.folder = target
         d.modified = Date()
         save(d)
     }
 
+    /// Benennt ein Dokument um; gilt nach dem Sync auf allen Geräten. Wie beim Verschieben mit neuem Zeitstempel:
+    /// Sonst bliebe auf den anderen Geräten der alte Name, und ihre nächste Änderung brächte ihn hierher zurück
     func rename(_ doc: NoteDocument, to title: String) {
-        var d = doc
-        d.title = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !d.title.isEmpty else { return }
+        let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Der aktuelle Stand, nicht der vom Öffnen des Dialogs (ein Abgleich kann ihn inzwischen geändert haben);
+        // inzwischen gelöscht: nicht wieder anlegen
+        guard var d = documents.first(where: { $0.id == doc.id }) else { return }
+        // Unverändert ist auch der Name, mit dem der Dialog aufging: Kam inzwischen ein neuer Name von einem anderen
+        // Gerät, bliebe der sonst durch bloßes „OK“ überall wieder der alte
+        guard !name.isEmpty, name != doc.title, name != d.title else { return }
+        d.title = name
+        d.modified = Date()
         save(d)
     }
 
