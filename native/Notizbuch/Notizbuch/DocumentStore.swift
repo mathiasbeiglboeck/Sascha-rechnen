@@ -26,6 +26,12 @@ struct NoteDocument: Codable, Identifiable, Hashable {
     /// Zeitpunkt (ms) der letzten Seitenänderung (löschen, einfügen) auf irgendeinem Gerät. Seitenzahl und
     /// PDF-Version folgen der neuesten Seitenänderung, nicht der letzten Änderung am Dokument überhaupt
     var pagesVersion: Int? = nil
+    /// Wann der Name zuletzt geändert wurde, auf irgendeinem Gerät (fehlt = seit dem Anlegen nicht). Beim Abgleich
+    /// gewinnt der zuletzt vergebene Name, auch wenn danach auf einem anderen Gerät noch ins Dokument geschrieben
+    /// wurde (das ändert nur `modified`)
+    var titleSet: Date? = nil
+    /// Wann das Dokument zuletzt in einen anderen Ordner kam; wie `titleSet`
+    var folderSet: Date? = nil
 }
 
 @MainActor
@@ -132,8 +138,10 @@ final class DocumentStore: ObservableObject {
         let name = folder?.trimmingCharacters(in: .whitespacesAndNewlines)
         let target = (name?.isEmpty ?? true) ? nil : name
         guard target != d.folder else { return }
+        let now = Date()
         d.folder = target
-        d.modified = Date()
+        d.folderSet = now
+        d.modified = now
         save(d)
     }
 
@@ -147,8 +155,10 @@ final class DocumentStore: ObservableObject {
         // Unverändert ist auch der Name, mit dem der Dialog aufging: Kam inzwischen ein neuer Name von einem anderen
         // Gerät, bliebe der sonst durch bloßes „OK“ überall wieder der alte
         guard !name.isEmpty, name != doc.title, name != d.title else { return }
+        let now = Date()
         d.title = name
-        d.modified = Date()
+        d.titleSet = now
+        d.modified = now
         save(d)
     }
 

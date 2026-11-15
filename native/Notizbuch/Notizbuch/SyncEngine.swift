@@ -24,6 +24,9 @@ struct RemoteMeta: Codable {
     var folder: String?
     var pdfVersion: Int?
     var pagesVersion: Int?
+    /// Wann Name bzw. Ordner zuletzt geändert wurden (siehe NoteDocument); fehlen bei Einträgen älterer Apps
+    var titleSet: Date?
+    var folderSet: Date?
 }
 
 /// Was dieses Gerät über den Sync-Stand eines Dokuments weiß (liegt als sync.json im Dokumentordner)
@@ -494,20 +497,46 @@ final class SyncEngine: ObservableObject {
                     }
                     continue
                 }
-                if let local {
+                if var local {
+                    // Ändert die offene Leinwand gerade selbst Seiten, ihr nicht dazwischen das PDF austauschen;
+                    // danach ist ihre Seitenänderung die neuere
+                    let restructuring = { self.openController?.doc.id == r.id && self.openController?.isRestructuring == true }
+                    // Ein neueres PDF zuerst holen. Währenddessen kann sich das Dokument hier ändern (umbenannt,
+                    // verschoben, Seiten geändert, gelöscht): Danach zählt sein dann aktueller Stand, sonst ginge
+                    // diese Änderung beim Speichern verloren
+                    var newPDF: Data?
+                    if r.kind == .pdf, r.hasPDF == true, (r.pdfVersion ?? 0) > (local.pdfVersion ?? 0), !restructuring() {
+                        newPDF = try await request("GET", "/api/pdf/\(Self.path(r.id))")
+                        guard let current = store.documents.first(where: { $0.id == r.id }) else { continue }
+                        local = current
+                    }
                     var merged = local
                     var changed = false
                     let remotePages = r.pagesVersion ?? 0, localPages = local.pagesVersion ?? 0
-                    // Ändert die offene Leinwand gerade selbst Seiten, ihr nicht dazwischen das PDF austauschen;
-                    // danach ist ihre Seitenänderung die neuere
-                    let busyHere = openController?.doc.id == r.id && openController?.isRestructuring == true
-                    // Titel, Ordner usw.: letzte Änderung gewinnt
-                    if r.modified.timeIntervalSince1970 > local.modified.timeIntervalSince1970 + 0.001 {
-                        merged.title = r.title
-                        merged.folder = r.folder
+                    let busyHere = restructuring()
+                    let remoteNewer = r.modified.timeIntervalSince1970 > local.modified.timeIntervalSince1970 + 0.001
+                    if remoteNewer {
                         merged.modified = r.modified
                         // Gleicher Seitenstand: Die Seitenzahl wächst nur (Schreiben auf der letzten Seite)
                         if remotePages == localPages { merged.pageCount = max(local.pageCount, r.pageCount) }
+                        changed = true
+                    }
+                    // Name und Ordner: Es gilt, was zuletzt umbenannt bzw. verschoben wurde, auch wenn danach auf einem
+                    // anderen Gerät noch ins Dokument geschrieben wurde (das allein macht den Eintrag nur neuer)
+                    let title = Self.newer(local: local.title, set: local.titleSet, remote: r.title, remoteSet: r.titleSet,
+                                           created: local.created, remoteNewer: remoteNewer)
+                    let folder = Self.newer(local: local.folder, set: local.folderSet, remote: r.folder, remoteSet: r.folderSet,
+                                            created: local.created, remoteNewer: remoteNewer)
+                    if merged.title != title.value { merged.title = title.value; changed = true }
+                    if merged.titleSet != title.set { merged.titleSet = title.set; changed = true }
+                    if merged.folder != folder.value { merged.folder = folder.value; changed = true }
+                    if merged.folderSet != folder.set { merged.folderSet = folder.set; changed = true }
+                    if title.ahead || folder.ahead,
+                       merged.modified.timeIntervalSince1970 <= r.modified.timeIntervalSince1970 + 0.001 {
+                        // Hier liegt der neuere Name oder Ordner, der Server hat (etwa nach dem Schreiben auf einem
+                        // anderen Gerät) einen neueren Eintrag mit dem alten: knapp neuer machen, dann lädt Schritt 3
+                        // ihn hoch und der Server nimmt ihn an
+                        merged.modified = max(merged.modified, r.modified).addingTimeInterval(0.01)
                         changed = true
                     }
                     // Seitenzahl und PDF folgen der neuesten Seitenänderung, unabhängig vom übrigen Stand:
@@ -521,9 +550,8 @@ final class SyncEngine: ObservableObject {
                         structure = true
                     }
                     var pdfChanged = false
-                    if r.kind == .pdf, r.hasPDF == true, (r.pdfVersion ?? 0) > (local.pdfVersion ?? 0), !busyHere {
-                        let pdf = try await request("GET", "/api/pdf/\(Self.path(r.id))")
-                        try pdf.write(to: store.pdfURL(r.id), options: .atomic)
+                    if let newPDF, (r.pdfVersion ?? 0) > (local.pdfVersion ?? 0), !busyHere {
+                        try newPDF.write(to: store.pdfURL(r.id), options: .atomic)
                         merged.pdfVersion = r.pdfVersion
                         changed = true
                         pdfChanged = true
@@ -551,13 +579,16 @@ final class SyncEngine: ObservableObject {
                     store.save(NoteDocument(id: r.id, title: r.title, kind: r.kind, created: r.created,
                                             modified: r.modified, pageCount: max(r.pageCount, 1),
                                             layoutVersion: PageLayout.currentVersion, folder: r.folder,
-                                            pdfVersion: r.pdfVersion, pagesVersion: r.pagesVersion))
+                                            pdfVersion: r.pdfVersion, pagesVersion: r.pagesVersion,
+                                            titleSet: r.titleSet, folderSet: r.folderSet))
                 }
             }
 
             // 3. Eigene Dokumente hochladen, wenn neu oder neuer, oder wenn hier eine neuere Seitenänderung liegt
             //    (der Server übernimmt die dann auch in einen sonst neueren Stand)
-            for local in store.documents {
+            for id in store.documents.map(\.id) {
+                // Der aktuelle Stand: Während der Uploads davor kann sich das Dokument geändert haben (oder ist gelöscht)
+                guard let local = store.documents.first(where: { $0.id == id }) else { continue }
                 let r = remoteByID[local.id]
                 let metaNewer = r == nil || local.modified.timeIntervalSince1970 > r!.modified.timeIntervalSince1970 + 0.001
                 let pagesNewer = (local.pagesVersion ?? 0) > (r?.pagesVersion ?? 0)
@@ -568,7 +599,12 @@ final class SyncEngine: ObservableObject {
                     let pdf = try Data(contentsOf: store.pdfURL(local.id))
                     _ = try await request("PUT", "/api/pdf/\(Self.path(local.id))", body: pdf, contentType: "application/pdf")
                 }
-                _ = try await request("PUT", "/api/library/\(Self.path(local.id))", body: try Self.encoder.encode(local))
+                // Immer mit den Zeitpunkten für Name und Ordner (nie geändert: der des Anlegens). Daran erkennen die
+                // anderen Geräte einen Eintrag dieser App-Version; ohne sie gilt wie bei älteren Apps der neuere Eintrag
+                var upload = local
+                if upload.titleSet == nil { upload.titleSet = upload.created }
+                if upload.folderSet == nil { upload.folderSet = upload.created }
+                _ = try await request("PUT", "/api/library/\(Self.path(local.id))", body: try Self.encoder.encode(upload))
                 pdfUploadPending.remove(local.id)
             }
 
@@ -585,6 +621,19 @@ final class SyncEngine: ObservableObject {
         } catch {
             status = error.localizedDescription
         }
+    }
+
+    /// Name oder Ordner beim Abgleich der Bibliothek. Es gilt der zuletzt vergebene (`set`, fehlt = seit dem Anlegen
+    /// nicht geändert), egal wo danach noch geschrieben wurde. Fehlt der Zeitpunkt am Server (Eintrag einer älteren
+    /// App), oder sind beide gleich alt, gilt wie bisher der neuere Eintrag (`remoteNewer`).
+    /// Ergebnis: der Wert, der hier zu speichernde Zeitpunkt, und ob hier der neuere Stand liegt, den der Server noch nicht hat
+    static func newer<T: Equatable>(local: T, set: Date?, remote: T, remoteSet: Date?, created: Date,
+                                    remoteNewer: Bool) -> (value: T, set: Date?, ahead: Bool) {
+        guard let remoteSet else { return (remoteNewer ? remote : local, set, false) }
+        let mine = (set ?? created).timeIntervalSince1970, theirs = remoteSet.timeIntervalSince1970
+        if theirs > mine + 0.001 { return (remote, remoteSet, false) }
+        if mine > theirs + 0.001 { return (local, set, local != remote) }
+        return (remoteNewer ? remote : local, set, false)
     }
 
     /// Merkt ein lokal gelöschtes Dokument vor, damit es auch auf den anderen Geräten verschwindet
