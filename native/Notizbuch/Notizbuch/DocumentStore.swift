@@ -259,6 +259,11 @@ final class DocumentStore: ObservableObject {
         }
     }
 
+    /// Wartet, bis alles bisher zum Schreiben Angestoßene auf der Platte ist (hält so lange an, also nur selten nutzen)
+    func waitForWrites() {
+        io.sync {}
+    }
+
     /// Seiten wurden gelöscht oder eingefügt (bei PDFs auch das PDF selbst geändert): Die anderen Geräte
     /// übernehmen Seitenzahl bzw. PDF, weil diese Version neuer ist als ihre
     /// Neue Seitenversion samt neuer Seitenzahl, beides sofort in den Metadaten: Die Seitenzahl aus dem
