@@ -189,9 +189,10 @@ final class SyncEngine: ObservableObject {
     private var remoteSeqs: [UUID: Int] = [:]
 
     /// Dokumente mit Strichen am Server, die dieses Gerät noch nicht geholt hat (etwa weil ihr Abgleich eben
-    /// fehlschlug). Das Aufräumen von temp lässt sie stehen: Sein Grabstein löschte diese Striche sonst auch am Server
+    /// fehlschlug), und solche, deren Abgleich gerade läuft (seine Antwort kann Neues bringen). Das Aufräumen von temp
+    /// lässt sie stehen: Sein Grabstein löschte diese Striche sonst auch am Server
     var unfetched: Set<UUID> {
-        Set(remoteSeqs.compactMap { id, seq in seq > (states[id]?.seq ?? 0) ? id : nil })
+        Set(remoteSeqs.compactMap { id, seq in seq > (states[id]?.seq ?? 0) ? id : nil }).union(busy)
     }
 
     init(store: DocumentStore) {
@@ -651,9 +652,9 @@ final class SyncEngine: ObservableObject {
                         var touched = local
                         touched.modified = max(Date(), r.modified.addingTimeInterval(0.01))
                         store.save(touched)
-                    } else if unchanged, !isOpen, !busy.contains(r.id) {
-                        // (Läuft gerade ein Abgleich seiner Striche, etwa der eben geschlossenen Leinwand, entscheidet
-                        // der nächste Abgleich, mit dessen Antwort)
+                    } else if unchanged, !isOpen, !busy.contains(r.id), foreignArrivals[r.id] == arrivalsBefore[r.id] {
+                        // (Läuft gerade ein Abgleich seiner Striche, etwa der eben geschlossenen Leinwand, oder kamen
+                        // während der Abfrage fremde Striche an, entscheidet der nächste Abgleich, mit frischer Abfrage)
                         states[r.id] = nil
                         bulks[r.id] = nil
                         pageTargets[r.id] = nil
