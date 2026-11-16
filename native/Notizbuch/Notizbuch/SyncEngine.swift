@@ -181,6 +181,9 @@ final class SyncEngine: ObservableObject {
     private var foreignWhileOpen: Set<UUID> = [] {
         didSet { UserDefaults.standard.set(foreignWhileOpen.map(\.uuidString), forKey: "syncForeignWhileOpen") }
     }
+    /// Wie oft fremde Striche ankamen, je Dokument (nur im Speicher): Schritt 2 erkennt daran, was erst während seiner
+    /// Abfrage ankam
+    private var foreignArrivals: [UUID: Int] = [:]
 
     /// Höchste Änderungsnummer der Striche je Dokument laut letzter Abfrage der Bibliothek
     private var remoteSeqs: [UUID: Int] = [:]
@@ -468,7 +471,11 @@ final class SyncEngine: ObservableObject {
                 state.seq = response.seq
                 if fresh, !refetching.contains(id) {
                     if !foreignSince.contains(id) { foreignSince.insert(id) }
-                    if openController?.doc.id == id, !foreignWhileOpen.contains(id) { foreignWhileOpen.insert(id) }
+                    foreignArrivals[id, default: 0] += 1
+                    // Auch wenn die Antwort erst nach dem Schließen ankommt: Gefragt hat die offene Leinwand
+                    if startedOpen || openController?.doc.id == id, !foreignWhileOpen.contains(id) {
+                        foreignWhileOpen.insert(id)
+                    }
                 }
                 if refetching.contains(id) { refetching.remove(id) }
                 deliver(changes, to: id)
@@ -590,6 +597,7 @@ final class SyncEngine: ObservableObject {
             var seqBefore: [UUID: Int] = [:]
             for doc in store.documents { seqBefore[doc.id] = state(doc.id).seq }
             let lostBefore = lostAtServer
+            let arrivalsBefore = foreignArrivals
             struct Library: Decodable { var docs: [RemoteMeta] }
             let remote = try Self.decoder.decode(Library.self, from: try await request("GET", "/api/library")).docs
             var remoteByID: [UUID: RemoteMeta] = [:]
@@ -643,7 +651,9 @@ final class SyncEngine: ObservableObject {
                         var touched = local
                         touched.modified = max(Date(), r.modified.addingTimeInterval(0.01))
                         store.save(touched)
-                    } else if unchanged, !isOpen {
+                    } else if unchanged, !isOpen, !busy.contains(r.id) {
+                        // (Läuft gerade ein Abgleich seiner Striche, etwa der eben geschlossenen Leinwand, entscheidet
+                        // der nächste Abgleich, mit dessen Antwort)
                         states[r.id] = nil
                         bulks[r.id] = nil
                         pageTargets[r.id] = nil
@@ -656,8 +666,12 @@ final class SyncEngine: ObservableObject {
                     }
                     continue
                 }
-                if foreignSince.contains(r.id) { foreignSince.remove(r.id) }
-                if foreignWhileOpen.contains(r.id) { foreignWhileOpen.remove(r.id) }
+                // Gültig: Fremdes von davor zählt nicht mehr. Kam erst während der Abfrage etwas an, bleibt es vermerkt,
+                // denn es kann nach einem Grabstein geschrieben sein, den sie noch nicht zeigt
+                if foreignArrivals[r.id] == arrivalsBefore[r.id] {
+                    if foreignSince.contains(r.id) { foreignSince.remove(r.id) }
+                    if foreignWhileOpen.contains(r.id) { foreignWhileOpen.remove(r.id) }
+                }
                 if lostAtServer.contains(r.id), lostBefore.contains(r.id) {
                     // Gilt wieder, nachdem der Server die Striche gelöscht hat: zurückgeholt (nur die Antwort ging
                     // verloren), oder ein Eintrag hat den Grabstein ersetzt. Nur was schon vor der Abfrage vermerkt war:
