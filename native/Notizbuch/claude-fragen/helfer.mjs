@@ -5,12 +5,13 @@
 // (claude -p, je Dokument ein eigener, fortgesetzter Chat), Antwort an den Server schicken.
 //
 // Der Schlüssel des Servers steht nur in config.json (Rechte 600). Er wird nie ausgegeben, nie geloggt
-// und nie an Claude weitergegeben: Claude bekommt nur das Werkzeug Read und den Ordner des Dokuments.
+// und nie an Claude weitergegeben: Claude bekommt nur das Werkzeug Read, und lesen darf es nur im Ordner des
+// Dokuments (sein Chat-Ordner unter chats/), nichts sonst auf dem Mac.
 //
 // Braucht Node 18 oder neuer; ab Node 22 kommt eine neue Frage sofort an (WebSocket), sonst spätestens
 // nach 30 Sekunden.
 
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -22,6 +23,7 @@ const CONFIG_FILE = path.join(HOME, "config.json");
 const STATE_FILE = path.join(HOME, "state.json");
 const LOG_FILE = path.join(HOME, "helfer.log");
 const CHATS = path.join(HOME, "chats");
+const OSASCRIPT = process.env.BETTERNOTES_HELFER_OSASCRIPT || "/usr/bin/osascript";
 
 const DEFAULTS = {
   // Aufwand je Menüpunkt: „Claude fragen“ = quick, „Claude gründlich fragen“ = thorough
@@ -32,7 +34,31 @@ const DEFAULTS = {
   // Nach einem Fehler am Mac: neuer Versuch nach so vielen Sekunden; am Nutzungslimit mindestens so lange Pause
   retrySeconds: 60,
   minPauseSeconds: 60,
+  // Claude Code im eingeschränkten Modus (--restricted: nur der Chat-Ordner, keine Einstellungen von außen), wenn
+  // die installierte Version ihn kennt. false: nie
+  restricted: true,
 };
+
+// Seiten um die Frage aus dem PDF (macOS: PDFKit über JavaScript for Automation). Ein Auszug von höchstens
+// 10 Seiten kann Claude ohne weitere Programme lesen, ein ganzes Buch nicht
+const PAGES_SCRIPT = `ObjC.import("Foundation");
+ObjC.import("PDFKit");
+function run(argv) {
+  const doc = $.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(argv[0]));
+  if (!doc || doc.isNil()) return "Fehler: PDF lässt sich nicht öffnen";
+  const n = doc.pageCount;
+  const first = Math.max(0, Number(argv[2])), last = Math.min(n - 1, Number(argv[3]));
+  const out = $.PDFDocument.alloc.init;
+  let j = 0;
+  for (let i = first; i <= last; i++) {
+    const page = doc.pageAtIndex(i);
+    if (!page || page.isNil()) continue;
+    out.insertPageAtIndex(page.copy, j++);
+  }
+  if (j === 0) return "leer " + n;
+  if (!out.writeToFile(argv[1])) return "Fehler: Auszug lässt sich nicht schreiben";
+  return "ok " + (first + 1) + " " + (last + 1) + " " + n;
+}`;
 
 // ---------- Protokoll ----------
 
@@ -369,7 +395,42 @@ async function fetchFiles(job, dir) {
     saveState(state);
   }
   files.pdf = job.doc.hasPDF && fs.existsSync(pdf) ? "dokument.pdf" : null;
+  if (files.pdf) Object.assign(files, await pageWindow(job, pdf, qdir, dir));
   return files;
+}
+
+/// Die Seiten um die Frage als eigenes kleines PDF: „Claude fragen“ zwei bis drei Seiten davor und eine danach,
+/// „gründlich“ bis zu sieben davor und zwei danach. Gibt { window, first, last, total } (Seiten ab 1) zurück; ist
+/// das ganze PDF klein (höchstens 10 Seiten), nur { total }, dann liest Claude es ganz. Ohne macOS oder wenn PDFKit
+/// scheitert: {} (Claude bekommt dann nur das ganze PDF)
+async function pageWindow(job, pdf, qdir, dir) {
+  const q = job.anchor.page;
+  const [before, after] = job.effort === "thorough" ? [7, 2] : [3, 1];
+  const target = path.join(qdir, "seiten.pdf");
+  const script = path.join(HOME, "seiten.js");
+  try {
+    if (!fs.existsSync(script) || fs.readFileSync(script, "utf8") !== PAGES_SCRIPT) fs.writeFileSync(script, PAGES_SCRIPT);
+    const out = await new Promise((resolve, reject) => {
+      execFile(OSASCRIPT, ["-l", "JavaScript", script, pdf, target, String(q - before), String(q + after)],
+        { timeout: 120000, env: cleanEnv() }, (err, stdout, stderr) => (err ? reject(new Error((stderr || err.message).trim())) : resolve(stdout.trim())));
+    });
+    const m = out.match(/^(ok|leer) (\d+)(?: (\d+) (\d+))?$/);
+    if (!m) throw new Error(out || "keine Ausgabe");
+    const total = Number(m[1] === "ok" ? m[4] : m[2]);
+    if (m[1] === "leer" || total <= 10) {
+      fs.rmSync(target, { force: true });
+      return { total };
+    }
+    const first = Number(m[2]), last = Number(m[3]);
+    const name = `seiten-${first}-${last}.pdf`;
+    fs.renameSync(target, path.join(qdir, name));
+    return { window: path.relative(dir, path.join(qdir, name)), first, last, total };
+  } catch (e) {
+    if (!pageWindow.warned) log("Seiten um die Frage nicht ausgeschnitten:", e.message);
+    pageWindow.warned = true;
+    fs.rmSync(target, { force: true });
+    return {};
+  }
 }
 
 // ---------- Claude ----------
@@ -380,7 +441,7 @@ erscheint in der App als Markierung neben der Frage; tippt er sie an, liest er s
 
 So gehst du vor:
 - Sieh dir zuerst mit dem Werkzeug Read das Bild der Frage an, dann die ganze Seite, auf der sie steht (die Frage ist \
-dort farbig umrandet). Lies das Dokument (dokument.pdf, falls vorhanden), soweit es für die Antwort hilft.
+dort farbig umrandet). Lies dann die Seiten um die Frage und, soweit es für die Antwort hilft, mehr vom Dokument.
 - Antworte in der Sprache der Frage, direkt und ohne Einleitung. Stell keine Rückfragen: Ist etwas unklar oder \
 unleserlich, sag kurz, wie du es gelesen hast, und antworte darauf.
 - Format: Markdown. Formeln in LaTeX, $…$ im Text und $$…$$ abgesetzt. Kein HTML, keine Bilder, keine Links und \
@@ -393,9 +454,13 @@ function prompt(job, files, fresh) {
   const pages = job.doc.pageCount ? ` mit ${job.doc.pageCount} Seiten` : "";
   const doc = state.docs[job.doc.id] || {};
   const lines = [];
+  const total = files.total ? ` mit ${files.total} Seiten` : pages;
   if (fresh) {
-    lines.push(`Dokument: „${job.doc.title || "ohne Titel"}“ (${kind}${pages}).`);
-    if (files.pdf) lines.push(`Das ganze Dokument liegt in ${files.pdf}.`);
+    lines.push(`Dokument: „${job.doc.title || "ohne Titel"}“ (${kind}${total}).`);
+    if (files.pdf && !files.window) lines.push(`Das ganze Dokument liegt in ${files.pdf}.`);
+    if (files.window) {
+      lines.push(`Das ganze Dokument liegt in ${files.pdf} (weitere Seiten mit Read und dem Parameter pages).`);
+    }
     lines.push("");
     lines.push("Frage:");
   } else {
@@ -404,6 +469,7 @@ function prompt(job, files, fresh) {
   }
   lines.push(`- ${files.question}: die handgeschriebene Frage`);
   lines.push(`- ${files.page}: die ganze Seite ${job.anchor.page + 1}, die Frage darauf farbig umrandet`);
+  if (files.window) lines.push(`- ${files.window}: die Seiten ${files.first} bis ${files.last} des Dokuments, um die Frage herum`);
   lines.push("");
   lines.push(
     job.effort === "thorough"
@@ -414,6 +480,7 @@ function prompt(job, files, fresh) {
 }
 
 async function askClaude(job, dir, files, level) {
+  const caps = await claudeCaps;
   const doc = (state.docs[job.doc.id] = state.docs[job.doc.id] || {});
   for (let attempt = 0; attempt < 2; attempt++) {
     const fresh = !doc.session;
@@ -421,8 +488,11 @@ async function askClaude(job, dir, files, level) {
     const args = [
       "-p", prompt(job, files, fresh),
       "--output-format", "json",
+      // Nur Read, und nur im Chat-Ordner: Lesen anderswo bräuchte eine Erlaubnis, und dontAsk lehnt alles ab, was
+      // fragen müsste (ohne diese Einstellung fragt -p nicht und lehnt ebenso ab)
       "--tools", "Read",
-      "--allowedTools", "Read",
+      ...(caps.dontAsk ? ["--permission-mode", "dontAsk"] : []),
+      ...(caps.restricted && config.restricted !== false ? ["--restricted"] : []),
       "--strict-mcp-config",
       "--append-system-prompt", SYSTEM,
       "--max-turns", "30",
@@ -450,13 +520,17 @@ async function askClaude(job, dir, files, level) {
   return { ok: false, error: "Chat konnte nicht fortgesetzt werden" };
 }
 
+/// Die Umgebung ohne Werte des Helfers (für Claude und andere Programme)
+function cleanEnv() {
+  const env = { ...process.env };
+  for (const k of Object.keys(env)) if (/^(NOTIZBUCH|BETTERNOTES)_/i.test(k)) delete env[k];
+  return env;
+}
+
 function runClaude(args, cwd, minutes) {
   return new Promise((resolve) => {
-    // Keine Werte des Helfers an Claude weitergeben
-    const env = { ...process.env };
-    for (const k of Object.keys(env)) if (/^(NOTIZBUCH|BETTERNOTES)_/i.test(k)) delete env[k];
     fs.mkdirSync(cwd, { recursive: true });
-    const child = spawn(config.claude, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(config.claude, args, { cwd, env: cleanEnv(), stdio: ["ignore", "pipe", "pipe"] });
     if (current) current.child = child;
     let out = "", err = "", timedOut = false;
     child.stdout.on("data", (d) => (out += d));
@@ -529,6 +603,18 @@ process.on("SIGTERM", () => {
   if (current?.child) stop(current.child);
   log("beendet");
   process.exit(0);
+});
+
+/// Was die installierte Version von Claude Code kann (einmal beim Start, aus claude --help)
+const claudeCaps = new Promise((resolve) => {
+  execFile(config.claude, ["--help"], { timeout: 60000, env: cleanEnv() }, (err, stdout) => {
+    const help = String(stdout || "");
+    const caps = { restricted: /--restricted\b/.test(help), dontAsk: /dontAsk/.test(help) };
+    log(`Claude Code: ${err && !help ? "nicht gefunden" : "da"}` +
+      `, eingeschränkter Modus ${caps.restricted ? (config.restricted !== false ? "an" : "aus (config)") : "nicht verfügbar"}` +
+      `, dontAsk ${caps.dontAsk ? "ja" : "nein"}`);
+    resolve(caps);
+  });
 });
 
 fs.mkdirSync(CHATS, { recursive: true });
