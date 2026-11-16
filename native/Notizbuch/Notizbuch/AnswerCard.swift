@@ -27,6 +27,8 @@ final class AnswerCardController: UIHostingController<AnswerCard> {
     init(model: AnswerCardModel) {
         self.model = model
         super.init(rootView: AnswerCard(model: model, asks: model.asks))
+        // Wie die ganze App immer hell (auch die Seite mit der Antwort ist für hellen Grund gemacht)
+        overrideUserInterfaceStyle = .light
     }
 
     @MainActor required dynamic init?(coder aDecoder: NSCoder) { fatalError("init(coder:) wird nicht verwendet") }
@@ -193,6 +195,8 @@ struct AnswerWebView: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.dataDetectorTypes = []
+        // Nichts bleibt liegen (keine Cookies, kein Cache)
+        config.websiteDataStore = .nonPersistent()
         let web = WKWebView(frame: .zero, configuration: config)
         web.isOpaque = false
         web.backgroundColor = .clear

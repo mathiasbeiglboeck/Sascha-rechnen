@@ -2031,3 +2031,99 @@ extension CanvasController: UIGestureRecognizerDelegate {
         present(card, animated: true)
     }
 }
+
+#if DEBUG
+// MARK: Nur für Tests im Simulator (Debug-Build)
+
+extension CanvasController {
+    /// Befehle über Links, etwa `xcrun simctl openurl booted "notizbuch://debug/ask?page=1"`:
+    /// - `debug/ask?page=N&effort=quick|thorough`: Frage zu Seite N wie mit dem Lasso (steht dort nichts, erst Probeschrift)
+    /// - `debug/card?ask=<id>|first|last`: Karte der Frage zeigen
+    /// - `debug/delete?ask=<id>|first|last`: Markierung löschen
+    /// - `debug/pages?delete=N`, `?insert=N`, `?undo`, `?done`: Seiten ändern, Rückgängig, Rückgängig verwerfen
+    /// - `debug/state`: nur den Stand
+    /// Danach steht der Stand der Fragen im Protokoll („Asks-Debug: …“)
+    func debugCommand(_ url: URL) {
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func value(_ name: String) -> String? { items.first { $0.name == name }?.value }
+        func has(_ name: String) -> Bool { items.contains { $0.name == name } }
+        let log: (String) -> Void = { NSLog("Asks-Debug: %@", $0) }
+        let list = sync.asks.asks(doc.id)
+        func pick() -> String? {
+            switch value("ask") {
+            case nil, "first"?: return list.first?.id
+            case "last"?: return list.last?.id
+            case let id?: return id
+            }
+        }
+        switch url.path {
+        case "/ask":
+            guard k > 0, let n = value("page").flatMap({ Int($0) }), layout.frames.indices.contains(n) else {
+                return log("ask: keine solche Seite")
+            }
+            let frame = layout.frames[n]
+            let toCanvas = CGAffineTransform(scaleX: k, y: k)
+            let pageArea = frame.applying(toCanvas)
+            var onPage = canvas.drawing.strokes.filter {
+                pageArea.contains(CGPoint(x: $0.renderBounds.midX, y: $0.renderBounds.midY))
+            }
+            if onPage.isEmpty {
+                // Probeschrift: drei Wellenlinien oben links auf der Seite
+                let strokes = (0..<3).map { line -> PKStroke in
+                    let y0 = frame.minY + 120 + CGFloat(line) * 40
+                    let points = (0...65).map { i -> PKStrokePoint in
+                        let x = CGFloat(i) * 4
+                        let p = CGPoint(x: frame.minX + 80 + x, y: y0 + 10 * sin(x / 12)).applying(toCanvas)
+                        return PKStrokePoint(location: p, timeOffset: Double(i) * 0.01, size: CGSize(width: 3 * k, height: 3 * k),
+                                             opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2)
+                    }
+                    return PKStroke(ink: PKInk(.pen, color: .black), path: PKStrokePath(controlPoints: points, creationDate: Date()))
+                }
+                canvas.drawing.strokes.append(contentsOf: strokes)
+                onPage = strokes
+            }
+            // Ein Lasso als Rechteck um die Schrift der Seite, in Seitenpunkten
+            let box = onPage.reduce(CGRect.null) { $0.union($1.renderBounds) }.applying(toPage).insetBy(dx: -16, dy: -16)
+            let corners = [CGPoint(x: box.minX, y: box.minY), CGPoint(x: box.maxX, y: box.minY),
+                           CGPoint(x: box.maxX, y: box.maxY), CGPoint(x: box.minX, y: box.maxY)]
+            lassoPath = LassoPath(points: corners, bounds: box, inkPrint: inkPrint(near: box))
+            askClaude(effort: value("effort") ?? "quick", from: SelectionMenuContext(space: nil, sourcePoint: .zero))
+            log("ask: Seite \(n), \(onPage.count) Striche")
+        case "/card":
+            guard let id = pick() else { return log("card: keine Frage") }
+            showAnswer(id)
+            log("card: \(id)")
+        case "/delete":
+            guard let id = pick() else { return log("delete: keine Frage") }
+            sync.asks.delete(doc.id, id)
+            log("delete: \(id)")
+        case "/pages":
+            let done: (String?) -> Void = { log("pages: \($0 ?? "ok")") }
+            if let n = value("delete").flatMap({ Int($0) }) {
+                deletePages([n], done: done)
+            } else if let n = value("insert").flatMap({ Int($0) }) {
+                insertBlankPage(at: n, done: done)
+            } else if has("undo") {
+                undoPageChange(done: done)
+            } else if has("done") {
+                discardPageUndo()
+                log("pages: Rückgängig verworfen")
+            }
+        case "/state":
+            break
+        default:
+            log("unbekannter Befehl \(url.path)")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            let state = self.sync.asks.asks(self.doc.id).map { a in
+                "\(a.id.prefix(8)) \(a.status) Seite \(a.anchor.page) pv \(a.pv)"
+                    + (a.hidden == true ? " versteckt" : "") + (a.deleting == true ? " löscht" : "")
+                    + (a.moved == true ? " verschoben" : "") + (a.localNote.map { " (\($0))" } ?? "")
+            }
+            log("Stand: pv \(self.currentPagesVersion), \(self.askOverlay.subviews.count) Markierungen: "
+                + state.joined(separator: "; "))
+        }
+    }
+}
+#endif

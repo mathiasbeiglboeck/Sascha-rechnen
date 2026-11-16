@@ -146,6 +146,12 @@ struct EditorView: View {
         .animation(.easeOut(duration: 0.2), value: tools.menuCollapsed)
         .animation(.easeOut(duration: 0.2), value: tools.flash)
         .animation(.easeOut(duration: 0.2), value: tabsShown)
+        #if DEBUG
+        // Nur für Tests im Simulator: notizbuch://debug/… (CanvasController.debugCommand)
+        .onOpenURL { url in
+            if url.scheme == "notizbuch", url.host == "debug" { tools.canvas?.debugCommand(url) }
+        }
+        #endif
     }
 }
 
