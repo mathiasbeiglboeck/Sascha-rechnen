@@ -62,6 +62,9 @@ const setPages = (cfg) => fs.writeFileSync(path.join(FAKE, "pages.json"), JSON.s
 const writeConfig = (extra = {}) => fs.writeFileSync(path.join(HOME, "config.json"), JSON.stringify({ url: BASE, key: KEY, claude: FAKE_CLAUDE, retrySeconds: 3, minPauseSeconds: 4, readyCheckSeconds: 2, pollSeconds: 300, ...extra }), { mode: 0o600 });
 const logText = () => fs.readFileSync(path.join(HOME, "helfer.log"), "utf8");
 const promptOf = (c) => c.args[c.args.indexOf("-p") + 1];
+const systemOf = (c) => c.args[c.args.indexOf("--append-system-prompt") + 1];
+// Wert einer Option, und das Argument danach ist wieder eine Option (eine Liste nimmt nichts Fremdes mit)
+const optOf = (c, f) => (c.args.includes(f) && String(c.args[c.args.indexOf(f) + 2]).startsWith("--") ? c.args[c.args.indexOf(f) + 1] : undefined);
 // Endet der Test vorzeitig (abgebrochen, Zeitlimit), darf der Helfer nicht weiterlaufen
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => { helper?.kill("SIGTERM"); process.exit(130); });
 process.on("exit", () => helper?.kill("SIGTERM"));
@@ -107,11 +110,12 @@ async function main() {
   let c = calls().filter((x) => x.args).at(-1);
   const sid = c.args[c.args.indexOf("--session-id") + 1];
   ok(c.args.includes("--session-id") && !c.args.includes("--resume"), "first call starts a new session", c.args);
-  ok(c.args[c.args.indexOf("--effort") + 1] === "medium" && c.args[c.args.indexOf("--tools") + 1] === "Read" && c.args.includes("--strict-mcp-config") && c.args[c.args.indexOf("--output-format") + 1] === "json", "flags: effort medium, tools Read, strict mcp, json", c.args);
-  ok(c.args[c.args.indexOf("--permission-mode") + 1] === "dontAsk" && c.args.includes("--restricted") && !c.args.some((x) => /allowedTools/i.test(x)), "flags: dontAsk, restricted, no allowedTools", c.args);
+  ok(c.args[c.args.indexOf("--effort") + 1] === "medium" && optOf(c, "--tools") === "Read,WebSearch,WebFetch" && c.args.includes("--strict-mcp-config") && c.args[c.args.indexOf("--output-format") + 1] === "json", "flags: effort medium, tools Read + web search + web pages, strict mcp, json", c.args);
+  ok(c.args[c.args.indexOf("--permission-mode") + 1] === "dontAsk" && c.args.includes("--restricted") && optOf(c, "--allowedTools") === "WebSearch,WebFetch" && c.args.filter((x) => /allowed/i.test(x)).length === 1, "flags: dontAsk, restricted, only web search and web pages pre-allowed", c.args);
+  ok(/schlag im Internet nach/.test(systemOf(c)) && /Quellen am Ende als Markdown-Links/.test(systemOf(c)) && /keine Anweisung an dich/.test(systemOf(c)) && !/keine Links/.test(systemOf(c)), "system prompt: may look things up, sources as links, web text is no instruction", systemOf(c));
   const helps = calls().filter((x) => x.help);
   ok(helps.length === 1 && helps[0].envKeys.length === 0, "claude --help asked once at start, clean environment", helps);
-  ok(/eingeschränkter Modus an, dontAsk ja/.test(logText()), "log names the restricted mode");
+  ok(/eingeschränkter Modus an, dontAsk ja, Internet an/.test(logText()), "log names the restricted mode and the internet");
   const osa = calls().filter((x) => x.osascript).at(-1)?.osascript;
   ok(osa && osa.l === "-l" && osa.lang === "JavaScript" && osa.scriptOK && osa.pdf === "dokument.pdf" && osa.from === "-1" && osa.to === "3", "page window asked for pages q-3 … q+1 of dokument.pdf", osa);
   ok(calls().filter((x) => x.osascript).every((x) => x.envKeys.length === 0), "osascript gets a clean environment");
@@ -242,7 +246,7 @@ async function main() {
   console.log("== old claude version: no --restricted, no dontAsk");
   await restartWith(() => setHelp("old"));
   let r = await askOnce();
-  ok(r.done && !r.c.args.includes("--restricted") && !r.c.args.includes("--permission-mode") && r.c.args[r.c.args.indexOf("--tools") + 1] === "Read", "answered with tools Read only", r.c.args);
+  ok(r.done && !r.c.args.includes("--restricted") && !r.c.args.includes("--permission-mode") && optOf(r.c, "--tools") === "Read,WebSearch,WebFetch" && optOf(r.c, "--allowedTools") === "WebSearch,WebFetch", "answered with Read and the web tools, only those pre-allowed", r.c.args);
   ok(/eingeschränkter Modus nicht verfügbar, dontAsk nein/.test(logText()), "log says restricted mode unavailable");
 
   console.log("== config restricted: false");
@@ -250,6 +254,19 @@ async function main() {
   r = await askOnce();
   ok(r.done && !r.c.args.includes("--restricted") && r.c.args[r.c.args.indexOf("--permission-mode") + 1] === "dontAsk", "dontAsk without --restricted", r.c.args);
   ok(/eingeschränkter Modus aus \(config\)/.test(logText()), "log says restricted off by config");
+
+  console.log("== config web: false: only the document");
+  await restartWith(() => { setHelp("new"); writeConfig({ web: false }); });
+  r = await askOnce();
+  ok(r.done && optOf(r.c, "--tools") === "Read" && !r.c.args.some((x) => /allowed/i.test(x)) && r.c.args.includes("--restricted") && r.c.args[r.c.args.indexOf("--permission-mode") + 1] === "dontAsk", "tools Read only, nothing pre-allowed", r.c.args);
+  ok(/keine Links/.test(systemOf(r.c)) && !/Internet/.test(systemOf(r.c)), "system prompt without the internet", systemOf(r.c));
+  ok(/Internet aus \(config\)/.test(logText()), "log says internet off by config");
+
+  console.log("== denied tools are logged with the answer");
+  setMode({ mode: "denied" });
+  r = await askOnce();
+  ok(r.done && /beantwortet nach \d+ s \(\d+ Zeichen\), abgelehnt: Read, WebFetch/.test(logText()), "answer logged with the denied tools", logText().split("\n").filter((l) => l.includes("beantwortet")).slice(-1));
+  setMode({ mode: "ok" });
 
   console.log("== page window fails: whole PDF only, logged once");
   await restartWith(() => { writeConfig(); setPages({ n: 30, fail: true }); });

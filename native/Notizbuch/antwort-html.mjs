@@ -78,6 +78,7 @@ blockquote { border-left: 3px solid #d1d1d6; padding-left: .8em; color: #3a3a3c;
 table { border-collapse: collapse; display: block; overflow-x: auto; }
 td, th { border: 1px solid #d1d1d6; padding: .25em .5em; }
 hr { border: none; border-top: 1px solid #d1d1d6; }
+a { color: #007aff; text-decoration: none; overflow-wrap: anywhere; }
 .katex { font-size: 1.05em; }
 /* Lange Formeln im Text scrollen für sich, statt die ganze Seite zu verbreitern */
 eq { display: inline-block; max-width: 100%; overflow-x: auto; overflow-y: hidden; vertical-align: middle; }
@@ -95,8 +96,8 @@ section.eqno > span { margin-left: 1em; }
 <script>${script(read(path.join(markdownIt.dir, "dist", "browser", "markdown-it.umd.min.js")))}</script>
 <script>${script(read(path.join(texmath.dir, "texmath.js")))}</script>
 <script>
-// Kein HTML aus der Antwort (wird als Text gezeigt), keine Links und Bilder (nichts lädt aus dem Netz), KaTeX ohne
-// \\href und Co. (trust: false)
+// Kein HTML aus der Antwort (wird als Text gezeigt), keine Bilder (nichts lädt aus dem Netz), KaTeX ohne \\href und
+// Co. (trust: false). Links öffnen erst beim Antippen, im Browser (die App fängt sie ab)
 const macros = { "\\\\R": "\\\\mathbb{R}", "\\\\N": "\\\\mathbb{N}", "\\\\Z": "\\\\mathbb{Z}", "\\\\Q": "\\\\mathbb{Q}",
   "\\\\C": "\\\\mathbb{C}" };
 const katexOptions = { throwOnError: false, strict: "ignore", output: "htmlAndMathml", trust: false, macros };
@@ -111,10 +112,13 @@ for (const set of ["dollars", "brackets"]) {
 // \\[…\\] auch mitten im Absatz, abgesetzt wie $$…$$ (Claude schreibt sie oft direkt unter eine Textzeile)
 texmath.rules.brackets.inline.push({ name: "math_inline_bracket_display", rex: /\\\\\\[([\\s\\S]+?)\\\\\\]/gy,
   tmpl: "<section><eqn>$1</eqn></section>", tag: "\\\\[", displayMode: true });
-// Keine Links, Bilder und Verweise ([x]: …) aus der Antwort: nichts lädt aus dem Netz, und „[0,1]: wachsend“ bleibt Text
-const md = window.markdownit({ html: false, linkify: false, typographer: false })
-  .disable(["link", "image", "autolink", "reference"])
+// Keine Bilder und Verweise ([x]: …) aus der Antwort: nichts lädt aus dem Netz, und „[0,1]: wachsend“ bleibt Text.
+// Links (etwa die Quellen einer Websuche) nur mit http(s), auch als nackte Adresse; „x.de“ ohne https:// bleibt Text
+const md = window.markdownit({ html: false, linkify: true, typographer: false })
+  .disable(["image", "reference"])
   .use(texmath, { engine: katex, delimiters: ["dollars", "brackets"], katexOptions });
+md.validateLink = (url) => /^https?:\\/\\//i.test(url);
+md.linkify.set({ fuzzyLink: false, fuzzyEmail: false, fuzzyIP: false });
 // Das HTML von KaTeX als Funktion einsetzen: als Ersatztext würde replace $&, $$ … darin umdeuten
 const esc = (t) => String(t).replace(/[&<>"']/g, (c) => "&#" + c.charCodeAt(0) + ";");
 for (const set of ["dollars", "brackets"]) {

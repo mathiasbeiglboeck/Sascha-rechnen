@@ -2,7 +2,7 @@
 
 In der Notizbuch-App eine handgeschriebene Frage mit dem Lasso markieren und im Menü **Claude fragen** (knapp) oder **Claude gründlich fragen** wählen. Neben der Frage erscheint eine Sprechblase. Ist die Antwort da, wird sie blau; antippen zeigt die Antwort mit Formeln. Dort lässt sich die Markierung auch wieder löschen, auf allen Geräten. Die Markierungen gibt es nur in der App, nicht im PDF, nicht im Export und nicht im geteilten Link.
 
-Beantwortet wird am Mac: Dieser Helfer läuft dort im Hintergrund und bekommt jede neue Frage sofort vom Notizbuch-Server gemeldet. Er fragt Claude Code (`claude -p`) mit dem Bild der Frage, der ganzen Seite und, bei PDFs, dem Dokument. Bei einem PDF mit mehr als 10 Seiten bekommt Claude zuerst die Seiten um die Frage als eigenes kleines PDF (bei „Claude fragen“ drei davor und eine danach, gründlich sieben davor und zwei danach); das ganze PDF liegt daneben. Je Dokument gibt es einen eigenen Chat, der mit jeder Frage weitergeht: Claude kennt die früheren Fragen zum selben Dokument.
+Beantwortet wird am Mac: Dieser Helfer läuft dort im Hintergrund und bekommt jede neue Frage sofort vom Notizbuch-Server gemeldet. Er fragt Claude Code (`claude -p`) mit dem Bild der Frage, der ganzen Seite und, bei PDFs, dem Dokument. Claude darf dabei im Internet nachschlagen; die Quellen stehen dann als Links unter der Antwort (antippen öffnet sie im Browser). Bei einem PDF mit mehr als 10 Seiten bekommt Claude zuerst die Seiten um die Frage als eigenes kleines PDF (bei „Claude fragen“ drei davor und eine danach, gründlich sieben davor und zwei danach); das ganze PDF liegt daneben. Je Dokument gibt es einen eigenen Chat, der mit jeder Frage weitergeht: Claude kennt die früheren Fragen zum selben Dokument.
 
 Ist der Mac aus oder im Ruhezustand, warten die Fragen am Server und werden beantwortet, sobald er wieder läuft. Ist das Nutzungslimit von Claude erreicht, zeigt die App das an, und der Helfer macht weiter, sobald das Limit vorbei ist (im Zweifel nach 30 Minuten).
 
@@ -22,7 +22,9 @@ Der Server muss die Fragen schon kennen (Server-Update). Sonst steht im Protokol
 
 ## Was Claude dabei darf
 
-Nur lesen, und nur im Ordner des Dokuments (`chats/<Dokument>` im Ordner des Helfers, mit den Bildern der Fragen und dem PDF). Claude Code läuft dafür mit dem einzigen Werkzeug Read, ohne MCP-Server und mit `--permission-mode dontAsk`: Alles, was eine Erlaubnis bräuchte, wird abgelehnt. Keine Befehle, kein Schreiben, kein Internet, kein Zugang zum Server; der Schlüssel des Servers erreicht Claude nicht.
+Lesen, und zwar nur im Ordner des Dokuments (`chats/<Dokument>` im Ordner des Helfers, mit den Bildern der Fragen und dem PDF), und im Internet suchen und Seiten lesen, etwa für Definitionen, Sätze oder Literatur. Claude Code läuft dafür nur mit den Werkzeugen Read, WebSearch und WebFetch, ohne MCP-Server und mit `--permission-mode dontAsk`. Suchen und Seiten lesen sind vorab erlaubt (`--allowedTools WebSearch,WebFetch`); alles andere, was eine Erlaubnis bräuchte, wird abgelehnt, etwa Read außerhalb des Chat-Ordners. Keine Befehle, kein Schreiben, kein Zugang zum Server; der Schlüssel des Servers erreicht Claude nicht.
+
+Was Claude sucht, sieht die Suchmaschine, und eine Seite, die Claude liest, sieht die Anfrage. Claude soll deshalb mit Begriffen und Namen suchen statt mit längeren Passagen aus dem Dokument und Text aus Webseiten oder dem Dokument nicht als Anweisung nehmen. Ganz ohne Internet: `"web": false` in den Einstellungen.
 
 Kennt die installierte Version von Claude Code den eingeschränkten Modus (`--restricted`), läuft jede Frage darin. Dann gelten auch deine eigenen Erlaubnisse aus `~/.claude/settings.json` nicht, etwa eine Regel, die Read überall erlaubt. Ob der Modus an ist, steht beim Start im Protokoll („eingeschränkter Modus an“). Steht dort „nicht verfügbar“: `claude update` und den Helfer neu starten (Einrichten noch einmal ausführen).
 
@@ -44,6 +46,8 @@ In `~/Library/Application Support/BetterNotes-Helfer/config.json`, danach den He
 ```
 
 `effort` ist die Denkstufe von `claude --effort`, `model` ein Modell für `claude --model` (`null`: das Standardmodell), `minutes` die längste Zeit für eine Antwort.
+
+`"web": false` nimmt Claude das Internet: Dann zählt nur das Dokument.
 
 `"restricted": false` schaltet den eingeschränkten Modus ab (nur nötig, falls Claude Code darin nicht antwortet).
 

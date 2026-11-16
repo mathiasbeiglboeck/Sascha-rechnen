@@ -277,7 +277,7 @@ final class AnswerPage: NSObject, WKNavigationDelegate {
         load()
     }
 
-    /// Nur die eingebaute Seite; Links (sollte es keine geben) öffnen im Browser
+    /// Nur die eingebaute Seite; Links (etwa die Quellen einer Websuche, nur http und https) öffnen im Browser
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         let url = navigationAction.request.url

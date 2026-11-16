@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Ersatz für claude in Tests des Helfers: schreibt jeden Aufruf nach $FAKE_STATE/calls.jsonl und antwortet je nach
-// $FAKE_STATE/mode.json ({"mode": "ok" | "rich" | "limit" | "limit-old" | "error" | "auth" | "authexpired" |
-// "refreshlock" | "maxturns", "delayMs": …}). "rich" antwortet mit Formeln, Liste und Code, zum Ansehen der Karte in
-// der App. `claude auth status` sagt angemeldet (Exit 0), wenn $FAKE_STATE/auth.json {"loggedIn": true} enthält
+// $FAKE_STATE/mode.json ({"mode": "ok" | "rich" | "denied" | "limit" | "limit-old" | "error" | "auth" | "authexpired" |
+// "refreshlock" | "maxturns", "delayMs": …}). "rich" antwortet mit Formeln, Liste, Code und Quellen (Links), zum
+// Ansehen der Karte in der App; "denied" antwortet, meldet aber abgelehnte Werkzeuge. `claude auth status` sagt angemeldet (Exit 0), wenn $FAKE_STATE/auth.json {"loggedIn": true} enthält
 const fs = require("fs"), path = require("path");
 const DIR = process.env.FAKE_STATE || path.join(require("os").tmpdir(), "betternotes-fake");
 fs.mkdirSync(DIR, { recursive: true });
@@ -75,6 +75,12 @@ const finish = () => {
     out({ type: "result", subtype: "success", is_error: true, result: "Invalid API key · Please run /login", session_id: session });
     process.exit(1);
   }
+  if (mode.mode === "denied") {
+    out({ type: "result", subtype: "success", is_error: false, result: "Antwort ohne die Datei", session_id: session,
+      permission_denials: [{ tool_name: "Read", tool_use_id: "t1", tool_input: { file_path: "/etc/hosts" } },
+        { tool_name: "WebFetch", tool_use_id: "t2", tool_input: { url: "https://example.com/" } }] });
+    process.exit(0);
+  }
   if (mode.mode === "maxturns") {
     out({ type: "result", subtype: "error_max_turns", is_error: true, session_id: session });
     process.exit(1);
@@ -93,6 +99,8 @@ const finish = () => {
     "Eine sehr lange Formel: $$" + Array.from({ length: 30 }, (_, i) => `a_{${i}} x^{${i}}`).join(" + ") + "$$",
     "",
     "`Code` und > ein Zitat",
+    "",
+    "Quellen: [Produktregel (Wikipedia)](https://de.wikipedia.org/wiki/Produktregel) und https://de.wikipedia.org/wiki/Differentialrechnung",
   ].join("\n");
   out({ type: "result", subtype: "success", is_error: false, result: mode.mode === "rich" ? rich : `Antwort (${get("--effort")}) auf ${files.join(", ")}: $x^2$`, session_id: session });
   process.exit(0);
