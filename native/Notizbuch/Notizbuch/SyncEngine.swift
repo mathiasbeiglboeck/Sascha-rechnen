@@ -652,9 +652,12 @@ final class SyncEngine: ObservableObject {
                         var touched = local
                         touched.modified = max(Date(), r.modified.addingTimeInterval(0.01))
                         store.save(touched)
-                    } else if unchanged, !isOpen, !busy.contains(r.id), foreignArrivals[r.id] == arrivalsBefore[r.id] {
+                    } else if unchanged, !isOpen, !busy.contains(r.id), !store.isWriting(r.id),
+                              foreignArrivals[r.id] == arrivalsBefore[r.id] {
                         // (Läuft gerade ein Abgleich seiner Striche, etwa der eben geschlossenen Leinwand, oder kamen
-                        // während der Abfrage fremde Striche an, entscheidet der nächste Abgleich, mit frischer Abfrage)
+                        // während der Abfrage fremde Striche an, entscheidet der nächste Abgleich, mit frischer Abfrage.
+                        // Ebenso, solange die Zeichnung noch geschrieben wird: Wurde kurz vor dem Schließen noch
+                        // geschrieben, zeigt `modified` das erst danach)
                         states[r.id] = nil
                         bulks[r.id] = nil
                         pageTargets[r.id] = nil

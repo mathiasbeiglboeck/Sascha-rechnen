@@ -48,6 +48,9 @@ final class DocumentStore: ObservableObject {
     private var writing: [UUID: PendingDrawing] = [:]
     private var writes = 0
 
+    /// Wird die Zeichnung gerade geschrieben? Erst danach zeigt `modified`, ob sie hier bearbeitet wurde
+    func isWriting(_ id: UUID) -> Bool { writing[id] != nil }
+
     private struct PendingDrawing {
         let number: Int
         let drawing: PKDrawing
