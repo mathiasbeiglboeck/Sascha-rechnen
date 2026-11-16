@@ -120,13 +120,13 @@ final class DocumentStore: ObservableObject {
     /// Nach so vielen Tagen ohne Änderung wird ein Dokument im temp-Ordner gelöscht
     static let tempDays = 14
 
-    /// Löscht Dokumente im temp-Ordner, die seit `tempDays` Tagen nicht geändert wurden (außer den in Tabs offenen);
-    /// gibt sie zurück. Auch fremde Striche (von anderen Geräten oder Gästen im Browser) zählen als Änderung: Sie
-    /// ändern nur die Zeichnung, nicht `modified`
-    func purgeTemp(keeping open: Set<UUID>) -> [NoteDocument] {
+    /// Löscht Dokumente im temp-Ordner, die seit `tempDays` Tagen nicht geändert wurden (außer denen in `keep`, etwa
+    /// den in Tabs offenen); gibt sie zurück. Auch fremde Striche (von anderen Geräten oder Gästen im Browser) zählen
+    /// als Änderung: Sie ändern nur die Zeichnung, nicht `modified`
+    func purgeTemp(keeping keep: Set<UUID>) -> [NoteDocument] {
         let limit = Date().addingTimeInterval(-Double(Self.tempDays) * 86400)
         let old = documents.filter { doc in
-            guard doc.folder == Self.tempFolder, doc.modified < limit, !open.contains(doc.id), writing[doc.id] == nil
+            guard doc.folder == Self.tempFolder, doc.modified < limit, !keep.contains(doc.id), writing[doc.id] == nil
             else { return false }
             let written = try? drawingURL(doc.id).resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
             return (written ?? .distantPast) < limit
