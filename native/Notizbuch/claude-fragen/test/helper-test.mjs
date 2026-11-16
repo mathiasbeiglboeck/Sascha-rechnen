@@ -328,6 +328,8 @@ async function main() {
   ok(await waitFor(async () => (await askOf(doc, a.id)).status === "answered", 15000, 200), "answered on the retry");
 
   console.log("== logged out: released with a note, pause until logged in again, one notification");
+  // Langer Abstand für neue Versuche: Die Frage darf trotzdem nicht am Server warten, wenn die Anmeldung wieder da ist
+  await restartWith(() => writeConfig({ retrySeconds: 60 }));
   const notesBefore = calls().filter((x) => x.notify).length;
   fs.writeFileSync(path.join(FAKE, "auth.json"), JSON.stringify({ loggedIn: false }));
   setMode({ mode: "authexpired" });
@@ -344,8 +346,9 @@ async function main() {
   ok(calls().some((x) => x.authStatus === false), "login state checked meanwhile (claude auth status)");
   setMode({ mode: "ok" });
   fs.writeFileSync(path.join(FAKE, "auth.json"), JSON.stringify({ loggedIn: true }));
+  const tLogin = Date.now();
   const back = await waitFor(async () => (await askOf(doc, a.id)).status === "answered" && (await askOf(doc, b2.id)).status === "answered", 20000, 300);
-  ok(back && /wieder angemeldet/.test(logText()), "after logging in both are answered within seconds");
+  ok(back && /wieder angemeldet/.test(logText()) && Date.now() - tLogin < 8000, `after logging in both are answered within seconds (${((Date.now() - tLogin) / 1000).toFixed(1)} s, retrySeconds 60)`);
 
   helper.kill("SIGTERM");
   const logPath = path.join(HOME, "helfer.log");

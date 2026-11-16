@@ -359,10 +359,10 @@ async function answer(ask) {
         (result.denied?.length ? `, abgelehnt: ${result.denied.join(", ")}` : ""));
     } else if (result.auth || result.setup) {
       // Abgemeldet oder nicht installiert: Ein neuer Versuch hilft erst danach. Pause, bis es wieder geht (höchstens
-      // 30 Minuten), Hinweis in der App und am Mac. Die Frage selbst wartet nur kurz: Ein neu gestarteter Helfer
-      // nimmt sie gleich
+      // 30 Minuten), Hinweis in der App und am Mac. Die Frage selbst wartet nicht am Server: Dieser Helfer nimmt sie
+      // gleich nach dem Anmelden, ein neu gestarteter sofort
       pauseUntilReady(result.auth ? "auth" : "setup");
-      await reply(ask.id, { claim: job.claim, release: true, retryAfter: config.retrySeconds, note: result.error });
+      await reply(ask.id, { claim: job.claim, release: true, retryAfter: 0, note: result.error });
       log(ask.id, result.auth ? `Claude am Mac ist abgemeldet, Pause bis zur Anmeldung (${result.detail})`
         : "Claude Code fehlt, Pause bis es da ist");
       notifyMac(result.auth

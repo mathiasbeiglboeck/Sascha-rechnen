@@ -1814,6 +1814,10 @@ extension CanvasController {
             remoteTargetSince = Date()
             fitToRemotePageCount()
         }
+        // Der neue Seitenstand gilt jetzt auch für die Markierungen. Kamen die Fragen schon vorher (mit dem neuen
+        // Stand), blieben sie bis hier verborgen; ohne neu angelegte Seiten (gleiche Seitenzahl, etwa nach
+        // Löschen und Rückgängig) zeigte sie sonst nichts mehr an
+        reloadAskMarks()
         onPagesChanged?()
     }
 
@@ -2162,8 +2166,8 @@ extension CanvasController {
                     + (a.hidden == true ? " versteckt" : "") + (a.deleting == true ? " löscht" : "")
                     + (a.moved == true ? " verschoben" : "") + (a.localNote.map { " (\($0))" } ?? "")
             }
-            log("Stand: pv \(self.currentPagesVersion), \(self.askOverlay.subviews.count) Markierungen: "
-                + state.joined(separator: "; "))
+            log("Stand: pv \(self.currentPagesVersion), \(self.layout.frames.count) Seiten, "
+                + "\(self.askOverlay.subviews.count) Markierungen: " + state.joined(separator: "; "))
         }
     }
 }
