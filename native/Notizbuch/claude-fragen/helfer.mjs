@@ -34,6 +34,8 @@ const DEFAULTS = {
   // Nach einem Fehler am Mac: neuer Versuch nach so vielen Sekunden; am Nutzungslimit mindestens so lange Pause
   retrySeconds: 60,
   minPauseSeconds: 60,
+  // Abgemeldet oder Claude Code fehlt: so oft nachsehen, ob es wieder geht (nur am Mac, ohne Nutzung von Claude)
+  readyCheckSeconds: 120,
   // Claude Code im eingeschränkten Modus (--restricted: nur der Chat-Ordner, keine Einstellungen von außen), wenn
   // die installierte Version ihn kennt. false: nie
   restricted: true,
@@ -132,7 +134,8 @@ async function api(method, p, { json, timeout = 60000 } = {}) {
 let socket = null;
 let socketAlive = 0; // Zeit des letzten Lebenszeichens (oder des Verbindungsversuchs)
 let reconnectDelay = 5;
-let pausedUntil = 0; // Nutzungslimit von Claude: bis dahin nichts übernehmen
+let pausedUntil = 0; // Nutzungslimit von Claude, abgemeldet: bis dahin nichts übernehmen
+let readyWatch = null;
 let oldServer = false;
 
 function connect() {
@@ -277,6 +280,36 @@ async function work(why) {
   }
 }
 
+/// Pause, bis Claude Code da bzw. angemeldet ist: alle `readyCheckSeconds` nachsehen (angemeldet: `claude auth
+/// status`, nur am Mac, kostet keine Nutzung), danach gleich weiter. Ohne diesen Befehl (ältere Fassung) nach 30 Minuten
+function pauseUntilReady(kind) {
+  pausedUntil = Date.now() + 1800000;
+  clearInterval(readyWatch);
+  let checking = false;
+  readyWatch = setInterval(async () => {
+    if (Date.now() >= pausedUntil) return clearInterval(readyWatch);
+    if (checking) return;
+    checking = true;
+    try {
+      const bin = findClaude();
+      if (!bin) return;
+      if (kind === "auth" && !((await claudeCaps(bin)).auth && (await loggedIn(bin)))) return;
+      if (Date.now() >= pausedUntil) return;
+      clearInterval(readyWatch);
+      pausedUntil = 0;
+      log(kind === "auth" ? "Claude am Mac ist wieder angemeldet" : `Claude Code ist jetzt da (${bin})`);
+      wake("bereit");
+    } finally {
+      checking = false;
+    }
+  }, config.readyCheckSeconds * 1000);
+}
+
+function loggedIn(bin) {
+  return new Promise((resolve) =>
+    execFile(bin, ["auth", "status"], { timeout: 30000, env: cleanEnv() }, (err) => resolve(!err)));
+}
+
 function cancel(id) {
   if (current && current.id === id) {
     log(id, "Markierung gelöscht, breche ab");
@@ -322,10 +355,13 @@ async function answer(ask) {
       await reply(ask.id, { claim: job.claim, markdown: result.text });
       log(ask.id, `beantwortet nach ${Math.round((Date.now() - t0) / 1000)} s (${result.text.length} Zeichen)`);
     } else if (result.auth || result.setup) {
-      // Abgemeldet oder nicht installiert: Ein neuer Versuch hilft erst danach. Pause, Hinweis in der App und am Mac
-      pausedUntil = Date.now() + 1800000;
-      await reply(ask.id, { claim: job.claim, release: true, retryAfter: 1800, note: result.error });
-      log(ask.id, result.auth ? "Claude am Mac ist abgemeldet, Pause 30 Minuten" : "Claude Code fehlt, Pause 30 Minuten");
+      // Abgemeldet oder nicht installiert: Ein neuer Versuch hilft erst danach. Pause, bis es wieder geht (höchstens
+      // 30 Minuten), Hinweis in der App und am Mac. Die Frage selbst wartet nur kurz: Ein neu gestarteter Helfer
+      // nimmt sie gleich
+      pauseUntilReady(result.auth ? "auth" : "setup");
+      await reply(ask.id, { claim: job.claim, release: true, retryAfter: config.retrySeconds, note: result.error });
+      log(ask.id, result.auth ? `Claude am Mac ist abgemeldet, Pause bis zur Anmeldung (${result.detail})`
+        : "Claude Code fehlt, Pause bis es da ist");
       notifyMac(result.auth
         ? "Claude am Mac ist abgemeldet. Im Terminal claude starten und anmelden, dann beantwortet der Helfer die Fragen."
         : "Claude Code fehlt am Mac. Im Terminal installieren und anmelden, dann beantwortet der Helfer die Fragen.");
@@ -341,7 +377,8 @@ async function answer(ask) {
       const tries = (state.failures?.[ask.id] || 0) + 1;
       state.failures = { ...(state.failures || {}), [ask.id]: tries };
       saveState(state);
-      if (tries < 2 && !result.timeout && !result.final) {
+      // Vorübergehend (etwa erneuert gerade ein anderes Claude Code die Anmeldung): öfter versuchen
+      if (tries < (result.transient ? 5 : 2) && !result.timeout && !result.final) {
         await reply(ask.id, {
           claim: job.claim, release: true, retryAfter: config.retrySeconds, note: "Fehler am Mac, neuer Versuch",
         });
@@ -586,16 +623,49 @@ function parseResult({ code, out, err, timedOut }) {
     return { ok: false, final: true, error: "Claude brauchte zu viele Schritte für diese Frage.", sessionUsed: true };
   }
   const message = (text || err || out || `Exit ${code}`).trim().slice(-500);
-  if (/\/login|not logged in|log ?in again|invalid api key|oauth token|authentication[_ ]error/i.test(message)) {
-    return { ok: false, auth: true, error: "Claude am Mac ist abgemeldet: im Terminal claude starten und anmelden." };
+  // Die Anmeldung wird gerade woanders erneuert (oder die Platte ist voll): kein Abmelden, bald noch einmal
+  if (TRANSIENT_AUTH.test(message)) return { ok: false, transient: true, error: `Claude am Mac: ${message}` };
+  if (r?.api_error_status === 401 || AUTH.test(message)) {
+    return { ok: false, auth: true, detail: message, error: "Claude am Mac ist abgemeldet: im Terminal claude starten und anmelden." };
   }
-  if (/usage limit|limit reached|hit your limit|rate.?limit|out of (extra )?usage/i.test(message)) {
-    // „…|1763305200“ (Ende des Limits als Unix-Zeit) oder „resets 5pm“: im Zweifel in 30 Minuten
-    const ts = message.match(/\|(\d{10})\b/);
-    const retryAt = ts ? Number(ts[1]) * 1000 + 60000 : Date.now() + 1800000;
+  if (LIMIT.test(message)) {
+    // Bis zum Ende des Limits (im Zweifel 30 Minuten), eine Minute Spielraum
+    const ends = limitEnds(message);
+    const retryAt = ends ? ends + 60000 : Date.now() + 1800000;
     return { ok: false, limit: true, retryAt: Math.max(retryAt, Date.now() + config.minPauseSeconds * 1000), error: message };
   }
   return { ok: false, error: `Claude am Mac: ${message}`, sessionUsed: !!r?.session_id };
+}
+
+// Wortlaute von claude -p (siehe code.claude.com/docs/en/errors). Abgemeldet: erst nach dem Anmelden geht es weiter
+const AUTH = /not logged in|\/login|log ?in again|sign in again|failed to authenticate|oauth session expired|oauth token (has )?(expired|been revoked|revoked)|invalid api key|invalid authentication credentials|authentication_(error|failed)|api error: 401/i;
+const TRANSIENT_AUTH = /another claude code process is refreshing|usually transient|signing in again won.t help|(disk|volume) is full|no space left/i;
+const LIMIT = /usage limit|limit reached|hit your [\w' ]*limit|rate.?limit|out of (extra )?usage/i;
+
+/// Wann ein Nutzungslimit endet: „…|1763305200“ (Unix-Zeit, ältere Fassungen) oder „resets 3:45pm“, „resets Mon 9am“
+/// (Ortszeit am Mac), sonst null. Eben vergangen (Minuten gerundet) heißt jetzt
+function limitEnds(message, now = Date.now()) {
+  const ts = message.match(/\|(\d{10})\b/);
+  if (ts) return Number(ts[1]) * 1000;
+  const m = message.match(/resets\s+(?:(sun|mon|tue|wed|thu|fri|sat)[a-z]*,?\s+)?(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
+  if (!m) return null;
+  let h = Number(m[2]);
+  const min = Number(m[3] || 0);
+  if (m[4]) {
+    if (h < 1 || h > 12) return null;
+    h = (h % 12) + (m[4].toLowerCase() === "pm" ? 12 : 0);
+  }
+  if (h > 23 || min > 59) return null;
+  const t = new Date(now);
+  t.setHours(h, min, 0, 0);
+  if (m[1]) {
+    const day = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"].indexOf(m[1].toLowerCase());
+    t.setDate(t.getDate() + ((day - t.getDay() + 7) % 7));
+    if (t.getTime() < now - 600000) t.setDate(t.getDate() + 7);
+  } else if (t.getTime() < now - 600000) {
+    t.setDate(t.getDate() + 1);
+  }
+  return t.getTime();
 }
 
 // ---------- Aufräumen ----------
@@ -708,7 +778,7 @@ function claudeCaps(bin) {
     capsByBin.set(bin, new Promise((resolve) => {
       execFile(bin, ["--help"], { timeout: 60000, env: cleanEnv() }, (err, stdout) => {
         const help = String(stdout || "");
-        const caps = { restricted: /--restricted\b/.test(help), dontAsk: /dontAsk/.test(help) };
+        const caps = { restricted: /--restricted\b/.test(help), dontAsk: /dontAsk/.test(help), auth: /^\s+auth\b/m.test(help) };
         log(`Claude Code: ${err && !help ? "startet nicht" : "da"} (${bin})` +
           `, eingeschränkter Modus ${caps.restricted ? (config.restricted !== false ? "an" : "aus (config)") : "nicht verfügbar"}` +
           `, dontAsk ${caps.dontAsk ? "ja" : "nein"}`);

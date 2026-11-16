@@ -11,6 +11,10 @@ import { fileURLToPath } from "node:url";
 const S = path.dirname(fileURLToPath(import.meta.url));
 const BASE = process.env.BASE || "http://127.0.0.1:8791";
 const KEY = process.env.KEY || "testkey";
+if (!/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(BASE)) {
+  console.error("Nur gegen einen lokalen Server (BASE=http://127.0.0.1:…), nie gegen den echten");
+  process.exit(2);
+}
 const H = { Authorization: `Bearer ${KEY}` };
 const HELFER = process.env.HELFER || path.join(S, "..", "helfer.mjs");
 // realpath: Am Mac ist os.tmpdir() ein Verweis (/var → /private/var), Claude sieht aber den echten Pfad
@@ -55,9 +59,12 @@ async function waitFor(fn, ms, step = 100) {
 let helper = null;
 const setHelp = (version) => fs.writeFileSync(path.join(FAKE, "help.json"), JSON.stringify({ version }));
 const setPages = (cfg) => fs.writeFileSync(path.join(FAKE, "pages.json"), JSON.stringify(cfg));
-const writeConfig = (extra = {}) => fs.writeFileSync(path.join(HOME, "config.json"), JSON.stringify({ url: BASE, key: KEY, claude: FAKE_CLAUDE, retrySeconds: 3, minPauseSeconds: 4, pollSeconds: 300, ...extra }), { mode: 0o600 });
+const writeConfig = (extra = {}) => fs.writeFileSync(path.join(HOME, "config.json"), JSON.stringify({ url: BASE, key: KEY, claude: FAKE_CLAUDE, retrySeconds: 3, minPauseSeconds: 4, readyCheckSeconds: 2, pollSeconds: 300, ...extra }), { mode: 0o600 });
 const logText = () => fs.readFileSync(path.join(HOME, "helfer.log"), "utf8");
 const promptOf = (c) => c.args[c.args.indexOf("-p") + 1];
+// Endet der Test vorzeitig (abgebrochen, Zeitlimit), darf der Helfer nicht weiterlaufen
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => { helper?.kill("SIGTERM"); process.exit(130); });
+process.on("exit", () => helper?.kill("SIGTERM"));
 function startHelper(env = {}) {
   const out = fs.openSync(path.join(TMP, "helfer.out"), "a");
   helper = spawn(process.execPath, [HELFER], {
@@ -287,7 +294,7 @@ async function main() {
     a = await createAsk(doc, "quick", 1);
     const nf = await waitFor(async () => { const x = await askOf(doc, a.id); return x.status === "open" && x.note ? x : null; }, 15000, 200);
     ok(nf && /nicht zu finden/.test(nf.note), "app sees the not-found note", nf);
-    ok(/Claude Code nicht gefunden/.test(logText()) && /Claude Code fehlt, Pause 30 Minuten/.test(logText()), "helper logs it and pauses");
+    ok(/Claude Code nicht gefunden/.test(logText()) && /Claude Code fehlt, Pause bis es da ist/.test(logText()), "helper logs it and pauses");
     await sleep(500);
     ok(calls().filter((x) => x.notify && /fehlt/.test(x.notify)).length === 1, "one notification on the Mac");
     await api("DELETE", `/api/doc/${doc}/asks/${a.id}`);
@@ -295,26 +302,38 @@ async function main() {
 
   }
 
-  console.log("== logged out: released with a note, pause, one notification");
+  console.log("== login being refreshed elsewhere: no pause, just tried again");
+  setMode({ mode: "refreshlock" });
+  a = await createAsk(doc, "quick", 1);
+  const rl = await waitFor(async () => { const x = await askOf(doc, a.id); return x.status === "open" && x.note ? x : null; }, 15000, 200);
+  ok(rl && /neuer Versuch/.test(rl.note) && !/abgemeldet/.test(logText()), "released for a retry, not logged out", rl);
+  setMode({ mode: "ok" });
+  ok(await waitFor(async () => (await askOf(doc, a.id)).status === "answered", 15000, 200), "answered on the retry");
+
+  console.log("== logged out: released with a note, pause until logged in again, one notification");
   const notesBefore = calls().filter((x) => x.notify).length;
-  setMode({ mode: "auth" });
+  fs.writeFileSync(path.join(FAKE, "auth.json"), JSON.stringify({ loggedIn: false }));
+  setMode({ mode: "authexpired" });
   a = await createAsk(doc, "quick", 1);
   const au = await waitFor(async () => { const x = await askOf(doc, a.id); return x.status === "open" && x.note ? x : null; }, 15000, 200);
   ok(au && /abgemeldet/.test(au.note), "app sees the logged-out note", au);
-  ok(/abgemeldet, Pause 30 Minuten/.test(logText()), "helper pauses");
+  ok(/abgemeldet, Pause bis zur Anmeldung \(Failed to authenticate: OAuth session expired/.test(logText()), "helper pauses and logs Claude's message");
   await sleep(500);
   const notes = calls().filter((x) => x.notify).slice(notesBefore);
   ok(notes.length === 1 && /abgemeldet/.test(notes[0].notify), "one notification on the Mac", notes);
   const b2 = await createAsk(doc, "quick", 1);
-  await sleep(1500);
-  ok((await askOf(doc, b2.id)).status === "open", "nothing claimed during the pause");
+  await sleep(4500);
+  ok((await askOf(doc, b2.id)).status === "open", "nothing claimed while logged out");
+  ok(calls().some((x) => x.authStatus === false), "login state checked meanwhile (claude auth status)");
   setMode({ mode: "ok" });
-  // Aufräumen: Diese beiden warten sonst am Server weiter
-  await api("DELETE", `/api/doc/${doc}/asks/${a.id}`);
-  await api("DELETE", `/api/doc/${doc}/asks/${b2.id}`);
+  fs.writeFileSync(path.join(FAKE, "auth.json"), JSON.stringify({ loggedIn: true }));
+  const back = await waitFor(async () => (await askOf(doc, a.id)).status === "answered" && (await askOf(doc, b2.id)).status === "answered", 20000, 300);
+  ok(back && /wieder angemeldet/.test(logText()), "after logging in both are answered within seconds");
 
   helper.kill("SIGTERM");
-  console.log(`\n${passes} passed, ${failures} failed (Protokoll: ${path.join(HOME, "helfer.log")})`);
+  const logPath = path.join(HOME, "helfer.log");
+  if (!failures && !process.env.KEEP) fs.rmSync(TMP, { recursive: true, force: true });
+  console.log(`\n${passes} passed, ${failures} failed${failures || process.env.KEEP ? ` (Protokoll: ${logPath})` : ""}`);
   process.exit(failures ? 1 : 0);
 }
 main().catch((e) => { console.error(e); helper?.kill(); process.exit(2); });

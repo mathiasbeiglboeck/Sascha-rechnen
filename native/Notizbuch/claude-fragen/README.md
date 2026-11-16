@@ -4,7 +4,7 @@ In der Notizbuch-App eine handgeschriebene Frage mit dem Lasso markieren und im 
 
 Beantwortet wird am Mac: Dieser Helfer läuft dort im Hintergrund und bekommt jede neue Frage sofort vom Notizbuch-Server gemeldet. Er fragt Claude Code (`claude -p`) mit dem Bild der Frage, der ganzen Seite und, bei PDFs, dem Dokument. Bei einem PDF mit mehr als 10 Seiten bekommt Claude zuerst die Seiten um die Frage als eigenes kleines PDF (bei „Claude fragen“ drei davor und eine danach, gründlich sieben davor und zwei danach); das ganze PDF liegt daneben. Je Dokument gibt es einen eigenen Chat, der mit jeder Frage weitergeht: Claude kennt die früheren Fragen zum selben Dokument.
 
-Ist der Mac aus oder im Ruhezustand, warten die Fragen am Server und werden beantwortet, sobald er wieder läuft. Ist das Nutzungslimit von Claude erreicht, zeigt die App das an, und der Helfer versucht es später wieder.
+Ist der Mac aus oder im Ruhezustand, warten die Fragen am Server und werden beantwortet, sobald er wieder läuft. Ist das Nutzungslimit von Claude erreicht, zeigt die App das an, und der Helfer macht weiter, sobald das Limit vorbei ist (im Zweifel nach 30 Minuten).
 
 ## Einrichten
 
@@ -16,7 +16,7 @@ zsh native/Notizbuch/claude-fragen/einrichten.sh
 
 Das Skript braucht `node` (am besten 22 oder neuer; es findet auch die Kopie in `Sascha/.notizbuch-tools`). URL und Schlüssel des Servers liest es aus `~/Documents/ClaudeCode/Sascha/notizbuch-zugang.txt` und legt sie nur in der Einstellungsdatei des Helfers ab. Nach einem Update des Repos dasselbe Skript noch einmal ausführen.
 
-Claude Code muss am Mac angemeldet sein, und zwar für den Helfer selbst: Die Claude-App gibt ihre Anmeldung nur an ihre eigenen Sitzungen weiter. Am einfachsten ist Claude Code fürs Terminal (`~/.local/bin/claude`): einmal `claude` starten und anmelden. Ohne diese Installation nimmt der Helfer die Kopie aus der Claude-App (die neueste Version; er sucht sie vor jeder Frage selbst, weil sich ihr Pfad mit jedem Update der App ändert), die dann ebenso einmal selbst angemeldet sein muss. Ist Claude Code nicht da oder abgemeldet, zeigt die App das bei der Frage an, am Mac erscheint ein Hinweis, und der Helfer versucht es später wieder.
+Claude Code muss am Mac angemeldet sein, und zwar für den Helfer selbst: Die Claude-App gibt ihre Anmeldung nur an ihre eigenen Sitzungen weiter. Am einfachsten ist Claude Code fürs Terminal (`~/.local/bin/claude`): einmal `claude` starten und anmelden. Ohne diese Installation nimmt der Helfer die Kopie aus der Claude-App (die neueste Version; er sucht sie vor jeder Frage selbst, weil sich ihr Pfad mit jedem Update der App ändert), die dann ebenso einmal selbst angemeldet sein muss. Ist Claude Code nicht da oder abgemeldet, zeigt die App das bei der Frage an, am Mac erscheint ein Hinweis, und der Helfer schaut alle zwei Minuten nach (`claude auth status`, kostet keine Nutzung): Kurz nach dem Anmelden geht es weiter. Erscheint am Mac kein Hinweis, die Mitteilungen einmal erlauben: im Skript-Editor `display notification "Test"` ausführen und zulassen.
 
 Der Server muss die Fragen schon kennen (Server-Update). Sonst steht im Protokoll „Server-Update nötig“, und der Helfer wartet.
 
@@ -63,9 +63,9 @@ Schnittstelle am Server (alle mit `Authorization: Bearer <Schlüssel>`):
 | `GET /api/asks/<id>/question`, `…/page` | Helfer | die beiden Bilder |
 | `PUT /api/asks/<id>/answer` | Helfer | `{claim, markdown}`, `{claim, error}` oder `{claim, release: true, note, retryAfter}` |
 
-Nach jeder Änderung schickt der Server den Apps mit diesem Dokument offen `{"type":"asks","v":N}`; Gäste eines geteilten Links bekommen nichts davon.
+Nach jeder Änderung schickt der Server den Apps mit diesem Dokument offen `{"type":"asks","v":N}`; Gäste eines geteilten Links bekommen nichts davon. Gelöschte Fragen merkt er sich 30 Tage: Lädt eine App eine davon noch einmal hoch (ihre erste Antwort ging verloren), entsteht sie nicht neu. Eine neue Frage auf einem älteren Seitenstand, als er kennt, lehnt er mit 409 `stale-pages` ab (ihre Stelle stimmt nicht mehr).
 
-Tests (nur gegen einen lokalen Server mit Wegwerf-Schlüssel, nie gegen den echten):
+Tests (nur gegen einen lokalen Server mit Wegwerf-Schlüssel, nie gegen den echten; andere Adressen lehnen sie ab):
 
 ```sh
 cd native/Notizbuch/server && npx wrangler dev --ip 127.0.0.1 --port 8791 --var SECRET:testkey --persist-to "$(mktemp -d)"
@@ -74,4 +74,4 @@ BASE=http://127.0.0.1:8791 KEY=testkey node native/Notizbuch/server/test/asks.mj
 BASE=http://127.0.0.1:8791 KEY=testkey node native/Notizbuch/claude-fragen/test/helper-test.mjs
 ```
 
-`helper-test.mjs` startet den Helfer mit `test/fake-claude` statt Claude Code und `test/fake-osascript` statt macOS. `fake-claude` lässt sich auch von Hand als `claude` in einer Test-`config.json` eintragen: Mit `{"mode": "rich"}` in `$FAKE_STATE/mode.json` antwortet er mit Formeln, Liste und Code, um die Karte in der App anzusehen.
+`helper-test.mjs` startet den Helfer mit `test/fake-claude` statt Claude Code und `test/fake-osascript` statt macOS; sein Arbeitsordner wird nach einem erfolgreichen Lauf gelöscht (`KEEP=1` behält ihn). `fake-claude` lässt sich auch von Hand als `claude` in einer Test-`config.json` eintragen: Mit `{"mode": "rich"}` in `$FAKE_STATE/mode.json` antwortet er mit Formeln, Liste und Code, um die Karte in der App anzusehen.

@@ -1,11 +1,19 @@
 #!/usr/bin/env node
 // Ersatz für claude in Tests des Helfers: schreibt jeden Aufruf nach $FAKE_STATE/calls.jsonl und antwortet je nach
-// $FAKE_STATE/mode.json ({"mode": "ok" | "rich" | "limit" | "error" | "auth" | "maxturns", "delayMs": …}).
-// "rich" antwortet mit Formeln, Liste und Code, zum Ansehen der Karte in der App
+// $FAKE_STATE/mode.json ({"mode": "ok" | "rich" | "limit" | "limit-old" | "error" | "auth" | "authexpired" |
+// "refreshlock" | "maxturns", "delayMs": …}). "rich" antwortet mit Formeln, Liste und Code, zum Ansehen der Karte in
+// der App. `claude auth status` sagt angemeldet (Exit 0), wenn $FAKE_STATE/auth.json {"loggedIn": true} enthält
 const fs = require("fs"), path = require("path");
 const DIR = process.env.FAKE_STATE || path.join(require("os").tmpdir(), "betternotes-fake");
 fs.mkdirSync(DIR, { recursive: true });
 const args = process.argv.slice(2);
+if (args[0] === "auth" && args[1] === "status") {
+  let a = { loggedIn: false };
+  try { a = JSON.parse(fs.readFileSync(path.join(DIR, "auth.json"), "utf8")); } catch {}
+  fs.appendFileSync(path.join(DIR, "calls.jsonl"), JSON.stringify({ authStatus: a.loggedIn }) + "\n");
+  process.stdout.write(JSON.stringify({ loggedIn: !!a.loggedIn }) + "\n");
+  process.exit(a.loggedIn ? 0 : 1);
+}
 if (args[0] === "--help") {
   // help.json: { "version": "new" | "old" } – new lists --restricted and dontAsk, old neither
   let h = { version: "new" };
@@ -15,6 +23,7 @@ if (args[0] === "--help") {
   if (h.version === "new") {
     lines.push('  --permission-mode <mode>  Permission mode (choices: "acceptEdits", "bypassPermissions", "default", "dontAsk", "plan")');
     lines.push("  --restricted   Restrict file tools to the working directories");
+    lines.push("", "Commands:", "  auth                      Manage authentication", "  update|upgrade            Check for updates");
   } else {
     lines.push('  --permission-mode <mode>  Permission mode (choices: "acceptEdits", "bypassPermissions", "default", "plan")');
   }
@@ -43,7 +52,22 @@ process.on("SIGTERM", () => { fs.appendFileSync(path.join(DIR, "calls.jsonl"), J
 const out = (o) => { process.stdout.write(JSON.stringify(o) + "\n"); };
 const finish = () => {
   if (mode.mode === "limit") {
+    // Wie Claude Code heute: Ende in Ortszeit (hier vor zwei Minuten, also gleich wieder frei)
+    const t = new Date(Date.now() - 120000), h = t.getHours();
+    const at = `${h % 12 || 12}:${String(t.getMinutes()).padStart(2, "0")}${h < 12 ? "am" : "pm"}`;
+    out({ type: "result", subtype: "success", is_error: true, result: `You've hit your session limit · resets ${at}`, session_id: session });
+    process.exit(1);
+  }
+  if (mode.mode === "limit-old") {
     out({ type: "result", subtype: "success", is_error: true, result: `Claude AI usage limit reached|${Math.floor(Date.now() / 1000) - 120}`, session_id: session });
+    process.exit(1);
+  }
+  if (mode.mode === "authexpired") {
+    out({ type: "result", subtype: "success", is_error: true, result: "Failed to authenticate: OAuth session expired and could not be refreshed", session_id: session });
+    process.exit(1);
+  }
+  if (mode.mode === "refreshlock") {
+    out({ type: "result", subtype: "success", is_error: true, result: "Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute.", session_id: session });
     process.exit(1);
   }
   if (mode.mode === "error") { process.stderr.write("Something broke\n"); process.exit(1); }
