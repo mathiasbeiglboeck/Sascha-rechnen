@@ -524,9 +524,9 @@ final class SyncEngine: ObservableObject {
                     // Name und Ordner: Es gilt, was zuletzt umbenannt bzw. verschoben wurde, auch wenn danach auf einem
                     // anderen Gerät noch ins Dokument geschrieben wurde (das allein macht den Eintrag nur neuer)
                     let title = Self.newer(local: local.title, set: local.titleSet, remote: r.title, remoteSet: r.titleSet,
-                                           created: local.created, remoteNewer: remoteNewer)
+                                           remoteModified: r.modified, created: local.created, remoteNewer: remoteNewer)
                     let folder = Self.newer(local: local.folder, set: local.folderSet, remote: r.folder, remoteSet: r.folderSet,
-                                            created: local.created, remoteNewer: remoteNewer)
+                                            remoteModified: r.modified, created: local.created, remoteNewer: remoteNewer)
                     if merged.title != title.value { merged.title = title.value; changed = true }
                     if merged.titleSet != title.set { merged.titleSet = title.set; changed = true }
                     if merged.folder != folder.value { merged.folder = folder.value; changed = true }
@@ -561,6 +561,9 @@ final class SyncEngine: ObservableObject {
                         c.remoteStructureChanged(pageCount: merged.pageCount, pdfChanged: pdfChanged)
                     }
                 } else {
+                    // Hier eben gelöscht (währenddessen; der Grabstein geht beim nächsten Abgleich hinauf): nicht
+                    // wieder anlegen und herunterladen
+                    if pendingDeletes.contains(r.id.uuidString) { continue }
                     // Neu auf diesem Gerät (oder nach dem Löschen wieder da): ohne alten Sync-Stand beginnen, sonst
                     // hielte der Abgleich alle früher bekannten Striche für hier gelöscht
                     states[r.id] = nil
@@ -590,6 +593,9 @@ final class SyncEngine: ObservableObject {
                 // Der aktuelle Stand: Während der Uploads davor kann sich das Dokument geändert haben (oder ist gelöscht)
                 guard let local = store.documents.first(where: { $0.id == id }) else { continue }
                 let r = remoteByID[local.id]
+                // Anderswo gelöscht und hier noch offen (wird nach dem Schließen gelöscht): nicht hochladen. Sonst ginge
+                // sein PDF bei jedem Abgleich neu hinauf, und eine Änderung brächte es ohne seine Striche zurück
+                if r?.deleted == true { continue }
                 let metaNewer = r == nil || local.modified.timeIntervalSince1970 > r!.modified.timeIntervalSince1970 + 0.001
                 let pagesNewer = (local.pagesVersion ?? 0) > (r?.pagesVersion ?? 0)
                 let pdfNewer = local.kind == .pdf && (r?.hasPDF != true || (local.pdfVersion ?? 0) > (r?.pdfVersion ?? 0))
@@ -627,9 +633,17 @@ final class SyncEngine: ObservableObject {
     /// nicht geändert), egal wo danach noch geschrieben wurde. Fehlt der Zeitpunkt am Server (Eintrag einer älteren
     /// App), oder sind beide gleich alt, gilt wie bisher der neuere Eintrag (`remoteNewer`).
     /// Ergebnis: der Wert, der hier zu speichernde Zeitpunkt, und ob hier der neuere Stand liegt, den der Server noch nicht hat
-    static func newer<T: Equatable>(local: T, set: Date?, remote: T, remoteSet: Date?, created: Date,
-                                    remoteNewer: Bool) -> (value: T, set: Date?, ahead: Bool) {
-        guard let remoteSet else { return (remoteNewer ? remote : local, set, false) }
+    static func newer<T: Equatable>(local: T, set: Date?, remote: T, remoteSet: Date?, remoteModified: Date,
+                                    created: Date, remoteNewer: Bool) -> (value: T, set: Date?, ahead: Bool) {
+        guard let remoteSet else {
+            // Eintrag einer älteren App: wie bisher der neuere Eintrag. Gilt danach ihr Wert (übernommen oder gleich),
+            // gilt er als spätestens zur Zeit ihres Eintrags gesetzt (genauer ist es nicht bekannt). Sonst lüde dieses
+            // Gerät ihn später mit einem zu alten Zeitpunkt hoch, und eine ältere Umbenennung schlüge ihn
+            let value = remoteNewer ? remote : local
+            guard value == remote else { return (local, set, false) }
+            let mine = set ?? created
+            return (value, remoteModified > mine ? remoteModified : mine, false)
+        }
         let mine = (set ?? created).timeIntervalSince1970, theirs = remoteSet.timeIntervalSince1970
         if theirs > mine + 0.001 { return (remote, remoteSet, false) }
         if mine > theirs + 0.001 { return (local, set, local != remote) }
