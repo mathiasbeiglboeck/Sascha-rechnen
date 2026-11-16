@@ -129,10 +129,25 @@ final class SyncEngine: ObservableObject {
         set { UserDefaults.standard.set(Array(newValue), forKey: "syncPendingDeletes") }
     }
 
+    /// Zeitpunkt je vorgemerktem Grabstein (Sekunden seit 1970): beim Löschen der des Löschens, beim Aufräumen von
+    /// temp der Stand des Dokuments damals. Geht der Grabstein erst später hinauf, löscht er so nichts, was andere
+    /// Geräte inzwischen geändert haben: Der Server nimmt ihn dann nicht an (sein Eintrag ist neuer)
+    private var pendingDeleteStamps: [String: Double] {
+        get { (UserDefaults.standard.dictionary(forKey: "syncPendingDeleteStamps") as? [String: Double]) ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: "syncPendingDeleteStamps") }
+    }
+
+    /// Dokumente, die nach einem Grabstein zurückkamen (siehe Schritt 3). Mit dem Grabstein hat der Server alle ihre
+    /// Striche gelöscht, also gehen alle noch einmal hinauf. Auch auf der Platte vermerkt, falls die App vorher endet
+    private var resend: Set<UUID> = [] {
+        didSet { UserDefaults.standard.set(resend.map(\.uuidString), forKey: "syncResend") }
+    }
+
     init(store: DocumentStore) {
         self.store = store
         serverURL = UserDefaults.standard.string(forKey: "syncURL") ?? ""
         key = UserDefaults.standard.string(forKey: "syncKey") ?? ""
+        resend = Set((UserDefaults.standard.stringArray(forKey: "syncResend") ?? []).compactMap { UUID(uuidString: $0) })
     }
 
     var isConfigured: Bool {
@@ -273,6 +288,18 @@ final class SyncEngine: ObservableObject {
         busy.insert(id)
         defer { busy.remove(id) }
 
+        if resend.contains(id) {
+            // Nach einem Grabstein zurück (siehe Schritt 3): Nichts gilt mehr als am Server vorhanden, also geht alles
+            // noch einmal hinauf. Erst hier, wo sicher kein anderer Abgleich des Dokuments läuft. Ein leerer Stand passt
+            // immer zur Zeichnung, darf also gleich auf die Platte
+            let s = self.state(id)
+            s.seq = 0
+            s.confirmed = []
+            s.syncedModified = 0
+            bulks[id] = nil
+            persistState(id)
+            resend.remove(id)
+        }
         let state = self.state(id)
         // Abgleich der offenen Leinwand: Er hört auf, sobald sie Neues hat, Seiten ändert oder geschlossen wird.
         // Abgleich der Datei: Er hört auf, sobald das Dokument inzwischen offen war
@@ -471,13 +498,17 @@ final class SyncEngine: ObservableObject {
 
     private func syncLibraryOnce() async {
         do {
-            // 1. Lokal gelöschte Dokumente als Grabstein hochladen
+            // 1. Lokal gelöschte Dokumente als Grabstein hochladen, mit dem Zeitpunkt des Löschens (siehe
+            //    `pendingDeleteStamps`). Ist der Eintrag am Server neuer, nimmt er ihn nicht an; dann holt Schritt 2 das
+            //    Dokument wieder
             for idString in pendingDeletes {
+                let stamp = pendingDeleteStamps[idString] ?? Date().timeIntervalSince1970
                 let tomb: [String: Any] = ["id": idString, "title": "", "kind": "notebook", "deleted": true,
                                            "created": Date().timeIntervalSince1970,
-                                           "modified": Date().timeIntervalSince1970, "pageCount": 0]
+                                           "modified": stamp, "pageCount": 0]
                 _ = try await request("PUT", "/api/library/\(idString)", body: try JSONSerialization.data(withJSONObject: tomb))
                 pendingDeletes.remove(idString)
+                pendingDeleteStamps[idString] = nil
             }
 
             // 2. Vom Server übernehmen
@@ -489,11 +520,15 @@ final class SyncEngine: ObservableObject {
             for r in remote {
                 let local = store.documents.first { $0.id == r.id }
                 if r.deleted == true {
-                    if local != nil, openController?.doc.id != r.id {
+                    // Anderswo gelöscht. Hier offen, oder hier seitdem geändert: behalten. Geändert bringt Schritt 3 es
+                    // zurück (samt allen Strichen), sonst wird es nach dem Schließen gelöscht
+                    if let local, openController?.doc.id != r.id,
+                       local.modified.timeIntervalSince1970 <= r.modified.timeIntervalSince1970 + 0.001 {
                         states[r.id] = nil
                         bulks[r.id] = nil
                         pageTargets[r.id] = nil
-                        store.delete(local!)
+                        if resend.contains(r.id) { resend.remove(r.id) }
+                        store.delete(local)
                     }
                     continue
                 }
@@ -524,9 +559,9 @@ final class SyncEngine: ObservableObject {
                     // Name und Ordner: Es gilt, was zuletzt umbenannt bzw. verschoben wurde, auch wenn danach auf einem
                     // anderen Gerät noch ins Dokument geschrieben wurde (das allein macht den Eintrag nur neuer)
                     let title = Self.newer(local: local.title, set: local.titleSet, remote: r.title, remoteSet: r.titleSet,
-                                           remoteModified: r.modified, created: local.created, remoteNewer: remoteNewer)
+                                           created: local.created, remoteNewer: remoteNewer)
                     let folder = Self.newer(local: local.folder, set: local.folderSet, remote: r.folder, remoteSet: r.folderSet,
-                                            remoteModified: r.modified, created: local.created, remoteNewer: remoteNewer)
+                                            created: local.created, remoteNewer: remoteNewer)
                     if merged.title != title.value { merged.title = title.value; changed = true }
                     if merged.titleSet != title.set { merged.titleSet = title.set; changed = true }
                     if merged.folder != folder.value { merged.folder = folder.value; changed = true }
@@ -593,10 +628,11 @@ final class SyncEngine: ObservableObject {
                 // Der aktuelle Stand: Während der Uploads davor kann sich das Dokument geändert haben (oder ist gelöscht)
                 guard let local = store.documents.first(where: { $0.id == id }) else { continue }
                 let r = remoteByID[local.id]
-                // Anderswo gelöscht und hier noch offen (wird nach dem Schließen gelöscht): nicht hochladen. Sonst ginge
-                // sein PDF bei jedem Abgleich neu hinauf, und eine Änderung brächte es ohne seine Striche zurück
-                if r?.deleted == true { continue }
                 let metaNewer = r == nil || local.modified.timeIntervalSince1970 > r!.modified.timeIntervalSince1970 + 0.001
+                // Anderswo gelöscht und hier seitdem nicht geändert (hier noch offen, wird nach dem Schließen gelöscht):
+                // nicht hochladen, sonst ginge sein PDF bei jedem Abgleich neu hinauf. Seitdem geändert: zurückbringen
+                let revive = r?.deleted == true
+                if revive, !metaNewer { continue }
                 let pagesNewer = (local.pagesVersion ?? 0) > (r?.pagesVersion ?? 0)
                 let pdfNewer = local.kind == .pdf && (r?.hasPDF != true || (local.pdfVersion ?? 0) > (r?.pdfVersion ?? 0))
                 if !pdfNewer { pdfUploadPending.remove(local.id) }
@@ -610,15 +646,22 @@ final class SyncEngine: ObservableObject {
                 var upload = local
                 if upload.titleSet == nil { upload.titleSet = upload.created }
                 if upload.folderSet == nil { upload.folderSet = upload.created }
-                _ = try await request("PUT", "/api/library/\(Self.path(local.id))", body: try Self.encoder.encode(upload))
+                let saved = try await request("PUT", "/api/library/\(Self.path(local.id))", body: try Self.encoder.encode(upload))
                 pdfUploadPending.remove(local.id)
+                // Zurück (der Server antwortet mit dem Eintrag, der jetzt gilt). Mit dem Grabstein hat er alle Striche
+                // gelöscht: alle noch einmal hinauf, von der offenen Leinwand gleich, sonst mit Schritt 4
+                if revive, (try? Self.decoder.decode(RemoteMeta.self, from: saved))?.deleted != true {
+                    resend.insert(id)
+                    if let canvas = openController, canvas.doc.id == id { canvas.resendAll() }
+                }
             }
 
             // 4. Striche der nicht geöffneten Dokumente
             for local in store.documents where local.id != openController?.doc.id {
                 let state = self.state(local.id)
                 let remoteSeq = remoteByID[local.id]?.strokeSeq ?? 0
-                if remoteSeq > state.seq || local.modified.timeIntervalSince1970 > state.syncedModified + 0.001 {
+                if remoteSeq > state.seq || local.modified.timeIntervalSince1970 > state.syncedModified + 0.001
+                    || resend.contains(local.id) {
                     await syncClosed(local.id)
                 }
             }
@@ -633,30 +676,32 @@ final class SyncEngine: ObservableObject {
     /// nicht geändert), egal wo danach noch geschrieben wurde. Fehlt der Zeitpunkt am Server (Eintrag einer älteren
     /// App), oder sind beide gleich alt, gilt wie bisher der neuere Eintrag (`remoteNewer`).
     /// Ergebnis: der Wert, der hier zu speichernde Zeitpunkt, und ob hier der neuere Stand liegt, den der Server noch nicht hat
-    static func newer<T: Equatable>(local: T, set: Date?, remote: T, remoteSet: Date?, remoteModified: Date,
+    static func newer<T: Equatable>(local: T, set: Date?, remote: T, remoteSet: Date?,
                                     created: Date, remoteNewer: Bool) -> (value: T, set: Date?, ahead: Bool) {
-        guard let remoteSet else {
-            // Eintrag einer älteren App: wie bisher der neuere Eintrag. Gilt danach ihr Wert (übernommen oder gleich),
-            // gilt er als spätestens zur Zeit ihres Eintrags gesetzt (genauer ist es nicht bekannt). Sonst lüde dieses
-            // Gerät ihn später mit einem zu alten Zeitpunkt hoch, und eine ältere Umbenennung schlüge ihn
-            let value = remoteNewer ? remote : local
-            guard value == remote else { return (local, set, false) }
-            let mine = set ?? created
-            return (value, remoteModified > mine ? remoteModified : mine, false)
-        }
+        // Eintrag einer älteren App: wie bisher der neuere Eintrag, der eigene Zeitpunkt bleibt. Wann sie den Wert
+        // gesetzt hat, ist nicht bekannt; ihr Eintrag kann auch nur einen alten Wert tragen, weil sie danach (ohne die
+        // Umbenennung zu kennen) geschrieben hat. Mit dem Zeitpunkt ihres Eintrags schlüge der die Umbenennung dauerhaft
+        guard let remoteSet else { return (remoteNewer ? remote : local, set, false) }
         let mine = (set ?? created).timeIntervalSince1970, theirs = remoteSet.timeIntervalSince1970
         if theirs > mine + 0.001 { return (remote, remoteSet, false) }
         if mine > theirs + 0.001 { return (local, set, local != remote) }
         return (remoteNewer ? remote : local, set, false)
     }
 
-    /// Merkt ein lokal gelöschtes Dokument vor, damit es auch auf den anderen Geräten verschwindet
-    func noteDeleted(_ id: UUID) {
+    /// Merkt ein lokal gelöschtes Dokument vor, damit es auch auf den anderen Geräten verschwindet.
+    /// - Parameter unchangedSince: beim Aufräumen von temp der Stand des Dokuments (`modified`). Dann gilt der
+    ///   Grabstein nur, wenn es seitdem niemand geändert hat. Sonst nimmt ihn der Server nicht an, oder das Gerät mit
+    ///   der Änderung bringt das Dokument zurück
+    func noteDeleted(_ id: UUID, unchangedSince: Date? = nil) {
         states[id] = nil
         bulks[id] = nil
         pageTargets[id] = nil
+        if resend.contains(id) { resend.remove(id) }
         guard isConfigured else { return }
         pendingDeletes.insert(id.uuidString)
+        // Knapp danach: Den gleich alten Eintrag am Server ersetzt er, jeden neueren nicht
+        pendingDeleteStamps[id.uuidString] = unchangedSince.map { $0.timeIntervalSince1970 + 0.001 }
+            ?? Date().timeIntervalSince1970
     }
 
     // MARK: Briefkasten

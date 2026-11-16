@@ -84,7 +84,7 @@ struct LibraryView: View {
                     // anderes inzwischen behalten (verschoben) oder beschrieben hat, und mit ihm überall
                     if !sync.isConfigured || sync.lastSync != before {
                         let purged = store.purgeTemp(keeping: Set(tabs.ids))
-                        for id in purged { sync.noteDeleted(id) }
+                        for doc in purged { sync.noteDeleted(doc.id, unchangedSince: doc.modified) }
                         if !purged.isEmpty { await sync.syncLibrary() }
                     }
                     try? await Task.sleep(for: .seconds(20))
