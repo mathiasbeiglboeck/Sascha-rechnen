@@ -137,23 +137,22 @@ final class SyncEngine: ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: "syncPendingDeleteStamps") }
     }
 
-    /// Aufgeräumtes aus temp, mit dem Zeitpunkt des Aufräumens (Sekunden seit 1970). Ging sein Grabstein nicht bald
-    /// hinauf, wird er verworfen (siehe Schritt 1)
-    private var pendingPurges: [String: Double] {
-        get { (UserDefaults.standard.dictionary(forKey: "syncPendingPurges") as? [String: Double]) ?? [:] }
-        set { UserDefaults.standard.set(newValue, forKey: "syncPendingPurges") }
+    /// Aufgeräumtes aus temp, mit der höchsten Änderungsnummer seiner Striche, die dieses Gerät damals kannte. Sein
+    /// Grabstein geht erst nach der nächsten Abfrage der Bibliothek hinauf, und nur, wenn der Server seitdem nichts
+    /// Neues hat (siehe Schritt 2)
+    private var pendingPurgeSeqs: [String: Int] {
+        get { (UserDefaults.standard.dictionary(forKey: "syncPendingPurgeSeqs") as? [String: Int]) ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: "syncPendingPurgeSeqs") }
     }
-    /// So lange (Sekunden) darf der Grabstein eines Aufräumens auf sich warten lassen
-    private static let purgeGrace: Double = 300
 
     /// Dokumente, die nach einem Grabstein zurückkamen (siehe Schritt 3). Mit dem Grabstein hat der Server alle ihre
     /// Striche gelöscht, also gehen alle noch einmal hinauf. Auch auf der Platte vermerkt, falls die App vorher endet
     private var resend: Set<UUID> = [] {
         didSet { UserDefaults.standard.set(resend.map(\.uuidString), forKey: "syncResend") }
     }
-    /// Nach dem Zurücksetzen für `resend` und bei neu heruntergeladenen Dokumenten: Die erste Antwort bringt alles, was
-    /// am Server liegt, auch eigene frühere Striche. Sie zählen nicht als fremd (siehe `foreignSince`). Auf der Platte
-    /// vermerkt, damit das auch nach einem Neustart vor dieser Antwort gilt
+    /// Bei neu heruntergeladenen Dokumenten, und nach dem Zurücksetzen für `resend` ohne Stand der Zeichnung: Die erste
+    /// Antwort bringt alles, was am Server liegt, auch eigene frühere Striche. Sie zählen nicht als fremd (siehe
+    /// `foreignSince`). Auf der Platte vermerkt, damit das auch nach einem Neustart vor dieser Antwort gilt
     private var refetching: Set<UUID> = [] {
         didSet { UserDefaults.standard.set(refetching.map(\.uuidString), forKey: "syncRefetching") }
     }
@@ -168,11 +167,19 @@ final class SyncEngine: ObservableObject {
     }
 
     /// Dokumente, in die fremde Striche kamen (von anderen Geräten oder Gästen im Browser), seit der Abgleich der
-    /// Bibliothek sie zuletzt gültig sah. Nur dann gelten Striche am Server nach einem Grabstein als danach
-    /// geschrieben: Eigene, etwa der Rest eines noch laufenden Hochladens aller Striche, holen ein Dokument nicht zurück,
-    /// das inzwischen noch einmal gelöscht wurde
+    /// Bibliothek sie zuletzt gültig sah. Fremd ist, was dieses Gerät noch nicht hatte: ein neuer Strich, oder das
+    /// Löschen eines vorhandenen. Nur dann gelten Striche am Server nach einem Grabstein als danach geschrieben: Eigene,
+    /// etwa der Rest eines noch laufenden Hochladens aller Striche, holen ein Dokument nicht zurück, das inzwischen noch
+    /// einmal gelöscht wurde
     private var foreignSince: Set<UUID> = [] {
         didSet { UserDefaults.standard.set(foreignSince.map(\.uuidString), forKey: "syncForeignSince") }
+    }
+
+    /// Ebenso, aber angekommen, während das Dokument hier offen war. Nach einem Grabstein kommt es dann zurück, auch
+    /// wenn es inzwischen zu ist und danach mehr geschrieben wurde, als dieses Gerät schon geholt hat (etwa von einem
+    /// Gast, der weiterschreibt)
+    private var foreignWhileOpen: Set<UUID> = [] {
+        didSet { UserDefaults.standard.set(foreignWhileOpen.map(\.uuidString), forKey: "syncForeignWhileOpen") }
     }
 
     /// Höchste Änderungsnummer der Striche je Dokument laut letzter Abfrage der Bibliothek
@@ -194,6 +201,7 @@ final class SyncEngine: ObservableObject {
         resend = ids("syncResend")
         lostAtServer = ids("syncLostAtServer")
         foreignSince = ids("syncForeignSince")
+        foreignWhileOpen = ids("syncForeignWhileOpen")
         refetching = ids("syncRefetching")
     }
 
@@ -348,7 +356,8 @@ final class SyncEngine: ObservableObject {
             // Erledigt ist das Vorhaben erst, wenn der leere Stand auf der Platte ist. Endet die App vorher, beginnt es
             // nach dem Neustart eben noch einmal. Das Warten (auf das Speichern davor) kommt nur nach einem Grabstein vor
             store.waitForWrites()
-            if !refetching.contains(id) { refetching.insert(id) }
+            // Ohne Stand der Zeichnung ist eigenes Früheres in der ersten Antwort nicht zu erkennen (siehe `refetching`)
+            if snapshot == nil, !refetching.contains(id) { refetching.insert(id) }
             resend.remove(id)
         }
         let state = self.state(id)
@@ -362,11 +371,14 @@ final class SyncEngine: ObservableObject {
         // So viele Striche am Anfang von `adds` gehören nicht zum großen Hochladen
         var freshCount = 0
         var toPage = CGAffineTransform.identity
+        // Was die Zeichnung enthält: Daran erkennt die Antwort, was fremd ist (siehe `foreignSince`)
+        var present: Set<String>?
         if let snapshot {
             toPage = snapshot.toPage
             var current = Set<String>(minimumCapacity: snapshot.strokes.count + snapshot.alsoPresent.count)
             for s in snapshot.strokes where !snapshot.alsoGone.contains(s.id) { current.insert(s.id) }
             current.formUnion(snapshot.alsoPresent)
+            present = current
             adds = snapshot.strokes.filter { !state.confirmed.contains($0.id) && !snapshot.alsoGone.contains($0.id) }
             let removes = state.confirmed.subtracting(current)
             if var bulk = bulks[id] {
@@ -426,8 +438,9 @@ final class SyncEngine: ObservableObject {
                 let body = try JSONSerialization.data(withJSONObject: ["since": since, "add": add, "remove": gone])
                 let data = try await request("POST", "/api/doc/\(Self.path(id))/sync", body: body)
                 let response = try JSONDecoder().decode(Response.self, from: data)
-                // Der Server kennt weniger als dieses Gerät: Ein Grabstein hat die Striche gelöscht (siehe `lostAtServer`)
-                if response.seq < since, !lostAtServer.contains(id) { lostAtServer.insert(id) }
+                // Der Server kennt weniger als dieses Gerät: Ein Grabstein hat die Striche gelöscht (siehe `lostAtServer`).
+                // Gehen ohnehin gleich alle noch einmal hinauf, ist nichts zu vermerken
+                if response.seq < since, !resend.contains(id), !lostAtServer.contains(id) { lostAtServer.insert(id) }
                 state.confirmed.subtract(gone)
                 for a in part { state.confirmed.insert(a.id) }
                 // Das eigene Echo (was diese Anfrage gerade hochgeladen oder gelöscht hat) nicht zurück an die
@@ -437,17 +450,26 @@ final class SyncEngine: ObservableObject {
                 var own = Set(gone)
                 for a in part { own.insert(a.id) }
                 var changes = RemoteChanges()
+                // Fremd ist nur, was dieses Gerät noch nicht hatte: ein neuer Strich, oder das Löschen eines vorhandenen.
+                // Eigene frühere Striche, die eine Antwort noch einmal bringt (etwa nach dem Zurücksetzen), zählen nicht
+                var fresh = false
                 for c in response.changes where !own.contains(c.id) {
+                    let known = state.confirmed.contains(c.id) || present?.contains(c.id) == true
                     if let d = c.data {
+                        if !known { fresh = true }
                         changes.added.append((c.id, d))
                         state.confirmed.insert(c.id)
                     } else {
+                        if known { fresh = true }
                         changes.removed.insert(c.id)
                         state.confirmed.remove(c.id)
                     }
                 }
                 state.seq = response.seq
-                if !changes.isEmpty, !refetching.contains(id), !foreignSince.contains(id) { foreignSince.insert(id) }
+                if fresh, !refetching.contains(id) {
+                    if !foreignSince.contains(id) { foreignSince.insert(id) }
+                    if openController?.doc.id == id, !foreignWhileOpen.contains(id) { foreignWhileOpen.insert(id) }
+                }
                 if refetching.contains(id) { refetching.remove(id) }
                 deliver(changes, to: id)
                 // Ein geschlossenes Dokument hat die Änderungen jetzt in seiner Datei (oder unterwegs dorthin);
@@ -556,53 +578,68 @@ final class SyncEngine: ObservableObject {
         do {
             // 1. Lokal gelöschte Dokumente als Grabstein hochladen, mit dem Zeitpunkt des Löschens (siehe
             //    `pendingDeleteStamps`). Ist der Eintrag am Server neuer, nimmt er ihn nicht an; dann holt Schritt 2 das
-            //    Dokument wieder
-            for idString in pendingDeletes {
-                // Aufgeräumt, aber der Grabstein ging nicht bald hinauf (etwa weil die App gleich danach in den
-                // Hintergrund ging): verwerfen. Inzwischen kann ein Gast hineingeschrieben haben, was den Eintrag nicht
-                // neuer macht, und der Grabstein löschte es. So kommt das Dokument mit Schritt 2 wieder, und das
-                // Aufräumen entscheidet später neu
-                if let purged = pendingPurges[idString], Date().timeIntervalSince1970 - purged > Self.purgeGrace {
-                    pendingDeletes.remove(idString)
-                    pendingDeleteStamps[idString] = nil
-                    pendingPurges[idString] = nil
-                    continue
-                }
-                let stamp = pendingDeleteStamps[idString] ?? Date().timeIntervalSince1970
-                let tomb: [String: Any] = ["id": idString, "title": "", "kind": "notebook", "deleted": true,
-                                           "created": Date().timeIntervalSince1970,
-                                           "modified": stamp, "pageCount": 0]
-                _ = try await request("PUT", "/api/library/\(idString)", body: try JSONSerialization.data(withJSONObject: tomb))
+            //    Dokument wieder. Über Aufgeräumtes aus temp entscheidet Schritt 2 (siehe `pendingPurgeSeqs`)
+            for idString in pendingDeletes where pendingPurgeSeqs[idString] == nil {
+                _ = try await tombstone(idString, stamp: pendingDeleteStamps[idString] ?? Date().timeIntervalSince1970)
                 pendingDeletes.remove(idString)
                 pendingDeleteStamps[idString] = nil
-                pendingPurges[idString] = nil
             }
 
-            // 2. Vom Server übernehmen
+            // 2. Vom Server übernehmen. Was dieses Gerät vor der Abfrage wusste: Was erst währenddessen ankommt, kann
+            //    neuer sein als ihr Ergebnis
+            var seqBefore: [UUID: Int] = [:]
+            for doc in store.documents { seqBefore[doc.id] = state(doc.id).seq }
+            let lostBefore = lostAtServer
             struct Library: Decodable { var docs: [RemoteMeta] }
             let remote = try Self.decoder.decode(Library.self, from: try await request("GET", "/api/library")).docs
             var remoteByID: [UUID: RemoteMeta] = [:]
             for r in remote { remoteByID[r.id] = r }
             remoteSeqs = remoteByID.mapValues { $0.strokeSeq ?? 0 }
 
+            // Aufgeräumtes aus temp: Der Grabstein geht nur hinauf, wenn der Server seitdem nichts Neues hat, weder am
+            // Eintrag noch an Strichen (etwa von einem Gast im Browser, was den Eintrag nicht neuer macht). Sonst kommt
+            // das Dokument unten wieder, und das Aufräumen entscheidet später neu. Erst nach dieser Abfrage, egal wie
+            // lange der Grabstein wartete: Bis zu ihr kann jemand hineingeschrieben haben
+            var purgedNow = Set<UUID>()
+            for (idString, known) in pendingPurgeSeqs {
+                if let id = UUID(uuidString: idString), let r = remoteByID[id], r.deleted != true,
+                   let stamp = pendingDeleteStamps[idString],
+                   (r.strokeSeq ?? 0) <= known, r.modified.timeIntervalSince1970 <= stamp {
+                    let saved = try await tombstone(idString, stamp: stamp)
+                    if (try? Self.decoder.decode(RemoteMeta.self, from: saved))?.deleted == true { purgedNow.insert(id) }
+                }
+                pendingDeletes.remove(idString)
+                pendingDeleteStamps[idString] = nil
+                pendingPurgeSeqs[idString] = nil
+            }
+
             for r in remote {
                 let local = store.documents.first { $0.id == r.id }
                 if r.deleted == true {
-                    // Gelöscht: Was Schritt 3 beim Zurückholen vorhatte, entscheidet er neu
-                    if lostAtServer.contains(r.id) { lostAtServer.remove(r.id) }
+                    // Gelöscht: Was Schritt 3 beim Zurückholen vorhatte, entscheidet er neu. Erst während der Abfrage
+                    // Vermerktes bleibt: Die Antwort dazu kann einen neueren Eintrag kennen als diese Abfrage
+                    if lostAtServer.contains(r.id), lostBefore.contains(r.id) { lostAtServer.remove(r.id) }
                     guard let local else { continue }
                     // Anderswo gelöscht. Hier offen, oder hier seitdem geändert: behalten. Geändert bringt Schritt 3 es
                     // zurück (samt allen Strichen), sonst wird es nach dem Schließen gelöscht
                     let isOpen = openController?.doc.id == r.id
                     let unchanged = local.modified.timeIntervalSince1970 <= r.modified.timeIntervalSince1970 + 0.001
-                    // Am Server liegen Striche von nach dem Löschen (alle davor hat der Grabstein gelöscht), und hier kamen
-                    // seit dem letzten Abgleich, der es gültig sah, fremde Striche an: Jemand hat danach noch
-                    // hineingeschrieben, etwa ein Gast im Browser (das macht den Eintrag nicht neuer). Ist es hier offen
-                    // oder hat dieses Gerät alle diese Striche schon, gilt es als hier geändert und kommt zurück. Sonst
-                    // nicht: Es können späte Striche des löschenden Geräts sein, oder eigene, etwa der Rest eines
-                    // Hochladens aller Striche, das ein erneutes Löschen überholt hat
+                    // Am Server liegen Striche von nach dem Löschen (alle davor hat der Grabstein gelöscht): Jemand hat
+                    // danach noch hineingeschrieben, etwa ein Gast im Browser (das macht den Eintrag nicht neuer). Es gilt
+                    // als hier geändert und kommt zurück, wenn es hier offen ist und diese Striche noch nicht geholt hat
+                    // (läuft gerade ein Abgleich der Leinwand, entscheidet seine Antwort mit). Ebenso, wenn hier seit
+                    // dem letzten Abgleich, der es gültig sah, fremde Striche ankamen und es hier offen ist, dabei offen
+                    // war, oder dieses Gerät alle Striche danach schon hat. Sonst nicht: Es können späte Striche des
+                    // löschenden Geräts sein, oder eigene, etwa der Rest eines Hochladens aller Striche, das ein
+                    // erneutes Löschen überholt hat
                     let after = r.strokeSeq ?? 0
-                    if unchanged, after > 0, foreignSince.contains(r.id), isOpen || state(r.id).seq >= after {
+                    var back = false
+                    if unchanged, after > 0 {
+                        let seen = state(r.id).seq
+                        back = (isOpen && !busy.contains(r.id) && seen < after)
+                            || (foreignSince.contains(r.id) && (isOpen || foreignWhileOpen.contains(r.id) || seen >= after))
+                    }
+                    if back {
                         var touched = local
                         touched.modified = max(Date(), r.modified.addingTimeInterval(0.01))
                         store.save(touched)
@@ -611,18 +648,29 @@ final class SyncEngine: ObservableObject {
                         bulks[r.id] = nil
                         pageTargets[r.id] = nil
                         if resend.contains(r.id) { resend.remove(r.id) }
+                        if lostAtServer.contains(r.id) { lostAtServer.remove(r.id) }
                         if foreignSince.contains(r.id) { foreignSince.remove(r.id) }
+                        if foreignWhileOpen.contains(r.id) { foreignWhileOpen.remove(r.id) }
                         if refetching.contains(r.id) { refetching.remove(r.id) }
                         store.delete(local)
                     }
                     continue
                 }
                 if foreignSince.contains(r.id) { foreignSince.remove(r.id) }
-                if lostAtServer.contains(r.id) {
+                if foreignWhileOpen.contains(r.id) { foreignWhileOpen.remove(r.id) }
+                if lostAtServer.contains(r.id), lostBefore.contains(r.id) {
                     // Gilt wieder, nachdem der Server die Striche gelöscht hat: zurückgeholt (nur die Antwort ging
-                    // verloren), oder ein Eintrag hat den Grabstein ersetzt
+                    // verloren), oder ein Eintrag hat den Grabstein ersetzt. Nur was schon vor der Abfrage vermerkt war:
+                    // Die Antwort zu später Vermerktem kann einen Grabstein kennen, den diese Abfrage noch nicht zeigt
                     lostAtServer.remove(r.id)
                     if local != nil { resendAll(r.id) }
+                } else if local != nil, openController?.doc.id != r.id, let known = seqBefore[r.id],
+                          (r.strokeSeq ?? 0) < known, states[r.id]?.seq == known, !resend.contains(r.id) {
+                    // Der Server kennt weniger Striche, als dieses Gerät schon vor der Abfrage geholt hatte: Ein
+                    // Grabstein hat sie gelöscht, und ein Eintrag hat ihn ersetzt, ohne dass sie wieder hinaufgingen
+                    // (etwa einer, der genau zwischen Abfrage und Hochladen kam). Alle noch einmal hinauf. Hat sich der
+                    // Stand hier inzwischen geändert, entscheidet das der nächste Abgleich (sonst ginge alles doppelt)
+                    resendAll(r.id)
                 }
                 if var local {
                     // Ändert die offene Leinwand gerade selbst Seiten, ihr nicht dazwischen das PDF austauschen;
@@ -688,9 +736,9 @@ final class SyncEngine: ObservableObject {
                         c.remoteStructureChanged(pageCount: merged.pageCount, pdfChanged: pdfChanged)
                     }
                 } else {
-                    // Hier eben gelöscht (währenddessen; der Grabstein geht beim nächsten Abgleich hinauf): nicht
-                    // wieder anlegen und herunterladen
-                    if pendingDeletes.contains(r.id.uuidString) { continue }
+                    // Hier eben gelöscht (währenddessen; der Grabstein geht beim nächsten Abgleich hinauf) oder eben
+                    // aufgeräumt: nicht wieder anlegen und herunterladen
+                    if pendingDeletes.contains(r.id.uuidString) || purgedNow.contains(r.id) { continue }
                     // Neu auf diesem Gerät (oder nach dem Löschen wieder da): ohne alten Sync-Stand beginnen, sonst
                     // hielte der Abgleich alle früher bekannten Striche für hier gelöscht. Was das erste Holen bringt,
                     // ist der ganze Stand, nichts Neues von anderen
@@ -749,6 +797,7 @@ final class SyncEngine: ObservableObject {
                     lostAtServer.remove(id)
                     if (try? Self.decoder.decode(RemoteMeta.self, from: saved))?.deleted != true {
                         if foreignSince.contains(id) { foreignSince.remove(id) }
+                        if foreignWhileOpen.contains(id) { foreignWhileOpen.remove(id) }
                         resendAll(id)
                     }
                 }
@@ -768,6 +817,13 @@ final class SyncEngine: ObservableObject {
         } catch {
             status = error.localizedDescription
         }
+    }
+
+    /// Lädt einen Grabstein hoch (`stamp`: sein Zeitpunkt, Sekunden seit 1970). Antwort: der Eintrag, der jetzt gilt
+    private func tombstone(_ idString: String, stamp: Double) async throws -> Data {
+        let tomb: [String: Any] = ["id": idString, "title": "", "kind": "notebook", "deleted": true,
+                                   "created": Date().timeIntervalSince1970, "modified": stamp, "pageCount": 0]
+        return try await request("PUT", "/api/library/\(idString)", body: try JSONSerialization.data(withJSONObject: tomb))
     }
 
     /// Das Dokument gilt am Server wieder, nachdem ein Grabstein alle seine Striche gelöscht hat: alle noch einmal
@@ -794,23 +850,26 @@ final class SyncEngine: ObservableObject {
     }
 
     /// Merkt ein lokal gelöschtes Dokument vor, damit es auch auf den anderen Geräten verschwindet.
-    /// - Parameter unchangedSince: beim Aufräumen von temp der Stand des Dokuments (`modified`). Dann gilt der
-    ///   Grabstein nur, wenn es seitdem niemand geändert hat. Sonst nimmt ihn der Server nicht an, oder das Gerät mit
-    ///   der Änderung bringt das Dokument zurück
+    /// - Parameter unchangedSince: beim Aufräumen von temp der Stand des Dokuments (`modified`). Dann geht der
+    ///   Grabstein erst nach der nächsten Abfrage hinauf, und nur, wenn seitdem niemand das Dokument geändert oder
+    ///   hineingeschrieben hat (siehe Schritt 2)
     func noteDeleted(_ id: UUID, unchangedSince: Date? = nil) {
+        // Welche Striche dieses Gerät kannte (nach einem gelungenen Abgleich ist der Stand jedes Dokuments geladen)
+        let known = states[id]?.seq ?? 0
         states[id] = nil
         bulks[id] = nil
         pageTargets[id] = nil
         if resend.contains(id) { resend.remove(id) }
         if lostAtServer.contains(id) { lostAtServer.remove(id) }
         if foreignSince.contains(id) { foreignSince.remove(id) }
+        if foreignWhileOpen.contains(id) { foreignWhileOpen.remove(id) }
         if refetching.contains(id) { refetching.remove(id) }
         guard isConfigured else { return }
         pendingDeletes.insert(id.uuidString)
         // Knapp danach: Den gleich alten Eintrag am Server ersetzt er, jeden neueren nicht
         pendingDeleteStamps[id.uuidString] = unchangedSince.map { $0.timeIntervalSince1970 + 0.001 }
             ?? Date().timeIntervalSince1970
-        pendingPurges[id.uuidString] = unchangedSince == nil ? nil : Date().timeIntervalSince1970
+        pendingPurgeSeqs[id.uuidString] = unchangedSince == nil ? nil : known
     }
 
     // MARK: Briefkasten
