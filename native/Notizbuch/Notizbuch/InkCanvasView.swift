@@ -96,7 +96,8 @@ final class InkCanvasView: PKCanvasView {
             var kept = removed ?? base
             // Menü einer Auswahl (nicht nur „Einsetzen“ auf einer leeren Stelle): vorn „Claude fragen“
             var extra: [UIMenuElement] = []
-            if let ink = canvas as? InkCanvasView, let make = ink.selectionMenuItems, isSelectionMenu(kept) {
+            // Nur in PencilKits eigenem Menü: UIKits Vorschläge (ohne Menü von PencilKit) sähen sonst wie eine Auswahl aus
+            if result != nil, let ink = canvas as? InkCanvasView, let make = ink.selectionMenuItems, isSelectionMenu(kept) {
                 let space = (interaction as? UIEditMenuInteraction)?.view ?? (me as? UIView)
                 let point = (configuration as? UIEditMenuConfiguration)?.sourcePoint ?? .zero
                 extra = make(SelectionMenuContext(space: space, sourcePoint: point))

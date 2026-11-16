@@ -84,6 +84,8 @@ export class Store extends DurableObject {
                                        v INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS asks_doc ON asks (doc);
       CREATE INDEX IF NOT EXISTS asks_status ON asks (status);
+      CREATE TABLE IF NOT EXISTS asks_gone (id TEXT PRIMARY KEY, t REAL NOT NULL);
+      CREATE INDEX IF NOT EXISTS asks_gone_t ON asks_gone (t);
     `);
     // Lebenszeichen des Helfers am Mac: beantwortet, ohne das Objekt zu wecken (kostet so gut wie nichts)
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
@@ -452,6 +454,12 @@ export class Store extends DurableObject {
     return this.sql.exec("SELECT * FROM asks WHERE id = ?", askId).toArray()[0];
   }
 
+  /// Gelöschte Fragen merkt sich der Server 30 Tage (asks_gone): Lädt ein Gerät eine davon noch einmal hoch, weil die
+  /// Antwort auf sein erstes Hochladen verloren ging, kommt sie nicht wieder
+  askGone(askId) {
+    return this.sql.exec("SELECT 1 FROM asks_gone WHERE id = ?", askId).toArray().length > 0;
+  }
+
   /// Alle Fragen eines Dokuments mit der Version, bis zu der die Liste vollständig ist. Nur Antworten mit der ganzen
   /// Liste dürfen der App ihre bekannte Version setzen, sonst verpasst sie eine Änderung dazwischen
   docAsks(doc) {
@@ -469,7 +477,10 @@ export class Store extends DurableObject {
   /// ändert sich nichts
   async createAsk(request, doc, askId) {
     if (!UUID_RE.test(askId)) return fail("Ungültige Kennung", "bad-id", 400);
-    if (this.askRow(askId)) return json(this.docAsks(doc));
+    if (this.askRow(askId) || this.askGone(askId)) return json(this.docAsks(doc));
+    // Billige Prüfungen, bevor die Bilder gelesen werden (danach noch einmal: dazwischen kann anderes laufen)
+    const early = this.askRefused(doc, null);
+    if (early) return early;
     let form;
     try {
       form = await request.formData();
@@ -486,14 +497,11 @@ export class Store extends DurableObject {
     } catch {}
     const qb = await q.arrayBuffer(), pb = await p.arrayBuffer();
     // Ab hier ohne Unterbrechung: Dazwischen läuft nichts anderes
-    if (this.askRow(askId)) return json(this.docAsks(doc));
-    const d = this.sql.exec("SELECT meta FROM docs WHERE id = ?", doc).toArray()[0];
-    if (!d || JSON.parse(d.meta).deleted) return fail("Dokument nicht auf dem Server", "no-doc", 404);
+    if (this.askRow(askId) || this.askGone(askId)) return json(this.docAsks(doc));
     const anchor = cleanAnchor(meta?.anchor), qt = imageType(qb), pt = imageType(pb);
     if (!anchor || !qt || !pt) return fail("Stelle oder Bild ungültig", "bad-body", 400);
-    if (this.sql.exec("SELECT COUNT(*) AS n FROM asks WHERE status IN ('open', 'claimed')").one().n >= MAX_OPEN_ASKS) {
-      return fail("Zu viele offene Fragen", "too-many", 429);
-    }
+    const refused = this.askRefused(doc, meta);
+    if (refused) return refused;
     const now = Date.now() / 1000;
     let v;
     this.ctx.storage.transactionSync(() => {
@@ -513,10 +521,29 @@ export class Store extends DurableObject {
     return json(this.docAsks(doc));
   }
 
+  /// Warum eine neue Frage nicht angenommen wird, sonst null. Mit `meta` auch: gestellt auf einem älteren Seitenstand
+  /// (ein anderes Gerät hat inzwischen Seiten gelöscht oder eingefügt), dann stimmt ihre Stelle nicht mehr
+  askRefused(doc, meta) {
+    const d = this.sql.exec("SELECT meta FROM docs WHERE id = ?", doc).toArray()[0];
+    const docMeta = d ? JSON.parse(d.meta) : null;
+    if (!docMeta || docMeta.deleted) return fail("Dokument nicht auf dem Server", "no-doc", 404);
+    if (meta && Math.trunc(Number(meta.pv) || 0) < (Number(docMeta.pagesVersion) || 0)) {
+      return fail("Die Seiten haben sich inzwischen geändert", "stale-pages", 409);
+    }
+    if (this.sql.exec("SELECT COUNT(*) AS n FROM asks WHERE status IN ('open', 'claimed')").one().n >= MAX_OPEN_ASKS) {
+      return fail("Zu viele offene Fragen", "too-many", 429);
+    }
+    return null;
+  }
+
   /// Markierung löschen, auf allen Geräten
   deleteAsk(doc, askId) {
     const row = this.askRow(askId);
     if (row && row.doc === doc) this.dropAsks(doc, [row]);
+    // Noch nicht angekommen (ihr Hochladen ist vielleicht noch unterwegs): Kommt es später, legt es sie nicht mehr an
+    else if (!row && UUID_RE.test(askId)) {
+      this.sql.exec("INSERT OR REPLACE INTO asks_gone (id, t) VALUES (?, ?)", askId, Date.now() / 1000);
+    }
     return this.docAsks(doc);
   }
 
@@ -530,11 +557,15 @@ export class Store extends DurableObject {
   dropAsks(doc, rows) {
     if (!rows.length) return;
     let v;
+    const now = Date.now() / 1000;
     this.ctx.storage.transactionSync(() => {
       for (const r of rows) {
         if (r.status === "open" || r.status === "claimed") this.deleteAskImages(r.id);
         this.sql.exec("DELETE FROM asks WHERE id = ?", r.id);
+        this.sql.exec("INSERT OR REPLACE INTO asks_gone (id, t) VALUES (?, ?)", r.id, now);
       }
+      // Nach 30 Tagen vergessen: So lange wartet keine verlorene Antwort (liest nur die abgelaufenen, über den Index)
+      this.sql.exec("DELETE FROM asks_gone WHERE t < ?", now - 30 * 86400);
       v = this.nextAsksV();
     });
     this.asksChanged(doc, v);

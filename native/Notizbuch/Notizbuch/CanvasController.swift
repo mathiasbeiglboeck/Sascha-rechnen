@@ -1605,7 +1605,10 @@ extension CanvasController {
         restructuring = true
         Task { [weak self] in
             guard let self else { return }
+            // Wie beim Ändern der Seiten: eben anderswo gestellte Fragen rücken mit
+            self.sync.asks.refresh(self.doc.id)
             await self.fetchRemoteNow()
+            await self.sync.asks.waitIdle(self.doc.id, upTo: 4)
             // Eine eingefügte Seite fiele mit allem darauf weg. Steht inzwischen etwas darauf (auch von anderen
             // Geräten oder Gästen), lieber nicht rückgängig machen
             let before = self.layout
@@ -1621,12 +1624,16 @@ extension CanvasController {
                 do {
                     _ = try FileManager.default.replaceItemAt(url, withItemAt: backup)
                 } catch {
+                    // Nichts geändert: Rückgängig bleibt möglich (und räumt sonst beim Schließen der Übersicht auf)
+                    self.pageUndo = undo
                     self.restructuring = false
                     self.syncCycle()
                     done("Rückgängig fehlgeschlagen: \(error.localizedDescription)")
                     return
                 }
                 guard let restored = CGPDFDocument(url as CFURL) else {
+                    // Die Seiten bleiben gelöscht, die Fragen darauf mit
+                    self.sync.asks.dropHidden(self.doc.id, undo.hiddenAsks)
                     self.restructuring = false
                     self.syncCycle()
                     done("Rückgängig fehlgeschlagen: PDF lässt sich nicht öffnen")
@@ -1853,12 +1860,18 @@ extension CanvasController: UIGestureRecognizerDelegate {
         }
     }
 
-    /// Weg des Lassos, sobald er fertig ist. Antippen (Menü öffnen, Auswahl aufheben) und Verschieben der Auswahl
-    /// (eine Linie ohne Fläche) zählen nicht: Dann bleibt der vorige Weg
+    /// Weg des Lassos, sobald er fertig ist. Antippen (Menü öffnen, Auswahl aufheben) zählt nicht, dann bleibt der
+    /// vorige Weg. Verschieben der Auswahl (eine Linie ohne Fläche) und Winziges löschen ihn: Er passte nicht mehr.
+    /// Gemessen auf dem Bildschirm, also gleich in jeder Zoomstufe
     private func lassoEnded(_ raw: [CGPoint]) {
         guard k > 0 else { return }
-        let points = LassoGeometry.simplified(raw, minStep: 2)
-        guard points.count >= 8, LassoGeometry.area(points) >= 400 else { return }
+        let s = k * canvas.zoomScale
+        let points = LassoGeometry.simplified(raw, minStep: 2 / s)
+        guard points.count >= 8 else { return }
+        guard LassoGeometry.area(points) * s * s >= 400 else {
+            lassoPath = nil
+            return
+        }
         let box = LassoGeometry.bounds(points)
         lassoPath = LassoPath(points: points, bounds: box, inkPrint: inkPrint(near: box))
     }
@@ -2004,7 +2017,13 @@ extension CanvasController: UIGestureRecognizerDelegate {
         guard gestureRecognizer === askTap else { return true }
         let toolOwns = (erasing || pointing) && !viewOnly && (!isPad || touch.type == .pencil)
         guard !toolOwns else { return false }
-        return askOverlay.mark(at: touch.location(in: canvas), padding: touch.type == .pencil ? 2 : 10) != nil
+        // Kann diese Berührung zeichnen, wartet PencilKit kurz, ob es ein Antippen wird; der Rand um die Markierung
+        // bleibt dann schmal, damit ein Punkt gleich daneben Tinte wird. Sonst (Finger am iPad, nur Lesen) ist er
+        // breiter, zum leichteren Treffen
+        let canDraw = !viewOnly && (touch.type == .pencil || !isPad)
+        guard askOverlay.mark(at: touch.location(in: canvas), padding: canDraw ? 2 : 10) != nil else { return false }
+        if askTap.state == .possible { askTap.touchCanDraw = canDraw }
+        return true
     }
 
     @objc private func handleAskTap(_ g: MarkTapGesture) {

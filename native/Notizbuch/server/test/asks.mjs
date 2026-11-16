@@ -6,6 +6,10 @@
 // und SHORT_LEASE=1. Ohne SHORT_LEASE wird dieser Abschnitt übersprungen.
 const BASE = process.env.BASE || "http://127.0.0.1:8791";
 const KEY = process.env.KEY || "testkey";
+if (!/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(BASE)) {
+  console.error("Nur gegen einen lokalen Server (BASE=http://127.0.0.1:…), nie gegen den echten");
+  process.exit(2);
+}
 const H = { Authorization: `Bearer ${KEY}` };
 let failures = 0, passes = 0;
 const ok = (cond, msg, extra) => {
@@ -262,6 +266,42 @@ async function main() {
   r = await createAsk(doc, uuid(), { anchor: anchor(-1), pv: 1 });
   ok(r.status === 400 && r.data.code === "bad-body", "PUT with page -1 rejected", r);
 
+  console.log("== deleted asks stay deleted; asked on an older page version");
+  // Noch einmal hochgeladen, nachdem sie anderswo gelöscht wurde (die Antwort aufs erste Hochladen ging verloren)
+  const g1 = uuid();
+  await createAsk(doc, g1, { anchor: anchor(1), pv: 0 });
+  r = await api("DELETE", `/api/doc/${doc}/asks/${g1}`);
+  ok(r.status === 200 && !r.data.asks.some((a) => a.id === g1), "deleted", r.data);
+  await sleep(300);
+  const nHelper2 = helper.json().length;
+  r = await createAsk(doc, g1, { anchor: anchor(1), pv: 0 });
+  ok(r.status === 200 && !r.data.asks.some((a) => a.id === g1), "re-upload after delete: 200, not created again", r.data);
+  r = await api("GET", "/api/asks/open");
+  ok(!r.data.asks.some((a) => a.id === g1), "not open for the helper", r.data);
+  await sleep(300);
+  ok(!helper.json().slice(nHelper2).some((m) => m.type === "ask"), "no ask push for it", helper.json().slice(nHelper2));
+  // Gelöscht, bevor sie ankam: kommt sie später, entsteht sie nicht
+  const g2 = uuid();
+  r = await api("DELETE", `/api/doc/${doc}/asks/${g2}`);
+  ok(r.status === 200, "delete of an ask the server has not seen: ok", r.status);
+  r = await createAsk(doc, g2, { anchor: anchor(1), pv: 0 });
+  ok(r.status === 200 && !r.data.asks.some((a) => a.id === g2), "upload after its delete: not created", r.data);
+  // Mit ihrer Seite entfernt (PATCH null, oben a8): ebenso
+  r = await createAsk(doc, a8, { anchor: anchor(4), pv: 100 });
+  ok(r.status === 200 && !r.data.asks.some((a) => a.id === a8), "re-upload of an ask removed with its page: not created", r.data);
+  // Gefragt auf einem älteren Seitenstand, als der Server kennt
+  const pvDoc = await newDoc("Seiten");
+  const t2 = Date.now() / 1000;
+  r = await api("PUT", `/api/library/${pvDoc}`, { json: { id: pvDoc, title: "Seiten", kind: "pdf", created: t2, modified: t2 + 5, pageCount: 4, pagesVersion: 7000 } });
+  ok(r.status === 200 && r.data.pagesVersion === 7000, "page version raised", r.data);
+  r = await createAsk(pvDoc, uuid(), { anchor: anchor(1), pv: 6999 });
+  ok(r.status === 409 && r.data.code === "stale-pages", "older page version → 409 stale-pages", r);
+  r = await createAsk(pvDoc, uuid(), { anchor: anchor(1), pv: 7000 });
+  ok(r.status === 200 && r.data.asks.length === 1, "same page version accepted", r);
+  r = await createAsk(pvDoc, uuid(), { anchor: anchor(1), pv: 8000 });
+  ok(r.status === 200 && r.data.asks.length === 2, "newer page version (device ahead of the server) accepted", r);
+  for (const a of (await api("GET", `/api/doc/${pvDoc}/asks`)).data.asks) await api("DELETE", `/api/doc/${pvDoc}/asks/${a.id}`);
+
   console.log("== cap of open asks");
   const capDoc = await newDoc("Cap");
   let n429 = null;
@@ -311,6 +351,11 @@ async function main() {
   await sleep(400);
   ok(!gm.some((m) => m.includes('"asks"') || m.includes('"ask"')), "guest got no asks/ask message", gm);
   guest.close();
+
+  // Aufräumen: Offene Fragen blieben sonst für den nächsten Lauf (oder den Helfer-Test) liegen
+  for (const a of (await api("GET", `/api/doc/${doc}/asks`)).data.asks) await api("DELETE", `/api/doc/${doc}/asks/${a.id}`);
+  r = await api("GET", "/api/asks/open");
+  ok(r.data.asks.length === 0, "nothing left open", r.data);
 
   app.ws.close(); appOther.ws.close(); helper.ws.close();
   console.log(`\n${passes} passed, ${failures} failed`);

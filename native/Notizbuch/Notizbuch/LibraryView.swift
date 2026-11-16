@@ -79,8 +79,9 @@ struct LibraryView: View {
                 while !Task.isCancelled {
                     let before = sync.lastSync
                     await sync.syncLibrary()
-                    // Fragen an Claude, die noch hinauf müssen (auch aus geschlossenen Dokumenten)
-                    sync.asks.flushAll()
+                    // Fragen an Claude, die noch hinauf müssen (auch aus geschlossenen Dokumenten); war das Gerät
+                    // offline und der Abgleich klappte eben, gleich
+                    sync.asks.flushAll(online: sync.lastSync != before)
                     // Den temp-Ordner erst nach einem gelungenen Abgleich aufräumen, also auf dem Stand des Servers.
                     // Sonst löschte ein lange nicht geöffnetes Gerät von seinem alten Stand aus Dokumente, die ein
                     // anderes inzwischen behalten (verschoben) oder beschrieben hat, und mit ihm überall. Dokumente mit
@@ -96,8 +97,9 @@ struct LibraryView: View {
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active {
                     Task {
+                        let before = sync.lastSync
                         await sync.syncLibrary()
-                        sync.asks.flushAll()
+                        sync.asks.flushAll(online: sync.lastSync != before)
                     }
                 }
             }

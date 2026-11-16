@@ -208,6 +208,10 @@ final class LassoTracker: UIGestureRecognizer {
 final class MarkTapGesture: UIGestureRecognizer {
     /// PencilKits Zeichnen (auch das Lasso): wartet auf diese Geste
     weak var drawing: UIGestureRecognizer?
+    /// Kann die Berührung auf der Markierung selbst zeichnen (Pencil; am iPhone beim Schreiben auch der Finger)? Nur
+    /// dann wartet PencilKit: Ein Finger oder Handballen am iPad hielte sonst jeden Strich des Pencils auf. Setzt der
+    /// Delegate, bevor UIKit nach dem Warten fragt
+    var touchCanDraw = true
     private var tracked: UITouch?
     private var start = CGPoint.zero
     private var timeout: DispatchWorkItem?
@@ -250,11 +254,13 @@ final class MarkTapGesture: UIGestureRecognizer {
         tracked = nil
         timeout?.cancel()
         timeout = nil
+        touchCanDraw = true
     }
 
     /// PencilKit (Stift und Lasso) wartet, ob es ein Antippen wird; Scrollen, Zoomen, Schweben und die eigenen
     /// Gesten der App nicht
     override func shouldBeRequiredToFail(by otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard touchCanDraw else { return false }
         if otherGestureRecognizer === drawing { return true }
         if otherGestureRecognizer is UIPanGestureRecognizer || otherGestureRecognizer is UIPinchGestureRecognizer
             || otherGestureRecognizer is UIHoverGestureRecognizer || otherGestureRecognizer is SingleTouchGesture

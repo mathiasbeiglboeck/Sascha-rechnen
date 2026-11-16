@@ -51,6 +51,9 @@ struct Ask: Codable, Identifiable, Equatable {
     var isFailed: Bool { status == "failed" }
     var isWaiting: Bool { !isAnswered && !isFailed }
     var isThorough: Bool { effort == "thorough" }
+    /// Hier gestellt, nie am Server angekommen, und das bleibt so (abgelehnt, Bilder fehlen): Verschieben und Löschen
+    /// gehen nur hier
+    var failedHere: Bool { v == nil && status != "local" }
     /// Wird angezeigt: nicht gerade gelöscht, ihre Seite nicht gelöscht (hier: `hidden`; auf einem anderen Gerät:
     /// Seite −1 vom Server, bis dort Rückgängig sie zurückbringt oder sie mit der Seite verschwindet)
     var isVisible: Bool { deleting != true && hidden != true && anchor.page >= 0 }
@@ -85,6 +88,9 @@ final class AskStore: ObservableObject {
     /// Der Server kannte „Claude fragen“ beim letzten Versuch nicht: erst billig nachsehen, bevor wieder Bilder
     /// hinaufgehen
     private var serverTooOld = false
+    /// Dokumente, deren letzter Versuch am Netz scheiterte (offline): Klappt der Abgleich der Bibliothek wieder, geht
+    /// es gleich weiter statt erst nach der Wartezeit
+    private var offline = Set<UUID>()
 
     init(store: DocumentStore, sync: SyncEngine) {
         self.store = store
@@ -145,7 +151,9 @@ final class AskStore: ObservableObject {
     }
 
     private func updatePending(_ doc: UUID) {
-        let pending = hasLocalWork(doc)
+        // Auch mit Fragen, deren Seite eben gelöscht wurde: Endet die App, bevor die Übersicht zu ist, löscht sie der
+        // nächste Start (das Laden der Liste macht aus ihnen zu löschende)
+        let pending = hasLocalWork(doc) || asks(doc).contains { $0.hidden == true }
         guard pending != pendingDocs.contains(doc) else { return }
         if pending { pendingDocs.insert(doc) } else { pendingDocs.remove(doc) }
         UserDefaults.standard.set(pendingDocs.map(\.uuidString), forKey: Self.pendingKey)
@@ -185,12 +193,12 @@ final class AskStore: ObservableObject {
                 guard let j = mapping(list[i].anchor.page) else {
                     list[i].hidden = true
                     // Noch nicht am Server: Sie geht erst hinauf, wenn Rückgängig sie zurückbringt
-                    list[i].moved = list[i].status == "local" ? nil : true
+                    list[i].moved = list[i].v == nil ? nil : true
                     hidden.append(list[i].id)
                     continue
                 }
                 list[i].anchor.page = max(j, 0)
-                list[i].moved = true
+                list[i].moved = list[i].failedHere ? nil : true
             }
         }
         refresh(doc)
@@ -205,7 +213,7 @@ final class AskStore: ObservableObject {
             for i in list.indices where ids.contains(list[i].id) && list[i].hidden == true {
                 list[i].hidden = nil
                 list[i].pv = pv
-                list[i].moved = true
+                list[i].moved = list[i].failedHere ? nil : true
             }
         }
         refresh(doc)
@@ -264,9 +272,13 @@ final class AskStore: ObservableObject {
     }
 
     /// Schickt hinauf, was in anderen (auch geschlossenen) Dokumenten noch wartet: aus der Schleife der Bibliothek
-    /// und beim Zurückkommen in die App. Ohne Wartendes keine Anfrage; nach einem Fehler gilt dessen Wartezeit
-    func flushAll() {
-        for doc in pendingDocs where !running.contains(doc) && retries[doc] == nil { refresh(doc) }
+    /// und beim Zurückkommen in die App. Ohne Wartendes keine Anfrage. Nach einem Fehler gilt dessen Wartezeit, außer
+    /// das Gerät war offline und der Abgleich der Bibliothek klappte eben wieder (`online`)
+    func flushAll(online: Bool = false) {
+        for doc in pendingDocs where !running.contains(doc) {
+            if retries[doc] != nil, !(online && offline.contains(doc)) { continue }
+            if hasLocalWork(doc) { refresh(doc) } else { updatePending(doc) }
+        }
     }
 
     private func pass(_ doc: UUID) async {
@@ -277,12 +289,16 @@ final class AskStore: ObservableObject {
                 apply(doc, try await sync.fetchAsks(doc))
                 serverTooOld = false
             }
-            try await flush(doc)
+            // Scheitert eine neue Frage (etwa ein großes Bild bei schlechtem Netz), kommen Antworten trotzdem herein
+            let uploadError = try await flush(doc)
             apply(doc, try await sync.fetchAsks(doc))
+            if let uploadError { throw uploadError }
             failures[doc] = nil
+            offline.remove(doc)
         } catch {
             let problem = Self.classify(error)
             if case .notConfigured = problem { return }
+            if error is URLError { offline.insert(doc) } else { offline.remove(doc) }
             if case .oldServer = problem {
                 serverTooOld = true
                 note(doc, "Server-Update nötig")
@@ -296,7 +312,8 @@ final class AskStore: ObservableObject {
             let wait: Double
             switch problem {
             case .oldServer: wait = 300
-            case .tooMany: wait = 120
+            // Am Mac stauen sich Fragen (aus oder am Nutzungslimit): seltener, jedes Mal gehen die Bilder mit
+            case .tooMany: wait = min(120 * pow(2, Double(min(n - 1, 4))), 1800)
             default: wait = min(20 * pow(2, Double(min(n - 1, 4))), 300)
             }
             scheduleRetry(doc, after: wait)
@@ -305,13 +322,16 @@ final class AskStore: ObservableObject {
 
     /// Muss etwas hinauf? (Eine neue Frage, deren Seite eben gelöscht wurde, wartet auf Rückgängig, nicht auf den Server)
     private func hasLocalWork(_ doc: UUID) -> Bool {
-        asks(doc).contains { ($0.status == "local" && $0.hidden != true) || $0.deleting == true || $0.moved == true }
+        asks(doc).contains {
+            ($0.status == "local" && $0.hidden != true) || $0.deleting == true || ($0.moved == true && $0.v != nil)
+        }
     }
 
     private func drop(_ doc: UUID) {
         lists[doc] = nil
         versions[doc] = nil
         failures[doc] = nil
+        offline.remove(doc)
         retries[doc]?.cancel()
         retries[doc] = nil
         if pendingDocs.remove(doc) != nil {
@@ -336,24 +356,37 @@ final class AskStore: ObservableObject {
         }
     }
 
-    /// Erst Löschen, dann neue Fragen, dann verschobene Stellen. Netzfehler brechen ab (später noch einmal),
-    /// was nie gelingen kann, wird hier als gescheitert vermerkt
-    private func flush(_ doc: UUID) async throws {
+    /// Erst Löschen, dann neue Fragen, dann verschobene Stellen. Netzfehler beim Löschen und Verschieben brechen ab
+    /// (später noch einmal); scheitert eine neue Frage, geht der Rest trotzdem und ihr Fehler kommt zurück. Was nie
+    /// gelingen kann, wird hier als gescheitert vermerkt
+    private func flush(_ doc: UUID) async throws -> Error? {
         for ask in asks(doc) where ask.deleting == true {
+            // Nie am Server angekommen und gescheitert: Löschen geht nur hier
+            if ask.failedHere {
+                forget(doc, ask.id)
+                continue
+            }
             do {
                 let list = try await sync.deleteAsk(doc, ask.id)
                 forget(doc, ask.id)
                 apply(doc, list)
             } catch {
-                // Älterer Server oder Dokument dort weg: Eine nie hochgeladene Frage ist damit erledigt
                 switch Self.classify(error) {
-                case .oldServer, .noDoc: forget(doc, ask.id)
+                // Dokument am Server weg: seine Fragen mit
+                case .noDoc: forget(doc, ask.id)
+                // Älterer Server: Eine nie hochgeladene Frage ist damit erledigt, eine von ihm bekannte nicht
+                case .oldServer where ask.v == nil: forget(doc, ask.id)
                 default: throw error
                 }
             }
         }
 
-        for ask in asks(doc) where ask.status == "local" && ask.deleting != true && ask.hidden != true {
+        var uploadError: Error?
+        for id in asks(doc).filter({ $0.status == "local" }).map(\.id) {
+            // Jedes Mal frisch gelesen: Während eine andere hochging, kann sich diese geändert haben (Seite gelöscht,
+            // gelöscht, vom Server schon bekannt)
+            guard uploadError == nil, let ask = self.ask(doc, id), ask.status == "local", ask.deleting != true,
+                  ask.hidden != true else { continue }
             let folder = imageFolder(doc, ask.id)
             guard let question = try? Data(contentsOf: folder.appendingPathComponent("question.png")),
                   let page = try? Data(contentsOf: folder.appendingPathComponent("page.jpg")) else {
@@ -362,28 +395,41 @@ final class AskStore: ObservableObject {
             }
             let list: SyncEngine.AskList
             do {
-                list = try await sync.uploadAsk(doc, ask, question: question, page: page)
+                list = try await upload(doc, ask, question: question, page: page)
             } catch {
                 switch Self.classify(error) {
-                case .noDoc:
-                    // Neues Dokument, noch nicht am Server: erst die Bibliothek abgleichen, dann noch einmal
-                    await sync.syncLibrary()
-                    list = try await sync.uploadAsk(doc, ask, question: question, page: page)
                 case .tooMany:
                     note(doc, "Zu viele offene Fragen, diese wartet")
-                    throw error
+                    uploadError = error
                 case .rejected(let message):
-                    fail(doc, ask.id, "Der Server nimmt die Frage nicht an: \(message)")
-                    continue
+                    fail(doc, ask.id, message)
+                case .stalePages:
+                    // Hier inzwischen mitgerückt (die Seiten änderten sich, während sie hochging): gleich noch einmal
+                    // mit der neuen Stelle. Sonst ist die Stelle veraltet
+                    if let now = self.ask(doc, ask.id), now.pv > ask.pv {
+                        again.insert(doc)
+                    } else {
+                        fail(doc, ask.id, "Die Seiten haben sich inzwischen geändert. Bitte noch einmal fragen.")
+                    }
                 default:
-                    throw error
+                    uploadError = error
                 }
+                continue
             }
             try? FileManager.default.removeItem(at: folder)
-            // Inzwischen verschoben (Seiten geändert, während sie hochging): Das Verschieben folgt gleich
+            // Inzwischen auf einem anderen Gerät gelöscht (die Antwort aufs erste Hochladen ging verloren; der Server
+            // merkt sich gelöschte Fragen): hier auch weg
+            guard let server = list.asks.first(where: { $0.id == ask.id }) else {
+                forget(doc, ask.id)
+                apply(doc, list)
+                continue
+            }
+            // Steht sie am Server anders als hier (inzwischen verschoben oder ihre Seite gelöscht, oder der Server hatte
+            // sie schon von einem früheren Versuch), folgt das Verschieben gleich
             edit(doc) { l in
                 guard let i = l.firstIndex(where: { $0.id == ask.id }) else { return }
-                if l[i].anchor == ask.anchor, l[i].pv == ask.pv { l[i].moved = nil }
+                let same = server.anchor == l[i].anchor && server.pv == l[i].pv && l[i].hidden != true
+                l[i].moved = same ? nil : true
                 l[i].localNote = nil
             }
             apply(doc, list)
@@ -391,7 +437,7 @@ final class AskStore: ObservableObject {
 
         // Verschobene Stellen; eine Frage auf einer eben gelöschten Seite bekommt Seite −1 (unsichtbar, bis
         // Rückgängig sie zurückbringt). Ein älterer Server übergeht die −1, dann bleibt es wie bisher
-        let moved = asks(doc).filter { $0.moved == true && $0.status != "local" && $0.deleting != true }
+        let moved = asks(doc).filter { $0.moved == true && $0.v != nil && $0.deleting != true }
         for (pv, group) in Dictionary(grouping: moved, by: \.pv) {
             let anchors = Dictionary(group.map { a -> (String, AskAnchor) in
                 var anchor = a.anchor
@@ -408,6 +454,18 @@ final class AskStore: ObservableObject {
                 }
             }
             apply(doc, list)
+        }
+        return uploadError
+    }
+
+    /// Eine neue Frage hinauf; ist ihr Dokument noch nicht am Server, erst die Bibliothek abgleichen
+    private func upload(_ doc: UUID, _ ask: Ask, question: Data, page: Data) async throws -> SyncEngine.AskList {
+        do {
+            return try await sync.uploadAsk(doc, ask, question: question, page: page)
+        } catch {
+            guard case .noDoc = Self.classify(error) else { throw error }
+            await sync.syncLibrary()
+            return try await sync.uploadAsk(doc, ask, question: question, page: page)
         }
     }
 
@@ -426,17 +484,24 @@ final class AskStore: ObservableObject {
                 }
                 // Gelesen bleibt gelesen, solange die Antwort dieselbe ist
                 if r.isAnswered, l.isAnswered, l.answer == r.answer { r.seen = l.seen }
+                // Hier noch nicht hochgeladen, am Server aber schon (die Antwort aufs Hochladen ging verloren): Die
+                // Bilder braucht es nicht mehr
+                if l.status == "local" { forgetImages(doc, l.id) }
                 if l.moved == true || l.hidden == true {
                     r.anchor = l.anchor
                     r.pv = l.pv
-                    r.moved = l.moved
                     r.hidden = l.hidden
+                    // Wurde sie hier verschoben oder ihre Seite gelöscht, bevor sie oben war, geht die Stelle gleich
+                    // hinauf (gelöschte Seite: −1)
+                    r.moved = l.status == "local" ? true : l.moved
                 }
             }
             merged.append(r)
         }
         for l in local where !remoteIDs.contains(l.id) {
-            if l.status == "local", l.deleting != true {
+            // Hier gestellt und nie am Server angekommen (wartet oder scheiterte): bleibt, bis sie oben ist oder
+            // gelöscht wird. Was der Server kannte und nicht mehr liefert, ist anderswo gelöscht
+            if l.v == nil, l.deleting != true {
                 merged.append(l)
             } else {
                 forgetImages(doc, l.id)
@@ -484,8 +549,10 @@ final class AskStore: ObservableObject {
         /// Dokument (noch) nicht am Server
         case noDoc
         case tooMany
-        /// Kann so nie gelingen (Bild zu groß, ungültig)
+        /// Kann so nie gelingen (Bild zu groß, ungültig); mit dem Text für die Karte
         case rejected(String)
+        /// Gefragt auf einem älteren Seitenstand, als der Server kennt: Die Stelle stimmt nicht mehr
+        case stalePages
         /// Netz, Server gerade nicht erreichbar, falscher Schlüssel …: später noch einmal
         case transient
     }
@@ -501,8 +568,12 @@ final class AskStore: ObservableObject {
             switch (status, parsed?.code) {
             case (404, .some("no-doc")): return .noDoc
             case (404, .none): return .oldServer
-            case (429, _): return .tooMany
-            case (400, _), (413, _): return .rejected(parsed?.error ?? "Fehler \(status)")
+            case (429, .some("too-many")): return .tooMany
+            case (409, .some("stale-pages")): return .stalePages
+            // Nur begründete Ablehnungen sind endgültig; ein 400 ohne Kennung ist ein Fehler am Server (etwa sein
+            // Tageslimit) und geht später noch einmal
+            case (400, .some), (413, _):
+                return .rejected("Der Server nimmt die Frage nicht an: \(parsed?.error ?? "Fehler \(status)")")
             default: return .transient
             }
         }
