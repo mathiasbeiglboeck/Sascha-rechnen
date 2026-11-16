@@ -21,6 +21,8 @@ struct LibraryView: View {
     @State private var folderName = ""
     @State private var moving: NoteDocument?
     @State private var renamingFolder: String?
+    /// Einrichtungslink, der erst nach Bestätigung gilt
+    @State private var pendingSetup: SetupLink?
     /// Angelegte, aber noch leere Ordner (nur auf diesem Gerät; mit dem ersten Dokument gelten sie überall)
     @AppStorage("emptyFolders") private var emptyFoldersRaw = ""
 
@@ -169,11 +171,13 @@ struct LibraryView: View {
             // PDFs, die aus einer anderen App (Dateien, Mail, AirDrop …) mit „Notizbuch“ geöffnet werden
             .onOpenURL { url in
                 // Einrichtungslink: notizbuch://setup?url=https://…&key=…
+                // Gilt erst nach Bestätigung: Ein Link, etwa von einer Webseite, soll die Synchronisation nicht unbemerkt
+                // auf einen fremden Server umstellen können
                 if url.scheme == "notizbuch", url.host == "setup",
                    let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems {
-                    if let server = items.first(where: { $0.name == "url" })?.value { sync.serverURL = server }
-                    if let key = items.first(where: { $0.name == "key" })?.value { sync.key = key }
-                    showSettings = true
+                    let setup = SetupLink(server: items.first(where: { $0.name == "url" })?.value,
+                                          key: items.first(where: { $0.name == "key" })?.value)
+                    if setup.server != nil || setup.key != nil { pendingSetup = setup }
                     return
                 }
                 guard url.pathExtension.lowercased() == "pdf" else { return }
@@ -222,7 +226,42 @@ struct LibraryView: View {
             } message: {
                 Text(importError ?? "")
             }
+            .alert(pendingSetup?.title ?? "",
+                   isPresented: Binding(get: { pendingSetup != nil }, set: { if !$0 { pendingSetup = nil } }),
+                   presenting: pendingSetup) { setup in
+                Button("Abbrechen", role: .cancel) {}
+                Button("Übernehmen") {
+                    if let server = setup.server { sync.serverURL = server }
+                    if let key = setup.key { sync.key = key }
+                    // Erst wenn die Meldung weg ist, sonst erscheinen die Einstellungen nicht
+                    DispatchQueue.main.async { showSettings = true }
+                }
+            } message: { setup in
+                Text(setup.message)
+            }
         }
+    }
+}
+
+/// Server und Schlüssel aus einem Einrichtungslink (notizbuch://setup?url=…&key=…), bis sie bestätigt sind
+private struct SetupLink {
+    let server: String?
+    let key: String?
+
+    var title: String {
+        server != nil ? "Mit diesem Server synchronisieren?" : "Schlüssel für den Sync ändern?"
+    }
+
+    var message: String {
+        let change: String
+        if let server = server {
+            // Der Rechnername des Servers (ohne Benutzerteil vor einem @), sonst die ganze Adresse
+            let host = URL(string: server)?.host ?? server
+            change = "Ein Link will den Sync auf „\(host)“ umstellen. Deine Notizen gehen dann an diesen Server."
+        } else {
+            change = "Ein Link will den Schlüssel für den Sync ändern."
+        }
+        return change + " Nur übernehmen, wenn der Link aus deiner eigenen Einrichtung stammt."
     }
 }
 
