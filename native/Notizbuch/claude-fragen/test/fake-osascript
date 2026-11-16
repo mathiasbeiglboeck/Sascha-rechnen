@@ -1,0 +1,19 @@
+#!/usr/bin/env node
+// Ersatz für osascript in Tests des Helfers (Linux): seiten.js mit -l JavaScript <script> <pdf> <ziel> <von> <bis>,
+// oder -e (Mitteilung). $FAKE_STATE/pages.json: { "n": <Seitenzahl>, "fail": true }
+const fs = require("fs"), path = require("path");
+const DIR = process.env.FAKE_STATE || path.join(require("os").tmpdir(), "betternotes-fake");
+fs.mkdirSync(DIR, { recursive: true });
+let cfg = { n: 30 };
+try { cfg = JSON.parse(fs.readFileSync(path.join(DIR, "pages.json"), "utf8")); } catch {}
+if (process.argv[2] === "-e") {
+  fs.appendFileSync(path.join(DIR, "calls.jsonl"), JSON.stringify({ notify: process.argv[3] }) + "\n");
+  process.exit(0);
+}
+const [l, lang, script, pdf, target, from, to] = process.argv.slice(2);
+fs.appendFileSync(path.join(DIR, "calls.jsonl"), JSON.stringify({ osascript: { l, lang, script: path.basename(script), scriptOK: fs.readFileSync(script, "utf8").includes("insertPageAtIndex"), pdf: path.basename(pdf), from, to }, envKeys: Object.keys(process.env).filter((k) => /NOTIZBUCH|BETTERNOTES/i.test(k)) }) + "\n");
+if (cfg.fail) { process.stderr.write("execution error: PDFKit kaputt (-2700)\n"); process.exit(1); }
+const n = cfg.n, first = Math.max(0, Number(from)), last = Math.min(n - 1, Number(to));
+if (first > last) { process.stdout.write("leer " + n + "\n"); process.exit(0); }
+fs.writeFileSync(target, "%PDF-1.4 window " + first + "-" + last);
+process.stdout.write(`ok ${first + 1} ${last + 1} ${n}\n`);

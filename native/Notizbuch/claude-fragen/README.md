@@ -62,3 +62,14 @@ Schnittstelle am Server (alle mit `Authorization: Bearer <Schlüssel>`):
 | `PUT /api/asks/<id>/answer` | Helfer | `{claim, markdown}`, `{claim, error}` oder `{claim, release: true, note, retryAfter}` |
 
 Nach jeder Änderung schickt der Server den Apps mit diesem Dokument offen `{"type":"asks","v":N}`; Gäste eines geteilten Links bekommen nichts davon.
+
+Tests (nur gegen einen lokalen Server mit Wegwerf-Schlüssel, nie gegen den echten):
+
+```sh
+cd native/Notizbuch/server && npx wrangler dev --ip 127.0.0.1 --port 8791 --var SECRET:testkey --persist-to "$(mktemp -d)"
+# in einem zweiten Terminal, im Ordner des Repos:
+BASE=http://127.0.0.1:8791 KEY=testkey node native/Notizbuch/server/test/asks.mjs
+BASE=http://127.0.0.1:8791 KEY=testkey node native/Notizbuch/claude-fragen/test/helper-test.mjs
+```
+
+`helper-test.mjs` startet den Helfer mit `test/fake-claude` statt Claude Code und `test/fake-osascript` statt macOS. `fake-claude` lässt sich auch von Hand als `claude` in einer Test-`config.json` eintragen: Mit `{"mode": "rich"}` in `$FAKE_STATE/mode.json` antwortet er mit Formeln, Liste und Code, um die Karte in der App anzusehen.
