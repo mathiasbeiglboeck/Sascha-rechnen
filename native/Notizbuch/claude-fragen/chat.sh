@@ -7,8 +7,11 @@
 set -euo pipefail
 DEST="${BETTERNOTES_HELFER_HOME:-$HOME/Library/Application Support/BetterNotes-Helfer}"
 if [[ ! -f "$DEST/state.json" ]]; then echo "Noch keine Chats."; exit 0; fi
-CLAUDE=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).claude' "$DEST/config.json")
-LIST=("${(@f)$(node -e '
+source "${0:A:h}/finden.sh"
+NODE=$(finde_node) || { echo "Node.js nicht gefunden (node)."; exit 1; }
+CLAUDE=$("$NODE" -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).claude || ""' "$DEST/config.json")
+if [[ ! -x $CLAUDE ]]; then CLAUDE=$(finde_claude || finde_app_claude) || { echo "Claude Code nicht gefunden."; exit 1; }; fi
+LIST=("${(@f)$("$NODE" -e '
   const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
   const q = (process.argv[2] || "").toLowerCase();
   for (const [id, d] of Object.entries(s.docs || {}))

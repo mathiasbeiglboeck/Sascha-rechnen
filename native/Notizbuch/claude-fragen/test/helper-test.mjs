@@ -13,7 +13,8 @@ const BASE = process.env.BASE || "http://127.0.0.1:8791";
 const KEY = process.env.KEY || "testkey";
 const H = { Authorization: `Bearer ${KEY}` };
 const HELFER = process.env.HELFER || path.join(S, "..", "helfer.mjs");
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "bn-helfer-test-"));
+// realpath: Am Mac ist os.tmpdir() ein Verweis (/var → /private/var), Claude sieht aber den echten Pfad
+const TMP = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bn-helfer-test-"));
 const HOME = path.join(TMP, "home");
 const FAKE = path.join(TMP, "fake");
 const FAKE_CLAUDE = path.join(S, "fake-claude"), FAKE_OSASCRIPT = path.join(S, "fake-osascript");
@@ -57,10 +58,10 @@ const setPages = (cfg) => fs.writeFileSync(path.join(FAKE, "pages.json"), JSON.s
 const writeConfig = (extra = {}) => fs.writeFileSync(path.join(HOME, "config.json"), JSON.stringify({ url: BASE, key: KEY, claude: FAKE_CLAUDE, retrySeconds: 3, minPauseSeconds: 4, pollSeconds: 300, ...extra }), { mode: 0o600 });
 const logText = () => fs.readFileSync(path.join(HOME, "helfer.log"), "utf8");
 const promptOf = (c) => c.args[c.args.indexOf("-p") + 1];
-function startHelper() {
+function startHelper(env = {}) {
   const out = fs.openSync(path.join(TMP, "helfer.out"), "a");
   helper = spawn(process.execPath, [HELFER], {
-    env: { ...process.env, BETTERNOTES_HELFER_HOME: HOME, BETTERNOTES_HELFER_ECHO: "1", BETTERNOTES_HELFER_OSASCRIPT: FAKE_OSASCRIPT, FAKE_STATE: FAKE, NOTIZBUCH_KEY: "must-not-leak", NOTIZBUCH_URL: "x" },
+    env: { ...process.env, BETTERNOTES_HELFER_HOME: HOME, BETTERNOTES_HELFER_ECHO: "1", BETTERNOTES_HELFER_OSASCRIPT: FAKE_OSASCRIPT, FAKE_STATE: FAKE, NOTIZBUCH_KEY: "must-not-leak", NOTIZBUCH_URL: "x", ...env },
     stdio: ["ignore", out, out],
   });
 }
@@ -217,12 +218,12 @@ async function main() {
   ok(/frage\.png: die handgeschriebene Frage\n- \S+seite\.jpg: die ganze Seite, die Frage/.test(promptOf(c)) && calls().filter((x) => x.osascript).length === osaBefore, "deleted page: whole page without number, no window", promptOf(c));
   ok(/Seite gelöscht/.test(logText()), "log says the page was deleted");
 
-  async function restartWith(fn) {
+  async function restartWith(fn, env) {
     helper.kill("SIGTERM");
     await sleep(500);
     fn();
     const before = logText().split("\n").length;
-    startHelper();
+    startHelper(env);
     await waitFor(() => logText().split("\n").slice(before - 1).some((l) => l.includes("verbunden")), 10000);
   }
   async function askOnce(effort = "quick") {
@@ -252,14 +253,58 @@ async function main() {
   ok(r.c.args.includes("--restricted"), "restricted again with the default config");
   setPages({ n: 30 });
 
+  // Der Helfer sucht auch in /opt/homebrew/bin und /usr/local/bin: Liegt dort ein echtes claude, fiele der Test darauf
+  // herein (und würde es aufrufen). Dann diese beiden Abschnitte auslassen
+  const realClaude = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"].filter((f) => fs.existsSync(f));
+  if (realClaude.length) {
+    console.log("== skipped: finding Claude Code (a real claude lies in " + realClaude.join(", ") + ")");
+  } else {
+    console.log("== no claude in config.json: the newest copy in the Claude app is found");
+    // wie am Mac ohne claude im Terminal: ~/Library/Application Support/Claude/claude-code/<Version>/<Kennung>/claude.app/…
+    const userHome = path.join(TMP, "userhome");
+    const appCopy = (version, build) => {
+      const d = path.join(userHome, "Library", "Application Support", "Claude", "claude-code", version, build, "claude.app", "Contents", "MacOS");
+      fs.mkdirSync(d, { recursive: true });
+      fs.symlinkSync(FAKE_CLAUDE, path.join(d, "claude"));
+      return path.join(d, "claude");
+    };
+    appCopy("2.1.99", "a1");
+    const newest = appCopy("2.1.325", "b2");
+    fs.writeFileSync(path.join(userHome, "Library", "Application Support", "Claude", "claude-code", ".DS_Store"), "");
+    // PATH nur mit node (fake-claude braucht ihn), nie mit einem echten claude daneben
+    const nodeOnly = path.join(TMP, "nodebin");
+    fs.mkdirSync(nodeOnly, { recursive: true });
+    fs.symlinkSync(process.execPath, path.join(nodeOnly, "node"));
+    const onlyNode = { HOME: userHome, PATH: [nodeOnly, "/usr/bin", "/bin"].join(path.delimiter) };
+    await restartWith(() => writeConfig({ claude: undefined }), onlyNode);
+    r = await askOnce();
+    ok(r.done, "answered without claude in config.json");
+    ok(logText().includes(`Claude Code: da (${newest})`), "the newest app copy is used", logText().split("\n").filter((l) => l.includes("Claude Code")).slice(-2));
+
+    console.log("== no claude anywhere: released with a note, pause");
+    fs.rmSync(path.join(userHome, "Library"), { recursive: true, force: true });
+    await restartWith(() => {}, onlyNode);
+    a = await createAsk(doc, "quick", 1);
+    const nf = await waitFor(async () => { const x = await askOf(doc, a.id); return x.status === "open" && x.note ? x : null; }, 15000, 200);
+    ok(nf && /nicht zu finden/.test(nf.note), "app sees the not-found note", nf);
+    ok(/Claude Code nicht gefunden/.test(logText()) && /Claude Code fehlt, Pause 30 Minuten/.test(logText()), "helper logs it and pauses");
+    await sleep(500);
+    ok(calls().filter((x) => x.notify && /fehlt/.test(x.notify)).length === 1, "one notification on the Mac");
+    await api("DELETE", `/api/doc/${doc}/asks/${a.id}`);
+    await restartWith(() => writeConfig());
+
+  }
+
   console.log("== logged out: released with a note, pause, one notification");
+  const notesBefore = calls().filter((x) => x.notify).length;
   setMode({ mode: "auth" });
   a = await createAsk(doc, "quick", 1);
   const au = await waitFor(async () => { const x = await askOf(doc, a.id); return x.status === "open" && x.note ? x : null; }, 15000, 200);
   ok(au && /abgemeldet/.test(au.note), "app sees the logged-out note", au);
   ok(/abgemeldet, Pause 30 Minuten/.test(logText()), "helper pauses");
   await sleep(500);
-  ok(calls().filter((x) => x.notify).length === 1 && /abgemeldet/.test(calls().find((x) => x.notify).notify), "one notification on the Mac", calls().filter((x) => x.notify));
+  const notes = calls().filter((x) => x.notify).slice(notesBefore);
+  ok(notes.length === 1 && /abgemeldet/.test(notes[0].notify), "one notification on the Mac", notes);
   const b2 = await createAsk(doc, "quick", 1);
   await sleep(1500);
   ok((await askOf(doc, b2.id)).status === "open", "nothing claimed during the pause");

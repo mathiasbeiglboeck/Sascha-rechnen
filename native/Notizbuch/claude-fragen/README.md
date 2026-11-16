@@ -14,7 +14,9 @@ Einmal im Terminal, im Ordner des Repos:
 zsh native/Notizbuch/claude-fragen/einrichten.sh
 ```
 
-Das Skript braucht `node` (am besten 22 oder neuer) und `claude`. URL und Schlüssel des Servers liest es aus `~/Documents/ClaudeCode/Sascha/notizbuch-zugang.txt` und legt sie nur in der Einstellungsdatei des Helfers ab. Nach einem Update des Repos dasselbe Skript noch einmal ausführen.
+Das Skript braucht `node` (am besten 22 oder neuer; es findet auch die Kopie in `Sascha/.notizbuch-tools`). URL und Schlüssel des Servers liest es aus `~/Documents/ClaudeCode/Sascha/notizbuch-zugang.txt` und legt sie nur in der Einstellungsdatei des Helfers ab. Nach einem Update des Repos dasselbe Skript noch einmal ausführen.
+
+Claude Code muss am Mac angemeldet sein, und zwar für den Helfer selbst: Die Claude-App gibt ihre Anmeldung nur an ihre eigenen Sitzungen weiter. Am einfachsten ist Claude Code fürs Terminal (`~/.local/bin/claude`): einmal `claude` starten und anmelden. Ohne diese Installation nimmt der Helfer die Kopie aus der Claude-App (die neueste Version; er sucht sie vor jeder Frage selbst, weil sich ihr Pfad mit jedem Update der App ändert), die dann ebenso einmal selbst angemeldet sein muss. Ist Claude Code nicht da oder abgemeldet, zeigt die App das bei der Frage an, am Mac erscheint ein Hinweis, und der Helfer versucht es später wieder.
 
 Der Server muss die Fragen schon kennen (Server-Update). Sonst steht im Protokoll „Server-Update nötig“, und der Helfer wartet.
 

@@ -75,7 +75,7 @@ function log(...parts) {
 
 function loadConfig() {
   const raw = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
-  if (!raw.url || !raw.key || !raw.claude) throw new Error("config.json braucht url, key und claude");
+  if (!raw.url || !raw.key) throw new Error("config.json braucht url und key");
   return {
     ...DEFAULTS,
     ...raw,
@@ -321,12 +321,14 @@ async function answer(ask) {
     if (result.ok) {
       await reply(ask.id, { claim: job.claim, markdown: result.text });
       log(ask.id, `beantwortet nach ${Math.round((Date.now() - t0) / 1000)} s (${result.text.length} Zeichen)`);
-    } else if (result.auth) {
-      // Abgemeldet: Ein neuer Versuch hilft erst nach dem Anmelden. Pause, Hinweis in der App und am Mac
+    } else if (result.auth || result.setup) {
+      // Abgemeldet oder nicht installiert: Ein neuer Versuch hilft erst danach. Pause, Hinweis in der App und am Mac
       pausedUntil = Date.now() + 1800000;
       await reply(ask.id, { claim: job.claim, release: true, retryAfter: 1800, note: result.error });
-      log(ask.id, "Claude am Mac ist abgemeldet, Pause 30 Minuten");
-      notifyMac("Claude am Mac ist abgemeldet. Im Terminal claude starten und anmelden, dann beantwortet der Helfer die Fragen.");
+      log(ask.id, result.auth ? "Claude am Mac ist abgemeldet, Pause 30 Minuten" : "Claude Code fehlt, Pause 30 Minuten");
+      notifyMac(result.auth
+        ? "Claude am Mac ist abgemeldet. Im Terminal claude starten und anmelden, dann beantwortet der Helfer die Fragen."
+        : "Claude Code fehlt am Mac. Im Terminal installieren und anmelden, dann beantwortet der Helfer die Fragen.");
     } else if (result.limit) {
       pausedUntil = result.retryAt;
       const at = new Date(result.retryAt).toLocaleTimeString("de-AT", { hour: "2-digit", minute: "2-digit" });
@@ -488,7 +490,11 @@ function prompt(job, files, fresh) {
 }
 
 async function askClaude(job, dir, files, level) {
-  const caps = await claudeCaps;
+  const bin = findClaude();
+  if (!bin) {
+    return { ok: false, setup: true, error: "Claude Code ist am Mac nicht zu finden. Im Terminal claude installieren und anmelden." };
+  }
+  const caps = await claudeCaps(bin);
   const doc = (state.docs[job.doc.id] = state.docs[job.doc.id] || {});
   for (let attempt = 0; attempt < 2; attempt++) {
     const fresh = !doc.session;
@@ -508,7 +514,7 @@ async function askClaude(job, dir, files, level) {
       ...(level.effort ? ["--effort", level.effort] : []),
       ...(level.model ? ["--model", level.model] : []),
     ];
-    const run = await runClaude(args, dir, level.minutes);
+    const run = await runClaude(bin, args, dir, level.minutes);
     if (current?.cancelled) return { ok: false, error: "abgebrochen" };
     const parsed = parseResult(run);
     // Chat gibt es nicht mehr (etwa nach 30 Tagen von Claude Code aufgeräumt): neuen anfangen
@@ -545,10 +551,10 @@ function notifyMac(text) {
     { timeout: 30000, env: cleanEnv() }, () => {});
 }
 
-function runClaude(args, cwd, minutes) {
+function runClaude(bin, args, cwd, minutes) {
   return new Promise((resolve) => {
     fs.mkdirSync(cwd, { recursive: true });
-    const child = spawn(config.claude, args, { cwd, env: cleanEnv(), stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(bin, args, { cwd, env: cleanEnv(), stdio: ["ignore", "pipe", "pipe"] });
     if (current) current.child = child;
     let out = "", err = "", timedOut = false;
     child.stdout.on("data", (d) => (out += d));
@@ -629,20 +635,97 @@ process.on("SIGTERM", () => {
   process.exit(0);
 });
 
-/// Was die installierte Version von Claude Code kann (einmal beim Start, aus claude --help)
-const claudeCaps = new Promise((resolve) => {
-  execFile(config.claude, ["--help"], { timeout: 60000, env: cleanEnv() }, (err, stdout) => {
-    const help = String(stdout || "");
-    const caps = { restricted: /--restricted\b/.test(help), dontAsk: /dontAsk/.test(help) };
-    log(`Claude Code: ${err && !help ? "nicht gefunden" : "da"}` +
-      `, eingeschränkter Modus ${caps.restricted ? (config.restricted !== false ? "an" : "aus (config)") : "nicht verfügbar"}` +
-      `, dontAsk ${caps.dontAsk ? "ja" : "nein"}`);
-    resolve(caps);
-  });
-});
+// ---------- Claude Code finden ----------
+
+/// Claude Code am Mac: der Pfad aus config.json, sonst die Installation fürs Terminal, sonst die Kopie in der
+/// Claude-App (neueste Version). Deren Pfad ändert sich mit jedem Update der App, deshalb sucht der Helfer vor
+/// jeder Frage neu. Allein gestartet ist die Kopie der App aber nur angemeldet, wenn sich Mathias damit einmal
+/// selbst angemeldet hat; die App gibt ihre Anmeldung nur an ihre eigenen Sitzungen weiter
+function findClaude() {
+  const home = os.homedir();
+  const list = [];
+  if (config.claude) list.push(config.claude);
+  list.push(path.join(home, ".local", "bin", "claude"), path.join(home, ".claude", "local", "claude"),
+    "/opt/homebrew/bin/claude", "/usr/local/bin/claude");
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) if (dir) list.push(path.join(dir, "claude"));
+  list.push(...appClaudes(home));
+  const bin = list.find(isProgram) || null;
+  if (bin !== findClaude.last) {
+    findClaude.last = bin;
+    if (!bin) log("Claude Code nicht gefunden");
+  }
+  return bin;
+}
+
+function isProgram(file) {
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/// Die Kopien von Claude Code in der Claude-App, neueste Version zuerst:
+/// ~/Library/Application Support/Claude/claude-code/<Version>/<Kennung>/claude.app/Contents/MacOS/claude
+function appClaudes(home) {
+  const base = path.join(home, "Library", "Application Support", "Claude", "claude-code");
+  const out = [];
+  for (const v of listDir(base).sort(byVersion).reverse()) {
+    const builds = listDir(path.join(base, v))
+      .map((b) => ({ b, t: fs.statSync(path.join(base, v, b)).mtimeMs }))
+      .sort((x, y) => y.t - x.t);
+    for (const { b } of builds) {
+      out.push(path.join(base, v, b, "claude.app", "Contents", "MacOS", "claude"), path.join(base, v, b, "claude"));
+    }
+  }
+  return out;
+}
+
+function listDir(dir) {
+  try {
+    return fs.readdirSync(dir).filter((n) => !n.startsWith("."));
+  } catch {
+    return [];
+  }
+}
+
+/// 2.1.325 nach 2.1.99: Zahlen als Zahlen vergleichen
+function byVersion(a, b) {
+  const x = a.split(/[.-]/), y = b.split(/[.-]/);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const p = x[i] ?? "", q = y[i] ?? "";
+    const d = /^\d+$/.test(p) && /^\d+$/.test(q) ? Number(p) - Number(q) : p.localeCompare(q);
+    if (d) return d;
+  }
+  return 0;
+}
+
+/// Was diese Version von Claude Code kann (aus claude --help, einmal je Programm)
+const capsByBin = new Map();
+function claudeCaps(bin) {
+  if (!capsByBin.has(bin)) {
+    capsByBin.set(bin, new Promise((resolve) => {
+      execFile(bin, ["--help"], { timeout: 60000, env: cleanEnv() }, (err, stdout) => {
+        const help = String(stdout || "");
+        const caps = { restricted: /--restricted\b/.test(help), dontAsk: /dontAsk/.test(help) };
+        log(`Claude Code: ${err && !help ? "startet nicht" : "da"} (${bin})` +
+          `, eingeschränkter Modus ${caps.restricted ? (config.restricted !== false ? "an" : "aus (config)") : "nicht verfügbar"}` +
+          `, dontAsk ${caps.dontAsk ? "ja" : "nein"}`);
+        if (err && !help) capsByBin.delete(bin); // beim nächsten Mal neu versuchen
+        resolve(caps);
+      });
+    }));
+  }
+  return capsByBin.get(bin);
+}
 
 fs.mkdirSync(CHATS, { recursive: true });
 log(`gestartet (Node ${process.versions.node}${typeof WebSocket === "undefined" ? ", ohne WebSocket: Abfrage alle 30 s" : ""})`);
 prune();
+{
+  const bin = findClaude();
+  if (bin) claudeCaps(bin);
+}
 connect();
 wake("Start");
