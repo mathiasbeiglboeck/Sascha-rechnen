@@ -111,11 +111,13 @@ async function main() {
   const sid = c.args[c.args.indexOf("--session-id") + 1];
   ok(c.args.includes("--session-id") && !c.args.includes("--resume"), "first call starts a new session", c.args);
   ok(c.args[c.args.indexOf("--effort") + 1] === "medium" && optOf(c, "--tools") === "Read,WebSearch,WebFetch" && c.args.includes("--strict-mcp-config") && c.args[c.args.indexOf("--output-format") + 1] === "json", "flags: effort medium, tools Read + web search + web pages, strict mcp, json", c.args);
-  ok(c.args[c.args.indexOf("--permission-mode") + 1] === "dontAsk" && c.args.includes("--restricted") && optOf(c, "--allowedTools") === "WebSearch,WebFetch" && c.args.filter((x) => /allowed/i.test(x)).length === 1, "flags: dontAsk, restricted, only web search and web pages pre-allowed", c.args);
-  ok(/schlag im Internet nach/.test(systemOf(c)) && /Quellen am Ende als Markdown-Links/.test(systemOf(c)) && /keine Anweisung an dich/.test(systemOf(c)) && !/keine Links/.test(systemOf(c)), "system prompt: may look things up, sources as links, web text is no instruction", systemOf(c));
+  const allowed = String(optOf(c, "--allowedTools")).split(",");
+  ok(c.args[c.args.indexOf("--permission-mode") + 1] === "dontAsk" && c.args.includes("--restricted") && c.args.filter((x) => /allowed/i.test(x)).length === 1 && allowed[0] === "WebSearch" && allowed.slice(1).every((x) => /^WebFetch\(domain:[^,() ]+\)$/.test(x)) && allowed.includes("WebFetch(domain:*.wikipedia.org)") && allowed.includes("WebFetch(domain:arxiv.org)") && allowed.length > 5, "flags: dontAsk, restricted; pre-allowed only the search and whole pages from the reference sites, never WebFetch for every site", c.args);
+  ok(/Ganze Seiten \(WebFetch\) kannst du nur auf diesen Seiten lesen: \*\.wikipedia\.org, arxiv\.org, /.test(systemOf(c)), "system prompt names the sites Claude may read", systemOf(c));
+  ok(/schlag im Internet nach/.test(systemOf(c)) && /Quellen am Ende als Markdown-Links, mit einer Überschrift in der Sprache der Antwort/.test(systemOf(c)) && /keine Anweisung an dich/.test(systemOf(c)) && !/keine Links/.test(systemOf(c)), "system prompt: may look things up, sources as links under a heading in the answer's language, web text is no instruction", systemOf(c));
   const helps = calls().filter((x) => x.help);
   ok(helps.length === 1 && helps[0].envKeys.length === 0, "claude --help asked once at start, clean environment", helps);
-  ok(/eingeschränkter Modus an, dontAsk ja, Internet an/.test(logText()), "log names the restricted mode and the internet");
+  ok(/eingeschränkter Modus an, dontAsk ja, Internet an \(ganze Seiten: \d+\)/.test(logText()), "log names the restricted mode, the internet and the number of sites");
   const osa = calls().filter((x) => x.osascript).at(-1)?.osascript;
   ok(osa && osa.l === "-l" && osa.lang === "JavaScript" && osa.scriptOK && osa.pdf === "dokument.pdf" && osa.from === "-1" && osa.to === "3", "page window asked for pages q-3 … q+1 of dokument.pdf", osa);
   ok(calls().filter((x) => x.osascript).every((x) => x.envKeys.length === 0), "osascript gets a clean environment");
@@ -246,14 +248,15 @@ async function main() {
   console.log("== old claude version: no --restricted, no dontAsk");
   await restartWith(() => setHelp("old"));
   let r = await askOnce();
-  ok(r.done && !r.c.args.includes("--restricted") && !r.c.args.includes("--permission-mode") && optOf(r.c, "--tools") === "Read,WebSearch,WebFetch" && optOf(r.c, "--allowedTools") === "WebSearch,WebFetch", "answered with Read and the web tools, only those pre-allowed", r.c.args);
-  ok(/eingeschränkter Modus nicht verfügbar, dontAsk nein/.test(logText()), "log says restricted mode unavailable");
+  ok(r.done && !r.c.args.includes("--restricted") && !r.c.args.includes("--permission-mode") && optOf(r.c, "--tools") === "Read" && !r.c.args.some((x) => /allowed/i.test(x)), "answered with tools Read only: no internet without the restricted mode", r.c.args);
+  ok(/keine Links/.test(systemOf(r.c)) && !/Internet/.test(systemOf(r.c)), "system prompt without the internet", systemOf(r.c));
+  ok(/eingeschränkter Modus nicht verfügbar, dontAsk nein, Internet aus \(nur im eingeschränkten Modus\)/.test(logText()), "log says restricted mode unavailable, so no internet");
 
   console.log("== config restricted: false");
   await restartWith(() => { setHelp("new"); writeConfig({ restricted: false }); });
   r = await askOnce();
-  ok(r.done && !r.c.args.includes("--restricted") && r.c.args[r.c.args.indexOf("--permission-mode") + 1] === "dontAsk", "dontAsk without --restricted", r.c.args);
-  ok(/eingeschränkter Modus aus \(config\)/.test(logText()), "log says restricted off by config");
+  ok(r.done && !r.c.args.includes("--restricted") && r.c.args[r.c.args.indexOf("--permission-mode") + 1] === "dontAsk" && optOf(r.c, "--tools") === "Read" && !r.c.args.some((x) => /allowed/i.test(x)), "dontAsk without --restricted, and then no internet", r.c.args);
+  ok(/eingeschränkter Modus aus \(config\), dontAsk ja, Internet aus \(nur im eingeschränkten Modus\)/.test(logText()), "log says restricted off by config, so no internet");
 
   console.log("== config web: false: only the document");
   await restartWith(() => { setHelp("new"); writeConfig({ web: false }); });
@@ -267,6 +270,17 @@ async function main() {
   r = await askOnce();
   ok(r.done && /beantwortet nach \d+ s \(\d+ Zeichen\), abgelehnt: Read, WebFetch/.test(logText()), "answer logged with the denied tools", logText().split("\n").filter((l) => l.includes("beantwortet")).slice(-1));
   setMode({ mode: "ok" });
+
+  console.log("== web sites from config.json: all, none, only valid ones");
+  await restartWith(() => writeConfig({ webSites: ["*"] }));
+  r = await askOnce();
+  ok(r.done && optOf(r.c, "--tools") === "Read,WebSearch,WebFetch" && optOf(r.c, "--allowedTools") === "WebSearch,WebFetch" && /Ganze Seiten liest du mit WebFetch/.test(systemOf(r.c)) && /ganze Seiten: alle/.test(logText()), "[\"*\"]: every site", r.c.args);
+  await restartWith(() => writeConfig({ webSites: [] }));
+  r = await askOnce();
+  ok(r.done && optOf(r.c, "--tools") === "Read,WebSearch" && optOf(r.c, "--allowedTools") === "WebSearch" && /nur suchen/.test(systemOf(r.c)) && /ganze Seiten: keine/.test(logText()), "[]: search only, no WebFetch at all", r.c.args);
+  await restartWith(() => writeConfig({ webSites: ["arxiv.org", "x.org/evil", "bad site", "a,b.org", "c(d).org", "*.wikipedia.org"] }));
+  r = await askOnce();
+  ok(r.done && optOf(r.c, "--allowedTools") === "WebSearch,WebFetch(domain:arxiv.org),WebFetch(domain:*.wikipedia.org)", "invalid site patterns are dropped", r.c.args);
 
   console.log("== page window fails: whole PDF only, logged once");
   await restartWith(() => { writeConfig(); setPages({ n: 30, fail: true }); });

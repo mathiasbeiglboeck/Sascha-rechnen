@@ -22,9 +22,9 @@ Der Server muss die Fragen schon kennen (Server-Update). Sonst steht im Protokol
 
 ## Was Claude dabei darf
 
-Lesen, und zwar nur im Ordner des Dokuments (`chats/<Dokument>` im Ordner des Helfers, mit den Bildern der Fragen und dem PDF), und im Internet suchen und Seiten lesen, etwa für Definitionen, Sätze oder Literatur. Claude Code läuft dafür nur mit den Werkzeugen Read, WebSearch und WebFetch, ohne MCP-Server und mit `--permission-mode dontAsk`. Suchen und Seiten lesen sind vorab erlaubt (`--allowedTools WebSearch,WebFetch`); alles andere, was eine Erlaubnis bräuchte, wird abgelehnt, etwa Read außerhalb des Chat-Ordners. Keine Befehle, kein Schreiben, kein Zugang zum Server; der Schlüssel des Servers erreicht Claude nicht.
+Lesen, und zwar nur im Ordner des Dokuments (`chats/<Dokument>` im Ordner des Helfers, mit den Bildern der Fragen und dem PDF), und im Internet suchen, etwa nach Definitionen, Sätzen oder Literatur. Ganze Seiten liest Claude nur von ausgewählten Fachseiten (Wikipedia, arXiv, MathOverflow, nLab, zbMATH und einige mehr, siehe `webSites` unten); andere Seiten kennt es nur aus den Suchergebnissen. Claude Code läuft dafür nur mit den Werkzeugen Read, WebSearch und WebFetch, ohne MCP-Server und mit `--permission-mode dontAsk`. Vorab erlaubt sind nur die Suche und WebFetch für diese Seiten (`--allowedTools WebSearch,WebFetch(domain:…),…`); alles andere, was eine Erlaubnis bräuchte, wird abgelehnt, etwa Read außerhalb des Chat-Ordners oder eine andere Webseite. Keine Befehle, kein Schreiben, kein Zugang zum Server; der Schlüssel des Servers erreicht Claude nicht.
 
-Was Claude sucht, sieht die Suchmaschine, und eine Seite, die Claude liest, sieht die Anfrage. Claude soll deshalb mit Begriffen und Namen suchen statt mit längeren Passagen aus dem Dokument und Text aus Webseiten oder dem Dokument nicht als Anweisung nehmen. Ganz ohne Internet: `"web": false` in den Einstellungen.
+Das Internet gibt es nur im eingeschränkten Modus (siehe unten): Nur dann kann Read sicher nichts außerhalb des Chat-Ordners lesen, etwa die Einstellungen des Helfers mit dem Schlüssel. Und warum nur ausgewählte Seiten: Die Suche läuft bei Anthropic, eine Seite ruft Claude dagegen vom Mac aus auf, und ihre Adresse sieht, wer die Seite betreibt. Eine Anweisung, die in einem PDF oder auf einer Webseite versteckt ist, könnte Claude sonst dazu bringen, Text aus deinen Notizen in eine solche Adresse zu packen. Was Claude sucht, sieht die Suchmaschine; Claude soll deshalb mit Begriffen und Namen suchen statt mit längeren Passagen aus dem Dokument und Text aus Webseiten oder dem Dokument nicht als Anweisung nehmen. Ganz ohne Internet: `"web": false` in den Einstellungen.
 
 Kennt die installierte Version von Claude Code den eingeschränkten Modus (`--restricted`), läuft jede Frage darin. Dann gelten auch deine eigenen Erlaubnisse aus `~/.claude/settings.json` nicht, etwa eine Regel, die Read überall erlaubt. Ob der Modus an ist, steht beim Start im Protokoll („eingeschränkter Modus an“). Steht dort „nicht verfügbar“: `claude update` und den Helfer neu starten (Einrichten noch einmal ausführen).
 
@@ -49,7 +49,9 @@ In `~/Library/Application Support/BetterNotes-Helfer/config.json`, danach den He
 
 `"web": false` nimmt Claude das Internet: Dann zählt nur das Dokument.
 
-`"restricted": false` schaltet den eingeschränkten Modus ab (nur nötig, falls Claude Code darin nicht antwortet).
+`"webSites"` sind die Seiten, die Claude ganz lesen darf: Muster wie `"arxiv.org"` oder `"*.wikipedia.org"` (alle Subdomains, etwa de.wikipedia.org). Die Liste in der Einstellungsdatei ersetzt die eingebaute (siehe `DEFAULTS` in `helfer.mjs`). `[]` heißt nur suchen, `["*"]` alle Seiten; dann gilt die Warnung oben.
+
+`"restricted": false` schaltet den eingeschränkten Modus ab (nur nötig, falls Claude Code darin nicht antwortet); dann gibt es auch kein Internet.
 
 ## Für Entwickler
 

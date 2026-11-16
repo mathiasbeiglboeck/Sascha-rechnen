@@ -102,6 +102,7 @@ table { border-collapse: collapse; display: block; overflow-x: auto; }
 td, th { border: 1px solid #d1d1d6; padding: .25em .5em; }
 hr { border: none; border-top: 1px solid #d1d1d6; }
 a { color: #007aff; text-decoration: none; overflow-wrap: anywhere; }
+.host { color: #8e8e93; font-size: .85em; }
 .katex { font-size: 1.05em; }
 /* Lange Formeln im Text scrollen für sich, statt die ganze Seite zu verbreitern */
 eq { display: inline-block; max-width: 100%; overflow-x: auto; overflow-y: hidden; vertical-align: middle; }
@@ -523,8 +524,31 @@ const md = window.markdownit({ html: false, linkify: true, typographer: false })
   .use(texmath, { engine: katex, delimiters: ["dollars", "brackets"], katexOptions });
 md.validateLink = (url) => /^https?:\/\//i.test(url);
 md.linkify.set({ fuzzyLink: false, fuzzyEmail: false, fuzzyIP: false });
+// Ein Doppelpunkt am Ende einer nackten Adresse gehört nicht dazu („Laut https://…/Produktregel: …“, „**https://…**:“)
+const normalizeMatch = md.linkify.normalize.bind(md.linkify);
+md.linkify.normalize = (m) => {
+  normalizeMatch(m);
+  const t = /[:*]*:[:*]*$/.exec(m.url);
+  if (t) { const n = t[0].length; m.url = m.url.slice(0, -n); m.text = m.text.slice(0, -n); m.lastIndex -= n; }
+};
+// Nackte Adressen nimmt markdown-it roh aus dem Text, samt Markdown-Escapes (\_ \*): die vor Ziel und Text entfernen
+const unesc = (u) => u.replace(/\\([!-\/:-@\[-`{-~])/g, "$1");
+const normalizeLink = md.normalizeLink.bind(md), normalizeLinkText = md.normalizeLinkText.bind(md);
+md.normalizeLink = (u) => normalizeLink(unesc(u));
+md.normalizeLinkText = (u) => normalizeLinkText(unesc(u));
 // Das HTML von KaTeX als Funktion einsetzen: als Ersatztext würde replace $&, $$ … darin umdeuten
 const esc = (t) => String(t).replace(/[&<>"']/g, (c) => "&#" + c.charCodeAt(0) + ";");
+// Wohin ein Link mit eigenem Text führt, steht klein dahinter: Der Text könnte etwas anderes behaupten oder
+// unsichtbar sein. Nackte Adressen zeigen sich selbst
+md.renderer.rules.link_close = (tokens, i, options, env, self) => {
+  let j = i;
+  while (j > 0 && tokens[j].type !== "link_open") j--;
+  const open = tokens[j];
+  let host = "";
+  try { host = new URL(open.attrGet("href")).hostname.replace(/^www\./, ""); } catch (e) {}
+  const bare = open.markup === "linkify" || open.markup === "autolink";
+  return self.renderToken(tokens, i, options) + (host && !bare ? '<span class="host"> (' + esc(host) + ")</span>" : "");
+};
 for (const set of ["dollars", "brackets"]) {
   for (const rule of texmath.rules[set].inline) {
     md.renderer.rules[rule.name] = (tokens, i) =>
@@ -535,13 +559,15 @@ for (const set of ["dollars", "brackets"]) {
       n === "1" ? texmath.render(tokens[i].content, true, katexOptions) : esc(tokens[i].info));
   }
 }
+// Steuerzeichen für die Schreibrichtung weg: Sie könnten Text (etwa eine Adresse) anders zeigen, als er ist
+const clean = (text) => String(text || "").replace(/[\u202A-\u202E\u2066-\u2069]/g, "");
 function render(text) {
   const out = document.getElementById("out");
   try {
-    out.innerHTML = md.render(String(text || ""));
+    out.innerHTML = md.render(clean(text));
   } catch (e) {
     const pre = document.createElement("pre");
-    pre.textContent = String(text || "");
+    pre.textContent = clean(text);
     out.replaceChildren(pre);
   }
   window.scrollTo(0, 0);
