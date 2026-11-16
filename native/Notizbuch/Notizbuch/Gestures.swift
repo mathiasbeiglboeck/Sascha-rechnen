@@ -144,3 +144,131 @@ final class PointerGesture: SingleTouchGesture {
 
 /// Radierer: löscht jeden Strich, den der Kreis berührt
 final class EraserGesture: SingleTouchGesture {}
+
+/// Beobachtet das Lasso, ohne je selbst zu erkennen. PencilKit verrät nicht, was es ausgewählt hat; für „Claude
+/// fragen“ merkt sich die App deshalb den Weg des Lassos, in den Koordinaten von `space` (die Seiten: Seitenpunkte,
+/// unabhängig von Zoom und Gerät). PencilKits Lasso bekommt davon nichts mit: Diese Geste hält nichts auf, verhindert
+/// nichts und lässt sich nicht verhindern. Die Leinwand stellt sie so ein, dass sie keine Berührung verzögert
+final class LassoTracker: UIGestureRecognizer {
+    weak var space: UIView?
+    /// Der ganze Weg, sobald der Finger oder Pencil abhebt
+    var onEnded: (([CGPoint]) -> Void)?
+    private var tracked: UITouch?
+    private var points: [CGPoint] = []
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        // Ein zweiter Finger (am iPhone: scrollen): Dieser Weg zählt nicht
+        guard tracked == nil, touches.count == 1, let t = touches.first else {
+            tracked = nil
+            points = []
+            if state == .possible { state = .failed }
+            return
+        }
+        tracked = t
+        points = [t.location(in: space ?? view)]
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let t = tracked, touches.contains(t) else { return }
+        let space = self.space ?? view
+        for c in event.coalescedTouches(for: t) ?? [t] { points.append(c.location(in: space)) }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let t = tracked, touches.contains(t) else { return }
+        points.append(t.location(in: space ?? view))
+        let path = points
+        tracked = nil
+        points = []
+        // Erkennt nie: PencilKits Lasso bleibt unberührt
+        if state == .possible { state = .failed }
+        onEnded?(path)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        tracked = nil
+        points = []
+        if state == .possible { state = .failed }
+    }
+
+    override func reset() {
+        super.reset()
+        tracked = nil
+        points = []
+    }
+
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+}
+
+/// Antippen einer Markierung von „Claude fragen“. Die Leinwand gibt ihr nur Berührungen, die auf einer Markierung
+/// beginnen (siehe CanvasController), und nur auf die wartet PencilKit: Bewegt sich der Pencil oder Finger mehr als
+/// 8 Punkte oder bleibt er länger als 0,6 s liegen, scheitert die Geste, und PencilKit schreibt oder wählt aus wie
+/// sonst. Scrollen und Zoomen warten nie
+final class MarkTapGesture: UIGestureRecognizer {
+    /// PencilKits Zeichnen (auch das Lasso): wartet auf diese Geste
+    weak var drawing: UIGestureRecognizer?
+    private var tracked: UITouch?
+    private var start = CGPoint.zero
+    private var timeout: DispatchWorkItem?
+
+    static let slop: CGFloat = 8
+    static let maxDuration: TimeInterval = 0.6
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard tracked == nil, touches.count == 1, let t = touches.first else {
+            if state == .possible { state = .failed }
+            return
+        }
+        tracked = t
+        start = t.location(in: view)
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.state == .possible else { return }
+            self.state = .failed
+        }
+        timeout = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.maxDuration, execute: work)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let t = tracked, touches.contains(t), state == .possible else { return }
+        let p = t.location(in: view)
+        if hypot(p.x - start.x, p.y - start.y) > Self.slop { state = .failed }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let t = tracked, touches.contains(t), state == .possible else { return }
+        state = .ended
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        if state == .possible { state = .failed }
+    }
+
+    override func reset() {
+        super.reset()
+        tracked = nil
+        timeout?.cancel()
+        timeout = nil
+    }
+
+    /// PencilKit (Stift und Lasso) wartet, ob es ein Antippen wird; Scrollen, Zoomen, Schweben und die eigenen
+    /// Gesten der App nicht
+    override func shouldBeRequiredToFail(by otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        if otherGestureRecognizer === drawing { return true }
+        if otherGestureRecognizer is UIPanGestureRecognizer || otherGestureRecognizer is UIPinchGestureRecognizer
+            || otherGestureRecognizer is UIHoverGestureRecognizer || otherGestureRecognizer is SingleTouchGesture
+            || otherGestureRecognizer is LassoTracker {
+            return false
+        }
+        let name = NSStringFromClass(type(of: otherGestureRecognizer))
+        return (name.hasPrefix("PK") || name.hasPrefix("_PK")) && !name.contains("PencilObserver")
+    }
+
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool {
+        if preventedGestureRecognizer is UIPanGestureRecognizer || preventedGestureRecognizer is UIPinchGestureRecognizer {
+            return false
+        }
+        return super.canPrevent(preventedGestureRecognizer)
+    }
+}

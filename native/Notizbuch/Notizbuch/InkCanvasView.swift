@@ -2,6 +2,13 @@ import UIKit
 import PencilKit
 import ObjectiveC
 
+/// Wo PencilKit das Menü einer Lasso-Auswahl zeigt: `sourcePoint` in den Koordinaten von `space` (PencilKits innere
+/// Fläche). „Claude fragen“ prüft damit, ob das Menü zum zuletzt gezogenen Lasso gehört
+struct SelectionMenuContext {
+    weak var space: UIView?
+    let sourcePoint: CGPoint
+}
+
 /// Die Schreibfläche: PencilKits Menü nur im Lasso-Modus, und nie mit „Alles auswählen“ oder „Leerzeile einfügen“.
 ///
 /// PencilKit zeigt ein Menü, wenn man die Fläche lange berührt (am iPad etwa mit dem Finger, der eigentlich
@@ -10,7 +17,8 @@ import ObjectiveC
 /// buildMenu, ein eigener Delegate) erreichen es nicht. Deshalb wird genau diese eine Methode einmal umgeleitet:
 /// - Außerhalb des Lasso-Modus (Stift, Radierer, Zeigestift) und im Nur-Sehen-Modus kommt gar kein Menü, auch nicht,
 ///   wenn kopierte Striche zum Einsetzen bereitliegen.
-/// - Mit dem Lasso bleiben Ausschneiden, Kopieren, Löschen, Duplizieren und Einsetzen.
+/// - Mit dem Lasso bleiben Ausschneiden, Kopieren, Löschen, Duplizieren und Einsetzen; im Menü einer Auswahl
+///   kommen vorn „Claude fragen“ und „Claude gründlich fragen“ dazu (`selectionMenuItems`).
 /// - „Alles auswählen“ fällt immer weg. Bleibt nichts übrig, kommt kein Menü.
 /// - „Leerzeile (oben) einfügen“ fällt anhand von PencilKits eigenen Übersetzungen weg (die Einträge tragen zufällige
 ///   Kennungen), falls PencilKits Schalter dafür (siehe unten) fehlt.
@@ -26,6 +34,8 @@ final class InkCanvasView: PKCanvasView {
     /// Darf man auf der Fläche bearbeiten (nicht Nur-Sehen)? Setzt CanvasController; ohne Bearbeiten kein Menü.
     /// drawingGestureRecognizer taugt dafür nicht: PencilKit schaltet ihn beim Lasso selbst aus.
     var editingAllowed = true
+    /// Weitere Einträge vorn im Menü einer Lasso-Auswahl („Claude fragen“); setzt CanvasController
+    var selectionMenuItems: ((SelectionMenuContext) -> [UIMenuElement])?
 
     override init(frame: CGRect) {
         _ = Self.menuHook
@@ -72,21 +82,34 @@ final class InkCanvasView: PKCanvasView {
             switchOffInsertSpace(me)
             // PencilKit baut sein Menü immer, auch wenn es danach nicht erscheint, damit sein Zustand wie sonst ist
             let result = original(me, sel, interaction, configuration, suggested)
-            let lasso = lassoIsActive(around: me)
+            let canvas = enclosingCanvas(of: me)
+            let lasso = lassoIsActive(canvas)
             #if DEBUG
             NSLog("InkCanvasView: Menü für %@ über %@, Lasso: %@", "\(type(of: me))",
                   interaction.map { "\(type(of: $0))" } ?? "nil", lasso ? "ja" : "nein")
             #endif
             // Außerhalb des Lasso-Modus gehört ein langer Finger zum Scrollen: kein Menü
             guard lasso else { return UIMenu(children: []) }
-            guard let menu = result else {
-                // Ohne Menü von PencilKit zeigt UIKit die vorgeschlagenen Einträge: dieselben Regeln für diese
-                debugLog("PencilKit gab kein Menü zurück")
-                guard let kept = filtered((suggested as? [UIMenuElement]) ?? []) else { return nil }
-                return UIMenu(children: kept)
+            // Ohne Menü von PencilKit zeigt UIKit die vorgeschlagenen Einträge: dieselben Regeln für diese
+            let base = result?.children ?? ((suggested as? [UIMenuElement]) ?? [])
+            let removed = filtered(base)
+            var kept = removed ?? base
+            // Menü einer Auswahl (nicht nur „Einsetzen“ auf einer leeren Stelle): vorn „Claude fragen“
+            var extra: [UIMenuElement] = []
+            if let ink = canvas as? InkCanvasView, let make = ink.selectionMenuItems, isSelectionMenu(kept) {
+                let space = (interaction as? UIEditMenuInteraction)?.view ?? (me as? UIView)
+                let point = (configuration as? UIEditMenuConfiguration)?.sourcePoint ?? .zero
+                extra = make(SelectionMenuContext(space: space, sourcePoint: point))
+                #if DEBUG
+                NSLog("InkCanvasView: Auswahl-Menü, Quelle %@ in %@", "\(point)", space.map { "\(type(of: $0))" } ?? "nil")
+                #endif
             }
-            guard let kept = filtered(menu.children) else { return menu }
-            return kept.isEmpty ? UIMenu(children: []) : menu.replacingChildren(kept)
+            // Nichts geändert: PencilKits Menü wie es ist (oder nil: UIKit zeigt seine Vorschläge)
+            if removed == nil, extra.isEmpty { return result }
+            if result == nil { debugLog("PencilKit gab kein Menü zurück") }
+            if !extra.isEmpty { kept.insert(UIMenu(title: "", options: .displayInline, children: extra), at: 0) }
+            if kept.isEmpty { return UIMenu(children: []) }
+            return result?.replacingChildren(kept) ?? UIMenu(children: kept)
         }
         let previous = method_setImplementation(method, imp_implementationWithBlock(replacement))
         assert(previous == originalIMP)
@@ -109,16 +132,29 @@ final class InkCanvasView: PKCanvasView {
         debugLog("Leerzeile einfügen abgeschaltet")
     }
 
-    /// Steht die Fläche, zu der PencilKits innere Ansicht gehört, im Lasso-Modus, und darf man darauf bearbeiten?
-    /// Findet sich keine Fläche, wird nur gefiltert, wie im Lasso-Modus.
-    private static func lassoIsActive(around tiledView: AnyObject) -> Bool {
+    /// Die Fläche, zu der PencilKits innere Ansicht gehört
+    private static func enclosingCanvas(of tiledView: AnyObject) -> PKCanvasView? {
         var view = (tiledView as? UIView)?.superview
         while let current = view, !(current is PKCanvasView) { view = current.superview }
-        guard let canvas = view as? PKCanvasView else {
+        return view as? PKCanvasView
+    }
+
+    /// Steht die Fläche im Lasso-Modus, und darf man darauf bearbeiten? Findet sich keine Fläche, wird nur
+    /// gefiltert, wie im Lasso-Modus.
+    private static func lassoIsActive(_ canvas: PKCanvasView?) -> Bool {
+        guard let canvas else {
             debugLog("keine Fläche über PKTiledView")
             return true
         }
         return canvas.tool is PKLassoTool && ((canvas as? InkCanvasView)?.editingAllowed ?? true)
+    }
+
+    /// Menü einer Auswahl (Ausschneiden, Kopieren, Löschen, Duplizieren …) statt nur „Einsetzen“: zählt die Einträge
+    /// (ohne die ausgeblendeten) statt Titel zu vergleichen, gilt also in jeder Sprache
+    private static func isSelectionMenu(_ elements: [UIMenuElement]) -> Bool { leafCount(elements) >= 3 }
+
+    private static func leafCount(_ elements: [UIMenuElement]) -> Int {
+        elements.reduce(0) { n, element in n + ((element as? UIMenu).map { leafCount($0.children) } ?? 1) }
     }
 
     /// Die Einträge ohne „Alles auswählen“ und „Leerzeile (oben) einfügen“, auch in Untermenüs; leer gewordene

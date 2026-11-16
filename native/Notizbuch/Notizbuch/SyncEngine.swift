@@ -890,6 +890,70 @@ final class SyncEngine: ObservableObject {
         pendingPurgeSeqs[id.uuidString] = unchangedSince == nil ? nil : known
     }
 
+    // MARK: Claude fragen
+
+    /// Fragen an Claude und ihre Antworten. Eigene Anfragen, nie Teil des Abgleichs der Striche
+    lazy var asks = AskStore(store: store, sync: self)
+
+    /// Alle Fragen eines Dokuments, vollständig bis zur Version `v` des Servers
+    struct AskList: Decodable {
+        var v: Int
+        var asks: [Ask]
+    }
+
+    private static func askPath(_ doc: UUID) -> String { "/api/doc/\(path(doc))/asks" }
+
+    func fetchAsks(_ doc: UUID) async throws -> AskList {
+        try JSONDecoder().decode(AskList.self, from: try await request("GET", Self.askPath(doc)))
+    }
+
+    /// Neue Frage mit ihren beiden Bildern in einem Aufruf (multipart); noch einmal hochladen ändert nichts
+    func uploadAsk(_ doc: UUID, _ ask: Ask, question: Data, page: Data) async throws -> AskList {
+        let boundary = "BetterNotes-" + UUID().uuidString
+        var body = Data()
+        // Bilder mit Dateinamen: Ohne kämen sie am Server als Text an
+        func part(_ name: String, filename: String? = nil, type: String? = nil, _ data: Data) {
+            var head = "--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\""
+            if let filename { head += "; filename=\"\(filename)\"" }
+            head += "\r\n"
+            if let type { head += "Content-Type: \(type)\r\n" }
+            body.append(Data((head + "\r\n").utf8))
+            body.append(data)
+            body.append(Data("\r\n".utf8))
+        }
+        struct Meta: Encodable {
+            var anchor: AskAnchor
+            var pv: Int
+            var effort: String
+            var created: Double
+            var from: String
+        }
+        let meta = Meta(anchor: ask.anchor, pv: ask.pv, effort: ask.effort, created: ask.created, from: ask.from ?? "")
+        part("meta", try JSONEncoder().encode(meta))
+        part("question", filename: "question.png", type: "image/png", question)
+        part("page", filename: "page.jpg", type: "image/jpeg", page)
+        body.append(Data("--\(boundary)--\r\n".utf8))
+        let data = try await request("PUT", Self.askPath(doc) + "/" + ask.id, body: body,
+                                     contentType: "multipart/form-data; boundary=\(boundary)")
+        return try JSONDecoder().decode(AskList.self, from: data)
+    }
+
+    /// Markierung löschen (auf allen Geräten); gibt es sie am Server nicht mehr, ist das auch recht
+    func deleteAsk(_ doc: UUID, _ id: String) async throws -> AskList {
+        try JSONDecoder().decode(AskList.self, from: try await request("DELETE", Self.askPath(doc) + "/" + id))
+    }
+
+    /// Neue Stellen nach Seitenänderungen, für den Seitenstand `pv`. Der Server nimmt sie nur, wenn seine Stelle
+    /// nicht schon zu einem neueren Seitenstand gehört
+    func moveAsks(_ doc: UUID, pv: Int, anchors: [String: AskAnchor]) async throws -> AskList {
+        struct Body: Encodable {
+            var pv: Int
+            var anchors: [String: AskAnchor]
+        }
+        let body = try JSONEncoder().encode(Body(pv: pv, anchors: anchors))
+        return try JSONDecoder().decode(AskList.self, from: try await request("PATCH", Self.askPath(doc), body: body))
+    }
+
     // MARK: Briefkasten
 
     func sendToOutbox(to recipient: String, name: String, data: Data, type: String) async throws {

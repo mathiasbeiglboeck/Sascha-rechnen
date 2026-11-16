@@ -1,6 +1,7 @@
 import UIKit
 import PencilKit
 import PDFKit
+import Combine
 
 /// Die Schreibfläche: ein PKCanvasView (scrollt und zoomt selbst), darunter die Seiten.
 /// Am iPad schreibt nur der Pencil, der Finger scrollt; am iPhone schreibt auch der Finger, gescrollt wird mit zwei.
@@ -54,6 +55,17 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private var pointerUnsent: [CGPoint] = []
     private var lastPointerSend = Date.distantPast
     private var pointerFlush: DispatchWorkItem?
+    /// Claude fragen: merkt sich den Weg des Lassos (PencilKit verrät seine Auswahl nicht)
+    private let lassoTracker = LassoTracker()
+    /// Der zuletzt gezogene Weg des Lassos (Seitenpunkte)
+    private var lassoPath: LassoPath?
+    /// Die Markierungen der Fragen an Claude, über der Tinte
+    private let askOverlay = AskOverlay()
+    private let askTap = MarkTapGesture()
+    private var askWatch: AnyCancellable?
+    private weak var answerCard: AnswerCardController?
+    /// Beantwortete Fragen beim letzten Zeichnen der Markierungen (nil: noch nie gezeichnet)
+    private var knownAnswered: Set<String>?
     private var viewOnly = false
     private let eraserGesture = EraserGesture()
     private let eraserCursor = UIView()
@@ -126,6 +138,29 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         if isPad { pointerGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)] }
         canvas.addGestureRecognizer(pointerGesture)
 
+        // Claude fragen: Weg des Lassos mitschreiben, ohne PencilKit aufzuhalten (Pencil am iPad, Finger am iPhone)
+        lassoTracker.cancelsTouchesInView = false
+        lassoTracker.delaysTouchesBegan = false
+        lassoTracker.delaysTouchesEnded = false
+        lassoTracker.space = pagesView
+        lassoTracker.onEnded = { [weak self] in self?.lassoEnded($0) }
+        lassoTracker.isEnabled = false
+        if isPad { lassoTracker.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)] }
+        canvas.addGestureRecognizer(lassoTracker)
+        canvas.selectionMenuItems = { [weak self] context in self?.askMenuItems(context) ?? [] }
+        // Markierungen der Fragen über der Tinte; Antippen öffnet die Antwort
+        canvas.addSubview(askOverlay)
+        askTap.drawing = canvas.drawingGestureRecognizer
+        askTap.delegate = self
+        askTap.addTarget(self, action: #selector(handleAskTap(_:)))
+        canvas.addGestureRecognizer(askTap)
+        // Erst nach der Änderung zeichnen (nicht mitten darin): Was dabei passiert, darf die Fragen wieder ändern
+        askWatch = sync.asks.$revisions
+            .map { [id = doc.id] in $0[id] ?? 0 }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.reloadAskMarks() }
+
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(handleHover(_:)))
         canvas.addGestureRecognizer(hover)
         appHover = hover
@@ -172,6 +207,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         }
         syncCycle()
         connectLive()
+        sync.asks.refresh(doc.id)
     }
 
     override func viewDidLayoutSubviews() {
@@ -314,6 +350,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         canvas.undoManager?.removeAllActions()
         persistSyncStateNow()
         if sync.openController === self { sync.openController = nil }
+        answerCard?.dismiss(animated: false)
         let sync = self.sync, id = doc.id
         Task { await sync.syncClosed(id) }
     }
@@ -599,6 +636,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
                     if self.socketFresh {
                         self.socketFresh = false
                         self.syncCycle()
+                        // Ebenso die Fragen an Claude (Antworten, die ohne Verbindung kamen)
+                        self.sync.asks.refresh(self.doc.id)
                     }
                     if case .string(let text) = message { self.handleLive(text) }
                     self.receive(task)
@@ -647,6 +686,9 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
                 self?.structureSyncSince = nil
                 self?.applyPendingWhenIdle()
             }
+        case "asks":
+            // Fragen an Claude haben sich geändert (neue Antwort, gelöscht, verschoben): Liste holen
+            sync.asks.hint(doc.id, v: (obj["v"] as? NSNumber)?.intValue)
         case "presence":
             guests = obj["guests"] as? Int ?? 0
             onGuests(shared || guests > 0 ? guests : nil)
@@ -803,6 +845,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         canvas.editingAllowed = !viewOnly
         eraserGesture.isEnabled = erasing && !viewOnly
         pointerGesture.isEnabled = pointing && !viewOnly
+        lassoTracker.isEnabled = lasso && !viewOnly
+        if !lassoTracker.isEnabled { lassoPath = nil }
         if !isPad { canvas.panGestureRecognizer.minimumNumberOfTouches = viewOnly ? 1 : 2 }
         if !erasing { eraserCursor.isHidden = true }
         setPencilKitHover(enabled: !(erasing && !viewOnly))
@@ -831,7 +875,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         let before = pausedPencilKitHover.count
         // Bei jedem Aufruf nachsehen: PencilKit könnte eine Geste neu anlegen oder wieder einschalten
         let onCanvas = (canvas.gestureRecognizers ?? []).filter { $0 !== appHover && Self.watchesPencil($0) }
-        let pencilKitViews = canvas.subviews.filter { $0 !== pagesView && $0 !== pointerOverlay }
+        let pencilKitViews = canvas.subviews.filter { $0 !== pagesView && $0 !== pointerOverlay && $0 !== askOverlay }
         for g in onCanvas + pencilKitViews.flatMap({ Self.pencilWatchers(in: $0) })
         where g.isEnabled && !pausedPencilKitHover.contains(where: { $0 === g }) {
             g.isEnabled = false
@@ -1106,6 +1150,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         }
         updatePixelScale()
         updateContentSize()
+        reloadAskMarks()
     }
 
     /// Alle Seiten neu anlegen, wenn sich Reihenfolge oder Inhalt der Seiten geändert hat
@@ -1128,6 +1173,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         pointerOverlay.bounds = pagesView.bounds
         pointerOverlay.layer.position = .zero
         pointerOverlay.transform = CGAffineTransform(scaleX: s, y: s)
+        askOverlay.layout(scale: s)
         canvas.contentSize = CGSize(width: PageLayout.width * s, height: layout.totalHeight * s)
     }
 
@@ -1167,6 +1213,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         let s = k * scrollView.zoomScale
         pagesView.transform = CGAffineTransform(scaleX: s, y: s)
         pointerOverlay.transform = CGAffineTransform(scaleX: s, y: s)
+        askOverlay.layout(scale: s)
     }
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
@@ -1389,6 +1436,9 @@ struct PageUndo {
     let pageCount: Int
     /// Kopie des PDFs vor der Änderung (nur bei PDF-Dokumenten)
     let pdfBackup: URL?
+    /// Fragen an Claude auf gelöschten Seiten: unsichtbar, bis Rückgängig sie zurückbringt oder das Ende des
+    /// Rückgängig sie löscht
+    var hiddenAsks: [String] = []
 }
 
 struct PageEditError: LocalizedError {
@@ -1584,6 +1634,11 @@ extension CanvasController {
             let moved = CanvasController.move(strokes, from: current, to: target, mapping: undo.inverse)
             self.commitPages(PKDrawing(strokes: moved.kept + undo.removed), pageCount: undo.pageCount,
                              pdfChanged: undo.pdfBackup != nil)
+            // Fragen an Claude rücken mit zurück; die auf den gelöschten Seiten kommen wieder
+            let pv = self.currentPagesVersion
+            let gone = self.sync.asks.remap(self.doc.id, pv: pv, mapping: undo.inverse)
+            self.sync.asks.unhide(self.doc.id, undo.hiddenAsks, pv: pv)
+            self.sync.asks.dropHidden(self.doc.id, gone)
             done(nil)
         }
     }
@@ -1616,6 +1671,7 @@ extension CanvasController {
     /// Beim Schließen der Übersicht: Kopie für Rückgängig aufräumen
     func discardPageUndo() {
         if let backup = pageUndo?.pdfBackup { try? FileManager.default.removeItem(at: backup) }
+        if let hidden = pageUndo?.hiddenAsks, !hidden.isEmpty { sync.asks.dropHidden(doc.id, hidden) }
         pageUndo = nil
     }
 
@@ -1629,6 +1685,8 @@ extension CanvasController {
         Task { [weak self] in
             guard let self else { return }
             await self.fetchRemoteNow()
+            // Fragen an Claude, die andere Geräte eben gestellt haben, sollen auch mitrücken
+            await self.sync.asks.refreshAndWait(self.doc.id, upTo: 4)
             var backup: URL?
             var newPDF: CGPDFDocument?
             if let pdfEdit {
@@ -1683,6 +1741,8 @@ extension CanvasController {
             let moved = CanvasController.move(strokes, from: old, to: new, mapping: mapping)
             self.pageUndo = PageUndo(removed: moved.removed, inverse: inverse, pageCount: old.frames.count, pdfBackup: backup)
             self.commitPages(PKDrawing(strokes: moved.kept), pageCount: new.frames.count, pdfChanged: newPDF != nil)
+            // Fragen an Claude rücken mit ihrer Seite; die auf gelöschten Seiten bleiben bis zum Ende des Rückgängig
+            self.pageUndo?.hiddenAsks = self.sync.asks.remap(self.doc.id, pv: self.currentPagesVersion, mapping: mapping)
             done(nil)
         }
     }
@@ -1765,5 +1825,207 @@ extension CanvasController {
         guard want != pageCount else { return }
         pageCount = want
         rebuildPages()
+    }
+}
+
+// MARK: Claude fragen: Frage mit dem Lasso markieren, Antwort an ihrer Markierung lesen
+
+extension CanvasController: UIGestureRecognizerDelegate {
+    /// Seitenstand dieses Dokuments jetzt (ms; 0 = nie Seiten geändert)
+    private var currentPagesVersion: Int { store.documents.first { $0.id == doc.id }?.pagesVersion ?? 0 }
+
+    /// „Claude fragen“ und „Claude gründlich fragen“ vorn im Menü einer Lasso-Auswahl
+    private func askMenuItems(_ context: SelectionMenuContext) -> [UIMenuElement] {
+        [("quick", "Claude fragen", "questionmark.bubble"),
+         ("thorough", "Claude gründlich fragen", "text.bubble")].map { effort, title, symbol in
+            UIAction(title: title, image: UIImage(systemName: symbol)) { [weak self] _ in
+                self?.askClaude(effort: effort, from: context)
+            }
+        }
+    }
+
+    /// Weg des Lassos, sobald er fertig ist. Antippen (Menü öffnen, Auswahl aufheben) und Verschieben der Auswahl
+    /// (eine Linie ohne Fläche) zählen nicht: Dann bleibt der vorige Weg
+    private func lassoEnded(_ raw: [CGPoint]) {
+        guard k > 0 else { return }
+        let points = LassoGeometry.simplified(raw, minStep: 2)
+        guard points.count >= 8, LassoGeometry.area(points) >= 400 else { return }
+        let box = LassoGeometry.bounds(points)
+        lassoPath = LassoPath(points: points, bounds: box, inkPrint: inkPrint(near: box))
+    }
+
+    /// Kennzahl der Tinte, die `box` (Seitenpunkte) berührt, in Seitenpunkten gerechnet (übersteht Drehen)
+    private func inkPrint(near box: CGRect) -> Int {
+        guard k > 0 else { return 0 }
+        let area = box.applying(CGAffineTransform(scaleX: k, y: k))
+        var h = Hasher()
+        for stroke in canvas.drawing.strokes where stroke.renderBounds.intersects(area) {
+            let b = stroke.renderBounds
+            for v in [b.minX, b.minY, b.maxX, b.maxY] { h.combine(Int((v / k * 4).rounded())) }
+            h.combine(stroke.path.count)
+        }
+        return h.finalize()
+    }
+
+    /// Die markierte Frage an Claude: Striche im Lasso, ihre Stelle, zwei Bilder (nur die Frage; die ganze Seite mit
+    /// der Frage hervorgehoben). Die Markierung erscheint, sobald die Bilder fertig sind; hochgeladen wird gleich
+    /// danach (ohne Netz später)
+    private func askClaude(effort: String, from menu: SelectionMenuContext) {
+        guard k > 0, !viewOnly else { return }
+        guard sync.isConfigured else {
+            onFlashTimed("Erst den Server einrichten (Zahnrad in der Übersicht)", 2.5)
+            return
+        }
+        // Der zuletzt gezogene Weg gehört zu dieser Auswahl: Die Tinte darunter ist unverändert (nichts verschoben,
+        // dupliziert oder eingefügt), und PencilKit zeigt sein Menü in seiner Nähe
+        let source = menu.space.map { pagesView.convert(menu.sourcePoint, from: $0) }
+        #if DEBUG
+        NSLog("Claude fragen: Menü bei %@, Lasso %@", source.map { "\($0)" } ?? "nil",
+              lassoPath.map { "\($0.bounds)" } ?? "nil")
+        #endif
+        guard let lasso = lassoPath, inkPrint(near: lasso.bounds) == lasso.inkPrint,
+              source.map({ lasso.bounds.insetBy(dx: -120, dy: -120).contains($0) }) ?? true
+        else {
+            onFlashTimed("Bitte die Frage noch einmal mit dem Lasso umkreisen", 2.5)
+            return
+        }
+        // Striche, die mindestens zur Hälfte im Lasso liegen (sonst die, deren Mitte darin liegt)
+        let toCanvas = CGAffineTransform(scaleX: k, y: k)
+        let polygon = lasso.points.map { $0.applying(toCanvas) }
+        let area = lasso.bounds.applying(toCanvas)
+        let strokes = canvas.drawing.strokes
+        let near = strokes.filter { $0.renderBounds.intersects(area) }
+        var picked = near.filter { LassoGeometry.mostlyInside($0, polygon) }
+        if picked.isEmpty {
+            picked = near.filter { LassoGeometry.contains(polygon, CGPoint(x: $0.renderBounds.midX, y: $0.renderBounds.midY)) }
+        }
+        guard !picked.isEmpty else {
+            onFlashTimed("Im Lasso ist keine Schrift", 2)
+            return
+        }
+        let ink = PKDrawing(strokes: picked).transformed(using: toPage)
+        let rect = ink.bounds
+        guard !layout.frames.isEmpty, !rect.isNull, !rect.isEmpty else { return }
+        // Seite der Frage, Stelle relativ zu ihr
+        let page = layout.page(at: rect.midY)
+        let frame = layout.frames[page]
+        let pageRect = CGRect(origin: .zero, size: frame.size)
+        var local = rect.offsetBy(dx: -frame.minX, dy: -frame.minY).intersection(pageRect)
+        if local.isNull || local.isEmpty {
+            let x = min(max(rect.minX - frame.minX, 0), frame.width), y = min(max(rect.minY - frame.minY, 0), frame.height)
+            local = CGRect(x: x, y: y, width: 1, height: 1)
+        }
+        let lassoOnPage = lasso.points.map { CGPoint(x: $0.x - frame.minX, y: $0.y - frame.minY) }
+        // Für das Bild der Seite nur ihre Striche (nicht die ganze Zeichnung umrechnen)
+        let pageArea = frame.applying(toCanvas)
+        let export = PageExport(frames: layout.frames, pdf: pdf,
+                                ink: PKDrawing(strokes: strokes.filter { $0.renderBounds.intersects(pageArea) })
+                                    .transformed(using: toPage))
+        let ask = Ask(id: UUID().uuidString, status: "local",
+                      anchor: AskAnchor(page: page, x: Double(local.minX), y: Double(local.minY),
+                                        w: Double(local.width), h: Double(local.height)),
+                      pv: currentPagesVersion, effort: effort, created: Date().timeIntervalSince1970,
+                      from: isPad ? "iPad" : "iPhone")
+        lassoPath = nil
+        // Auswahl aufheben, sobald das Menü weg ist
+        DispatchQueue.main.async { [weak self] in self?.endLassoSelection() }
+
+        let folder = sync.asks.imageFolder(doc.id, ask.id)
+        let box = UncheckedBox(ink)
+        let asks = sync.asks, id = doc.id
+        // Hinweise auch, wenn diese Leinwand inzwischen zu ist (Tab gewechselt)
+        let flash = onFlashTimed
+        Task {
+            do {
+                try await PageExport.run {
+                    let question = PageExport.questionPNG(box.value, region: rect)
+                    let pageImage = export.askPageJPEG(page: page, lasso: lassoOnPage)
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                    try question.write(to: folder.appendingPathComponent("question.png"), options: .atomic)
+                    try pageImage.write(to: folder.appendingPathComponent("page.jpg"), options: .atomic)
+                }
+                asks.add(id, ask)
+                flash(effort == "thorough" ? "Frage an Claude geschickt (gründlich)" : "Frage an Claude geschickt", 2)
+            } catch {
+                flash("Frage konnte nicht vorbereitet werden: \(error.localizedDescription)", 3)
+            }
+        }
+    }
+
+    /// Hebt PencilKits Auswahl auf wie ein Werkzeugwechsel (das Lasso bleibt das Werkzeug) und nimmt ihr den Fokus.
+    /// Ersetzt die Zeichnung nicht: Kein Rückgängig geht verloren, kein Strich unterwegs
+    private func endLassoSelection() {
+        guard canvas.tool is PKLassoTool else { return }
+        canvas.tool = PKInkingTool(.pen, color: inkColor, width: inkWidth * max(k, 0.5))
+        applyTool()
+        canvas.endEditing(true)
+    }
+
+    /// Markierungen neu: nach Änderungen der Fragen, neuen Seiten, Drehen
+    private func reloadAskMarks() {
+        guard k > 0 else { return }
+        let list = sync.asks.asks(doc.id)
+        askOverlay.set(list, frames: layout.frames, pagesVersion: currentPagesVersion)
+        askOverlay.layout(scale: k * canvas.zoomScale)
+        if canvas.subviews.last !== askOverlay { canvas.bringSubviewToFront(askOverlay) }
+        // Neue Antwort, während das Dokument offen ist
+        let answered = Set(list.filter { $0.isAnswered && $0.isVisible }.map(\.id))
+        if let known = knownAnswered, !answered.subtracting(known).isEmpty { onFlash("Claude hat geantwortet") }
+        knownAnswered = answered
+        // Die Frage der offenen Karte ist weg (gelöscht, auch auf einem anderen Gerät)
+        if let card = answerCard, sync.asks.ask(doc.id, card.model.askID)?.isVisible != true {
+            card.dismiss(animated: true)
+        }
+    }
+
+    // MARK: Markierung antippen
+
+    /// Nur Berührungen, die auf einer Markierung beginnen. Radierer und Zeigestift behalten ihre (Pencil am iPad,
+    /// Finger am iPhone)
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        guard gestureRecognizer === askTap else { return true }
+        let toolOwns = (erasing || pointing) && !viewOnly && (!isPad || touch.type == .pencil)
+        guard !toolOwns else { return false }
+        return askOverlay.mark(at: touch.location(in: canvas), padding: touch.type == .pencil ? 2 : 10) != nil
+    }
+
+    @objc private func handleAskTap(_ g: MarkTapGesture) {
+        guard g.state == .ended, let id = askOverlay.mark(at: g.location(in: canvas), padding: 10) else { return }
+        showAnswer(id)
+    }
+
+    /// Karte mit der Antwort: am iPad neben der Markierung, am iPhone von unten (halb hoch, die Seite bleibt
+    /// bedienbar; eine andere Markierung tauscht nur den Inhalt)
+    private func showAnswer(_ id: String) {
+        guard let mark = askOverlay.view(for: id) else { return }
+        if let card = answerCard {
+            card.model.askID = id
+            askOverlay.highlight(id)
+            return
+        }
+        guard presentedViewController == nil else { return }
+        let model = AnswerCardModel(doc: doc.id, askID: id, asks: sync.asks)
+        let card = AnswerCardController(model: model)
+        model.onDelete = { [weak self, weak card] askID in
+            guard let self else { return }
+            self.sync.asks.delete(self.doc.id, askID)
+            card?.dismiss(animated: true)
+        }
+        card.onClose = { [weak self] in self?.askOverlay.highlight(nil) }
+        card.modalPresentationStyle = .popover
+        card.preferredContentSize = CGSize(width: min(480, view.bounds.width - 40),
+                                           height: min(520, view.bounds.height * 0.7))
+        if let pop = card.popoverPresentationController {
+            pop.sourceView = mark
+            pop.sourceRect = mark.bounds
+            pop.permittedArrowDirections = .any
+            let sheet = pop.adaptiveSheetPresentationController
+            sheet.detents = [.medium(), .large()]
+            sheet.prefersGrabberVisible = true
+            sheet.largestUndimmedDetentIdentifier = .medium
+        }
+        answerCard = card
+        askOverlay.highlight(id)
+        present(card, animated: true)
     }
 }
