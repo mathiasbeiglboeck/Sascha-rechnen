@@ -4,6 +4,8 @@
 //   docs     Metadaten der Dokumente (wie meta.json in der App), "letzte Änderung gewinnt"
 //   strokes  jeder Strich mit stabiler ID; Löschen setzt alive = 0 (Grabstein), so gibt es keine Konflikte
 //   blobs    PDFs und Ausgang-Dateien, in 1-MB-Stücken
+//   asks     Fragen an Claude („Claude fragen“ im Lasso-Menü) samt Antwort; die Bilder der Frage liegen in blobs,
+//            bis sie beantwortet ist. Ein Helfer am Mac holt sie ab (er bekommt neue sofort über /api/asks/ws)
 // Jede Änderung bekommt eine fortlaufende Nummer (seq). Geräte fragen „alles seit seq X“.
 //
 // Alle /api-Adressen brauchen den Header  Authorization: Bearer <SECRET>.
@@ -16,9 +18,22 @@ const RECIPIENTS = ["claude", "chatgpt"];
 // Zeigestift-Farben der Gäste im Browser, je Gast eine andere. Lila (iPad) und Pink (iPhone) gehören den Apps.
 const GUEST_COLORS = ["#00a8e8", "#ff7a00", "#00b386", "#ff3b30", "#2f6bff", "#e0a800"];
 const isColor = (c) => typeof c === "string" && /^#[0-9a-fA-F]{6}$/.test(c);
+// Fragen an Claude: höchstens so viele offene auf einmal (schützt die Nutzung am Mac vor einer Schleife in der App)
+const MAX_OPEN_ASKS = 50;
+const MAX_QUESTION_BYTES = 4 * 1024 * 1024;
+const MAX_PAGE_BYTES = 8 * 1024 * 1024;
+const MAX_ANSWER_CHARS = 200000;
+const EFFORTS = ["quick", "thorough"];
+// Frist, in der der Helfer eine übernommene Frage beantwortet (er kann sie verlängern), in Sekunden
+const ASK_LEASE = 900;
+// Läuft die Frist einer übernommenen Frage so oft ab, ohne dass eine Antwort kommt, gilt sie als gescheitert
+const MAX_ASK_RETRIES = 3;
+const UUID_RE = /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i;
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
+/// Fehler mit Kennung: So unterscheiden App und Helfer sie von der 404 eines älteren Servers ohne diese Adressen
+const fail = (error, code, status) => json({ error, code }, status);
 
 function sameSecret(a, b) {
   if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
@@ -62,7 +77,16 @@ export class Store extends DurableObject {
       CREATE TABLE IF NOT EXISTS blobmeta (key TEXT PRIMARY KEY, size INTEGER NOT NULL, type TEXT, created REAL NOT NULL);
       CREATE TABLE IF NOT EXISTS shares (token TEXT PRIMARY KEY, doc TEXT NOT NULL, created REAL NOT NULL);
       CREATE TABLE IF NOT EXISTS blobs (key TEXT NOT NULL, part INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY (key, part));
+      CREATE TABLE IF NOT EXISTS asks (id TEXT PRIMARY KEY, doc TEXT NOT NULL, status TEXT NOT NULL, anchor TEXT NOT NULL,
+                                       pv INTEGER NOT NULL DEFAULT 0, effort TEXT NOT NULL DEFAULT 'quick',
+                                       created REAL NOT NULL, updated REAL NOT NULL, lease REAL NOT NULL DEFAULT 0,
+                                       claim TEXT, retries INTEGER NOT NULL DEFAULT 0, answer TEXT, note TEXT, info TEXT,
+                                       v INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS asks_doc ON asks (doc);
+      CREATE INDEX IF NOT EXISTS asks_status ON asks (status);
     `);
+    // Lebenszeichen des Helfers am Mac: beantwortet, ohne das Objekt zu wecken (kostet so gut wie nichts)
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
   nextSeq() {
@@ -78,9 +102,25 @@ export class Store extends DurableObject {
     const method = request.method;
     try {
       if (parts[0] === "s") return this.guest(request, parts[1], parts[2]);
-      const [, area, id, sub] = parts;
+      const [, area, id, sub, extra] = parts;
 
       if (area === "doc" && id && sub === "ws") return this.accept(request, id, "app");
+
+      // Fragen an Claude. Die App: Liste je Dokument, neue Frage, Markierung löschen, Stellen nach Seitenänderungen
+      if (area === "doc" && id && sub === "asks") {
+        if (!extra && method === "GET") return json(this.docAsks(id));
+        if (!extra && method === "PATCH") return json(this.moveAsks(id, await request.json()));
+        if (extra && method === "PUT") return await this.createAsk(request, id, extra);
+        if (extra && method === "DELETE") return json(this.deleteAsk(id, extra));
+      }
+      // Der Helfer am Mac: wartet über den WebSocket, holt offene Fragen, übernimmt eine, lädt ihre Bilder, antwortet
+      if (area === "asks") {
+        if (id === "ws" && !sub) return this.acceptHelper(request);
+        if (id === "open" && !sub && method === "GET") return json(this.openAsks());
+        if (id && sub === "claim" && method === "POST") return await this.claimAsk(id, request);
+        if (id && (sub === "question" || sub === "page") && method === "GET") return this.blobResponse(`ask/${id}/${sub}`);
+        if (id && sub === "answer" && method === "PUT") return await this.answerAsk(id, request, url);
+      }
       if (area === "share" && id && method === "POST") return json({ token: this.shareToken(id) });
       if (area === "share" && id && method === "DELETE") {
         this.sql.exec("DELETE FROM shares WHERE doc = ?", id);
@@ -164,6 +204,7 @@ export class Store extends DurableObject {
       if (result.deleted) {
         this.sql.exec("DELETE FROM strokes WHERE doc = ?", id);
         this.deleteBlob(`pdf/${id}`);
+        this.deleteDocAsks(id);
       }
     }
     // Seiten gelöscht oder eingefügt: offene Ansichten bauen ihre Seiten neu auf. Ältere Apps schicken keine
@@ -393,6 +434,276 @@ export class Store extends DurableObject {
     return json({ error: "Unbekannte Adresse" }, 404);
   }
 
+  // ---------- Fragen an Claude ----------
+  // Eine Frage durchläuft open → claimed (der Helfer am Mac arbeitet daran) → answered oder failed. Gibt der Helfer
+  // sie zurück (release, etwa am Nutzungslimit) oder läuft seine Frist ab, ist sie wieder open. Die Markierung löschen
+  // (oder das ganze Dokument) entfernt sie in jedem Zustand. Ihre beiden Bilder gibt es nur, bis sie fertig ist.
+  // Apps bekommen nach jeder Änderung den Hinweis {type: "asks", v} (nur Apps, nie Gäste) und holen die Liste selbst.
+  // Der Helfer bekommt bei jeder neuen Frage {type: "ask"} und holt dann /api/asks/open.
+
+  /// Version der Fragen über alle Dokumente: steigt mit jeder Änderung
+  nextAsksV() {
+    return this.sql
+      .exec("INSERT INTO counter (k, v) VALUES ('asks', 1) ON CONFLICT(k) DO UPDATE SET v = v + 1 RETURNING v")
+      .one().v;
+  }
+
+  askRow(askId) {
+    return this.sql.exec("SELECT * FROM asks WHERE id = ?", askId).toArray()[0];
+  }
+
+  /// Alle Fragen eines Dokuments mit der Version, bis zu der die Liste vollständig ist. Nur Antworten mit der ganzen
+  /// Liste dürfen der App ihre bekannte Version setzen, sonst verpasst sie eine Änderung dazwischen
+  docAsks(doc) {
+    const v = this.sql.exec("SELECT v FROM counter WHERE k = 'asks'").toArray()[0]?.v || 0;
+    return { v, asks: this.sql.exec("SELECT * FROM asks WHERE doc = ?", doc).toArray().map(publicAsk) };
+  }
+
+  asksChanged(doc, v) {
+    this.broadcast(doc, { type: "asks", v }, `app:${doc}`);
+  }
+
+  /// Neue Frage in einem einzigen multipart-Aufruf: meta (JSON: anchor, pv, effort, created, from), question (PNG,
+  /// nur die Frage) und page (JPEG oder PNG: die ganze Seite, die Frage darauf hervorgehoben). Bilder und Zeile
+  /// landen zusammen oder gar nicht. Lädt die App dieselbe Frage noch einmal hoch (Antwort verloren),
+  /// ändert sich nichts
+  async createAsk(request, doc, askId) {
+    if (!UUID_RE.test(askId)) return fail("Ungültige Kennung", "bad-id", 400);
+    if (this.askRow(askId)) return json(this.docAsks(doc));
+    let form;
+    try {
+      form = await request.formData();
+    } catch {
+      return fail("multipart erwartet", "bad-body", 400);
+    }
+    // Ein Teil ohne Dateinamen käme als Text an, die Bytes des Bildes wären verdorben
+    const q = form.get("question"), p = form.get("page"), m = form.get("meta");
+    if (!q || !p || typeof q === "string" || typeof p === "string") return fail("Bilder fehlen", "bad-body", 400);
+    if (q.size > MAX_QUESTION_BYTES || p.size > MAX_PAGE_BYTES) return fail("Bild zu groß", "too-large", 413);
+    let meta = null;
+    try {
+      meta = JSON.parse(typeof m === "string" ? m : m ? await m.text() : "null");
+    } catch {}
+    const qb = await q.arrayBuffer(), pb = await p.arrayBuffer();
+    // Ab hier ohne Unterbrechung: Dazwischen läuft nichts anderes
+    if (this.askRow(askId)) return json(this.docAsks(doc));
+    const d = this.sql.exec("SELECT meta FROM docs WHERE id = ?", doc).toArray()[0];
+    if (!d || JSON.parse(d.meta).deleted) return fail("Dokument nicht auf dem Server", "no-doc", 404);
+    const anchor = cleanAnchor(meta?.anchor), qt = imageType(qb), pt = imageType(pb);
+    if (!anchor || !qt || !pt) return fail("Stelle oder Bild ungültig", "bad-body", 400);
+    if (this.sql.exec("SELECT COUNT(*) AS n FROM asks WHERE status IN ('open', 'claimed')").one().n >= MAX_OPEN_ASKS) {
+      return fail("Zu viele offene Fragen", "too-many", 429);
+    }
+    const now = Date.now() / 1000;
+    let v;
+    this.ctx.storage.transactionSync(() => {
+      this.writeBlob(`ask/${askId}/question`, qb, qt);
+      this.writeBlob(`ask/${askId}/page`, pb, pt);
+      v = this.nextAsksV();
+      this.sql.exec(
+        "INSERT INTO asks (id, doc, status, anchor, pv, effort, created, updated, info, v) " +
+          "VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)",
+        askId, doc, JSON.stringify(anchor), Math.max(0, Math.trunc(Number(meta.pv) || 0)),
+        EFFORTS.includes(meta.effort) ? meta.effort : EFFORTS[0], Number(meta.created) || now, now,
+        JSON.stringify({ from: String(meta.from || "").slice(0, 40) }), v,
+      );
+    });
+    this.asksChanged(doc, v);
+    this.broadcast(null, { type: "ask" }, "helper");
+    return json(this.docAsks(doc));
+  }
+
+  /// Markierung löschen, auf allen Geräten
+  deleteAsk(doc, askId) {
+    const row = this.askRow(askId);
+    if (row && row.doc === doc) this.dropAsks(doc, [row]);
+    return this.docAsks(doc);
+  }
+
+  /// Das Dokument wurde gelöscht: seine Fragen mit
+  deleteDocAsks(doc) {
+    this.dropAsks(doc, this.sql.exec("SELECT id, status FROM asks WHERE doc = ?", doc).toArray());
+  }
+
+  /// Entfernt Fragen eines Dokuments samt ihren Bildern. Arbeitet der Helfer gerade an einer,
+  /// erfährt er es und bricht ab
+  dropAsks(doc, rows) {
+    if (!rows.length) return;
+    let v;
+    this.ctx.storage.transactionSync(() => {
+      for (const r of rows) {
+        if (r.status === "open" || r.status === "claimed") this.deleteAskImages(r.id);
+        this.sql.exec("DELETE FROM asks WHERE id = ?", r.id);
+      }
+      v = this.nextAsksV();
+    });
+    this.asksChanged(doc, v);
+    for (const r of rows) if (r.status === "claimed") this.broadcast(null, { type: "cancel", id: r.id }, "helper");
+  }
+
+  deleteAskImages(askId) {
+    this.deleteBlob(`ask/${askId}/question`);
+    this.deleteBlob(`ask/${askId}/page`);
+  }
+
+  /// Nach dem Löschen oder Einfügen von Seiten: body {pv, anchors: {askId: anchor | null}}, null heißt, die Seite der
+  /// Frage ist weg (die Frage mit). Wie bei pagesVersion nie zurück zu einer älteren Seitenordnung
+  moveAsks(doc, body) {
+    const pv = Math.max(0, Math.trunc(Number(body?.pv) || 0));
+    const entries = body?.anchors && typeof body.anchors === "object" ? Object.entries(body.anchors) : [];
+    const gone = [];
+    let v = 0;
+    this.ctx.storage.transactionSync(() => {
+      for (const [askId, a] of entries) {
+        const row = this.sql.exec("SELECT id, status, pv FROM asks WHERE id = ? AND doc = ?", askId, doc).toArray()[0];
+        const anchor = a === null ? null : cleanAnchor(a);
+        if (!row || row.pv > pv || (a !== null && !anchor)) continue;
+        if (!anchor) {
+          gone.push(row);
+          continue;
+        }
+        v = v || this.nextAsksV();
+        this.sql.exec(
+          "UPDATE asks SET anchor = ?, pv = ?, updated = ?, v = ? WHERE id = ?",
+          JSON.stringify(anchor), pv, Date.now() / 1000, v, askId,
+        );
+      }
+    });
+    if (v) this.asksChanged(doc, v);
+    this.dropAsks(doc, gone);
+    return this.docAsks(doc);
+  }
+
+  /// Für den Helfer: offene Fragen und übernommene, deren Frist abgelaufen ist, die älteste zuerst. Liest nur über den
+  /// Index asks_status, also nie die beantworteten (die sich ansammeln). `next`: in wie vielen Sekunden die nächste
+  /// zurückgestellte oder übernommene Frage fällig wird (null, wenn keine)
+  openAsks() {
+    const now = Date.now() / 1000;
+    const rows = this.sql
+      .exec("SELECT id, doc, status, effort, created, lease FROM asks WHERE status IN ('open', 'claimed')")
+      .toArray();
+    const later = rows.filter((r) => r.lease > now).map((r) => r.lease - now);
+    return {
+      asks: rows
+        .filter((r) => r.lease <= now)
+        .sort((a, b) => a.created - b.created)
+        .map((r) => ({ id: r.id, doc: r.doc, effort: r.effort, created: r.created, retry: r.status === "claimed" })),
+      next: later.length ? Math.ceil(Math.min(...later)) : null,
+    };
+  }
+
+  /// Der Helfer übernimmt eine Frage: body {lease} in Sekunden (60 bis 3600). Mit {claim} seines laufenden Auftrags
+  /// verlängert er stattdessen die Frist. Die Antwort enthält alles zum Beantworten außer den Bildern
+  /// (die holt er einzeln)
+  async claimAsk(askId, request) {
+    const body = await bodyJSON(request);
+    const row = this.askRow(askId);
+    if (!row) return fail("Diese Frage gibt es nicht (mehr)", "gone", 404);
+    const now = Date.now() / 1000;
+    const lease = Math.min(Math.max(Number(body.lease) || ASK_LEASE, 60), 3600);
+    if (row.status === "claimed" && body.claim && body.claim === row.claim) {
+      this.sql.exec("UPDATE asks SET lease = ? WHERE id = ?", now + lease, askId);
+      return json({ id: askId, claim: row.claim, leaseUntil: now + lease });
+    }
+    const expired = row.status === "claimed" && row.lease <= now;
+    if (row.status !== "open" && !expired) {
+      return json({ error: "Schon vergeben", code: "taken", status: row.status }, 409);
+    }
+    // Bricht der Helfer an einer Frage immer wieder ab (etwa weil er an ihr abstürzt), nicht endlos weiter versuchen
+    const retries = row.retries + (expired ? 1 : 0);
+    if (retries >= MAX_ASK_RETRIES) {
+      this.finishAsk(row, "failed", { note: "Der Helfer am Mac hat mehrmals nicht geantwortet." });
+      return fail("Aufgegeben", "failed", 409);
+    }
+    const claim = crypto.randomUUID();
+    let v;
+    this.ctx.storage.transactionSync(() => {
+      v = this.nextAsksV();
+      this.sql.exec(
+        "UPDATE asks SET status = 'claimed', lease = ?, claim = ?, retries = ?, note = NULL, updated = ?, v = ? " +
+          "WHERE id = ?",
+        now + lease, claim, retries, now, v, askId,
+      );
+    });
+    this.asksChanged(row.doc, v);
+    const d = this.sql.exec("SELECT meta FROM docs WHERE id = ?", row.doc).toArray()[0];
+    const meta = d ? JSON.parse(d.meta) : {};
+    const image = (name) =>
+      this.sql.exec("SELECT size, type FROM blobmeta WHERE key = ?", `ask/${askId}/${name}`).toArray()[0] || null;
+    return json({
+      id: askId, claim, leaseUntil: now + lease, anchor: JSON.parse(row.anchor), pv: row.pv, effort: row.effort,
+      created: row.created, from: JSON.parse(row.info || "{}").from || null,
+      doc: {
+        id: row.doc, title: meta.title || "", kind: meta.kind || "notebook", pageCount: meta.pageCount || 0,
+        pagesVersion: meta.pagesVersion || 0, pdfVersion: meta.pdfVersion || 0,
+        hasPDF: this.sql.exec("SELECT 1 FROM blobmeta WHERE key = ?", `pdf/${row.doc}`).toArray().length > 0,
+      },
+      images: { question: image("question"), page: image("page") },
+    });
+  }
+
+  /// Der Helfer meldet sich zurück, mit dem claim seines Auftrags. JSON {claim, markdown}: beantwortet;
+  /// {claim, error}: gescheitert (die App zeigt den Text); {claim, release: true, note?, retryAfter?}: zurück in die
+  /// Warteschlange, frühestens nach retryAfter Sekunden (etwa am Nutzungslimit; die App zeigt note). Statt JSON geht
+  /// auch text/markdown mit ?claim=…. Wiederholt er eine Antwort (Antwort verloren), ändert sich nichts
+  async answerAsk(askId, request, url) {
+    const raw = (request.headers.get("content-type") || "").startsWith("text/markdown");
+    const body = raw
+      ? { claim: url.searchParams.get("claim"), markdown: await request.text() }
+      : await bodyJSON(request);
+    const row = this.askRow(askId);
+    if (!row) return fail("Diese Frage gibt es nicht (mehr)", "gone", 404);
+    if (!body.claim || body.claim !== row.claim) {
+      return json({ error: "Nicht dein Auftrag", code: "not-yours", status: row.status }, 409);
+    }
+    if (row.status === "answered" || row.status === "failed") return json({ ok: true, v: row.v });
+    if (body.release) {
+      const now = Date.now() / 1000;
+      let v;
+      this.ctx.storage.transactionSync(() => {
+        v = this.nextAsksV();
+        this.sql.exec(
+          "UPDATE asks SET status = 'open', claim = NULL, lease = ?, note = ?, updated = ?, v = ? WHERE id = ?",
+          now + Math.min(Math.max(Number(body.retryAfter) || 0, 0), 86400),
+          typeof body.note === "string" && body.note ? body.note.slice(0, 300) : null, now, v, askId,
+        );
+      });
+      this.asksChanged(row.doc, v);
+      return json({ ok: true, v });
+    }
+    if (typeof body.markdown === "string" && body.markdown.trim()) {
+      if (body.markdown.length > MAX_ANSWER_CHARS) return fail("Antwort zu lang", "too-large", 413);
+      return json({ ok: true, v: this.finishAsk(row, "answered", { answer: body.markdown }) });
+    }
+    if (typeof body.error === "string") {
+      return json({ ok: true, v: this.finishAsk(row, "failed", { note: body.error.slice(0, 2000) || "Fehler" }) });
+    }
+    return fail("markdown, error oder release fehlt", "bad-body", 400);
+  }
+
+  finishAsk(row, status, { answer = null, note = null } = {}) {
+    let v;
+    this.ctx.storage.transactionSync(() => {
+      v = this.nextAsksV();
+      this.sql.exec(
+        "UPDATE asks SET status = ?, answer = ?, note = ?, lease = 0, updated = ?, v = ? WHERE id = ?",
+        status, answer, note, Date.now() / 1000, v, row.id,
+      );
+      this.deleteAskImages(row.id);
+    });
+    this.asksChanged(row.doc, v);
+    return v;
+  }
+
+  /// Der Helfer am Mac wartet über diesen WebSocket auf neue Fragen. Das Objekt schläft dabei (Hibernation), und sein
+  /// "ping" beantwortet der Server, ohne aufzuwachen
+  acceptHelper(request) {
+    if (request.headers.get("upgrade") !== "websocket") return json({ error: "WebSocket erwartet" }, 426);
+    const pair = new WebSocketPair();
+    this.ctx.acceptWebSocket(pair[1], ["helper"]);
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
   // ---------- Briefkasten ----------
 
   /// Ein PDF in den Eingang: wird ein neues Dokument, das auf allen Geräten erscheint
@@ -425,16 +736,19 @@ export class Store extends DurableObject {
 
   putBlob(key, buffer, type) {
     if (!buffer || buffer.byteLength === 0) throw new Error("Leere Datei");
-    this.ctx.storage.transactionSync(() => {
-      this.sql.exec("DELETE FROM blobs WHERE key = ?", key);
-      for (let off = 0, part = 0; off < buffer.byteLength; off += CHUNK, part++) {
-        this.sql.exec("INSERT INTO blobs (key, part, data) VALUES (?, ?, ?)", key, part, buffer.slice(off, off + CHUNK));
-      }
-      this.sql.exec(
-        "INSERT OR REPLACE INTO blobmeta (key, size, type, created) VALUES (?, ?, ?, ?)",
-        key, buffer.byteLength, type || "application/octet-stream", Date.now() / 1000,
-      );
-    });
+    this.ctx.storage.transactionSync(() => this.writeBlob(key, buffer, type));
+  }
+
+  /// Wie putBlob, aber ohne eigene Transaktion: So landen mehrere Dateien und ihre Zeile zusammen oder gar nicht
+  writeBlob(key, buffer, type) {
+    this.sql.exec("DELETE FROM blobs WHERE key = ?", key);
+    for (let off = 0, part = 0; off < buffer.byteLength; off += CHUNK, part++) {
+      this.sql.exec("INSERT INTO blobs (key, part, data) VALUES (?, ?, ?)", key, part, buffer.slice(off, off + CHUNK));
+    }
+    this.sql.exec(
+      "INSERT OR REPLACE INTO blobmeta (key, size, type, created) VALUES (?, ?, ?, ?)",
+      key, buffer.byteLength, type || "application/octet-stream", Date.now() / 1000,
+    );
   }
 
   deleteBlob(key) {
@@ -476,6 +790,39 @@ function inParts(changes, send) {
     size += n;
   }
   if (part.length) send(part);
+}
+
+/// Body als JSON (leer: {})
+async function bodyJSON(request) {
+  const text = await request.text();
+  const body = text ? JSON.parse(text) : {};
+  return body && typeof body === "object" ? body : {};
+}
+
+/// PNG oder JPEG, an den ersten Bytes erkannt (sonst null)
+function imageType(buffer) {
+  const b = new Uint8Array(buffer.slice(0, 4));
+  if (b.length === 4 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return "image/png";
+  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
+  return null;
+}
+
+/// Stelle einer Frage: Seite (ab 0) und Rechteck auf dieser Seite, in Seiteneinheiten (Breite 768, Ursprung oben links)
+function cleanAnchor(a) {
+  if (!a || typeof a !== "object") return null;
+  const page = Number(a.page), [x, y, w, h] = [a.x, a.y, a.w, a.h].map(Number);
+  if (!Number.isInteger(page) || page < 0 || page > 100000) return null;
+  if (![x, y, w, h].every((n) => Number.isFinite(n) && Math.abs(n) < 1e6) || w < 0 || h < 0) return null;
+  return { page, x, y, w, h };
+}
+
+/// Was die Apps von einer Frage sehen (ohne den claim des Helfers)
+function publicAsk(r) {
+  return {
+    id: r.id, doc: r.doc, status: r.status, anchor: JSON.parse(r.anchor), pv: r.pv, effort: r.effort,
+    created: r.created, updated: r.updated, answer: r.answer, note: r.note,
+    from: JSON.parse(r.info || "{}").from || null, v: r.v,
+  };
 }
 
 /// Übernimmt in `target` die Seitenangaben aus `other`, wo sie neuer sind
