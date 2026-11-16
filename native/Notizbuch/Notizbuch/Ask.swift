@@ -51,8 +51,9 @@ struct Ask: Codable, Identifiable, Equatable {
     var isFailed: Bool { status == "failed" }
     var isWaiting: Bool { !isAnswered && !isFailed }
     var isThorough: Bool { effort == "thorough" }
-    /// Wird angezeigt (nicht gerade gelöscht, ihre Seite nicht gelöscht)
-    var isVisible: Bool { deleting != true && hidden != true }
+    /// Wird angezeigt: nicht gerade gelöscht, ihre Seite nicht gelöscht (hier: `hidden`; auf einem anderen Gerät:
+    /// Seite −1 vom Server, bis dort Rückgängig sie zurückbringt oder sie mit der Seite verschwindet)
+    var isVisible: Bool { deleting != true && hidden != true && anchor.page >= 0 }
 }
 
 /// Fragen an Claude je Dokument: Zwischenspeicher in <Dokument>/asks.json, Abgleich mit dem Server.
@@ -76,6 +77,14 @@ final class AskStore: ObservableObject {
     private var retries: [UUID: Task<Void, Never>] = [:]
     /// Fehlversuche in Folge je Dokument (für die Wartezeit bis zum nächsten)
     private var failures: [UUID: Int] = [:]
+    /// Dokumente, in denen noch etwas hinauf muss, auch über einen Neustart hinweg: So geht eine Frage auch dann
+    /// hinaus, wenn ihr Dokument zu ist (`flushAll`)
+    private var pendingDocs = Set((UserDefaults.standard.stringArray(forKey: AskStore.pendingKey) ?? [])
+        .compactMap(UUID.init(uuidString:)))
+    private static let pendingKey = "askPendingDocs"
+    /// Der Server kannte „Claude fragen“ beim letzten Versuch nicht: erst billig nachsehen, bevor wieder Bilder
+    /// hinaufgehen
+    private var serverTooOld = false
 
     init(store: DocumentStore, sync: SyncEngine) {
         self.store = store
@@ -131,7 +140,15 @@ final class AskStore: ObservableObject {
         lists[doc] = list
         let data = try? JSONEncoder().encode(File(v: versions[doc] ?? 0, asks: list))
         store.enqueueWrite(to: fileURL(doc)) { data }
+        updatePending(doc)
         revisions[doc, default: 0] += 1
+    }
+
+    private func updatePending(_ doc: UUID) {
+        let pending = hasLocalWork(doc)
+        guard pending != pendingDocs.contains(doc) else { return }
+        if pending { pendingDocs.insert(doc) } else { pendingDocs.remove(doc) }
+        UserDefaults.standard.set(pendingDocs.map(\.uuidString), forKey: Self.pendingKey)
     }
 
     /// Neue Frage; ihre Bilder liegen schon in `imageFolder(doc, ask.id)`
@@ -157,19 +174,22 @@ final class AskStore: ObservableObject {
     }
 
     /// Seiten gelöscht oder eingefügt: Jede Frage rückt mit ihrer Seite, wie die Striche (`mapping`: alte Seite →
-    /// neue, nil = gelöscht), und gilt für den neuen Seitenstand `pv`. Fällt ihre Seite weg, wird sie unsichtbar,
-    /// bis Rückgängig sie zurückbringt oder `dropHidden` sie löscht. Gibt die IDs der unsichtbar gewordenen zurück
+    /// neue, nil = gelöscht), und gilt für den neuen Seitenstand `pv`. Fällt ihre Seite weg, wird sie unsichtbar
+    /// (die anderen Geräte bekommen Seite −1), bis Rückgängig sie zurückbringt oder `dropHidden` sie löscht. Gibt
+    /// die IDs der unsichtbar gewordenen zurück. Fragen, die ein anderes Gerät eben so versteckt hat, bleiben, wie sie sind
     func remap(_ doc: UUID, pv: Int, mapping: (Int) -> Int?) -> [String] {
         var hidden: [String] = []
         edit(doc) { list in
-            for i in list.indices where list[i].deleting != true && list[i].hidden != true {
+            for i in list.indices where list[i].deleting != true && list[i].hidden != true && list[i].anchor.page >= 0 {
+                list[i].pv = pv
                 guard let j = mapping(list[i].anchor.page) else {
                     list[i].hidden = true
+                    // Noch nicht am Server: Sie geht erst hinauf, wenn Rückgängig sie zurückbringt
+                    list[i].moved = list[i].status == "local" ? nil : true
                     hidden.append(list[i].id)
                     continue
                 }
                 list[i].anchor.page = max(j, 0)
-                list[i].pv = pv
                 list[i].moved = true
             }
         }
@@ -234,19 +254,29 @@ final class AskStore: ObservableObject {
         }
     }
 
-    /// Wie `refresh`, wartet aber auf das Ende, höchstens `seconds` Sekunden (etwa vor einer Seitenänderung, damit
-    /// eben anderswo gestellte Fragen mitrücken)
-    func refreshAndWait(_ doc: UUID, upTo seconds: Double) async {
-        guard sync.isConfigured else { return }
-        refresh(doc)
+    /// Wartet, bis der laufende Abgleich dieses Dokuments fertig ist, höchstens `seconds` Sekunden (vor einer
+    /// Seitenänderung, damit eben anderswo gestellte Fragen mitrücken)
+    func waitIdle(_ doc: UUID, upTo seconds: Double) async {
         let end = Date().addingTimeInterval(seconds)
         while running.contains(doc), Date() < end {
             try? await Task.sleep(for: .milliseconds(50))
         }
     }
 
+    /// Schickt hinauf, was in anderen (auch geschlossenen) Dokumenten noch wartet: aus der Schleife der Bibliothek
+    /// und beim Zurückkommen in die App. Ohne Wartendes keine Anfrage; nach einem Fehler gilt dessen Wartezeit
+    func flushAll() {
+        for doc in pendingDocs where !running.contains(doc) && retries[doc] == nil { refresh(doc) }
+    }
+
     private func pass(_ doc: UUID) async {
+        // Dokument hier gelöscht: Seine Fragen sind am Server mit ihm weg
+        guard store.documents.contains(where: { $0.id == doc }) else { return drop(doc) }
         do {
+            if serverTooOld {
+                apply(doc, try await sync.fetchAsks(doc))
+                serverTooOld = false
+            }
             try await flush(doc)
             apply(doc, try await sync.fetchAsks(doc))
             failures[doc] = nil
@@ -254,6 +284,7 @@ final class AskStore: ObservableObject {
             let problem = Self.classify(error)
             if case .notConfigured = problem { return }
             if case .oldServer = problem {
+                serverTooOld = true
                 note(doc, "Server-Update nötig")
             }
             // Später noch einmal, solange etwas hinauf muss oder das Dokument offen ist (bei der offenen Leinwand
@@ -272,8 +303,20 @@ final class AskStore: ObservableObject {
         }
     }
 
+    /// Muss etwas hinauf? (Eine neue Frage, deren Seite eben gelöscht wurde, wartet auf Rückgängig, nicht auf den Server)
     private func hasLocalWork(_ doc: UUID) -> Bool {
-        asks(doc).contains { $0.status == "local" || $0.deleting == true || $0.moved == true }
+        asks(doc).contains { ($0.status == "local" && $0.hidden != true) || $0.deleting == true || $0.moved == true }
+    }
+
+    private func drop(_ doc: UUID) {
+        lists[doc] = nil
+        versions[doc] = nil
+        failures[doc] = nil
+        retries[doc]?.cancel()
+        retries[doc] = nil
+        if pendingDocs.remove(doc) != nil {
+            UserDefaults.standard.set(pendingDocs.map(\.uuidString), forKey: Self.pendingKey)
+        }
     }
 
     private func scheduleRetry(_ doc: UUID, after seconds: Double) {
@@ -346,15 +389,20 @@ final class AskStore: ObservableObject {
             apply(doc, list)
         }
 
-        let moved = asks(doc).filter {
-            $0.moved == true && $0.status != "local" && $0.deleting != true && $0.hidden != true
-        }
+        // Verschobene Stellen; eine Frage auf einer eben gelöschten Seite bekommt Seite −1 (unsichtbar, bis
+        // Rückgängig sie zurückbringt). Ein älterer Server übergeht die −1, dann bleibt es wie bisher
+        let moved = asks(doc).filter { $0.moved == true && $0.status != "local" && $0.deleting != true }
         for (pv, group) in Dictionary(grouping: moved, by: \.pv) {
-            let anchors = Dictionary(group.map { ($0.id, $0.anchor) }, uniquingKeysWith: { a, _ in a })
+            let anchors = Dictionary(group.map { a -> (String, AskAnchor) in
+                var anchor = a.anchor
+                if a.hidden == true { anchor.page = -1 }
+                return (a.id, anchor)
+            }, uniquingKeysWith: { a, _ in a })
             let list = try await sync.moveAsks(doc, pv: pv, anchors: anchors)
             edit(doc) { l in
                 for a in group {
-                    guard let i = l.firstIndex(where: { $0.id == a.id }), l[i].anchor == a.anchor, l[i].pv == a.pv
+                    guard let i = l.firstIndex(where: { $0.id == a.id }), l[i].anchor == a.anchor, l[i].pv == a.pv,
+                          l[i].hidden == a.hidden
                     else { continue }
                     l[i].moved = nil
                 }

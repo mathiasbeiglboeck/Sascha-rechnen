@@ -304,7 +304,8 @@ async function answer(ask) {
     throw e;
   }
   const title = job.doc.title || "Dokument";
-  log(ask.id, `übernommen: „${title}“, Seite ${job.anchor.page + 1}, ${ask.effort === "thorough" ? "gründlich" : "schnell"}`);
+  const where = job.anchor.page >= 0 ? `Seite ${job.anchor.page + 1}` : "Seite gelöscht";
+  log(ask.id, `übernommen: „${title}“, ${where}, ${ask.effort === "thorough" ? "gründlich" : "schnell"}`);
   const t0 = Date.now();
   // Frist verlängern, solange Claude arbeitet
   const renew = setInterval(() => {
@@ -320,6 +321,12 @@ async function answer(ask) {
     if (result.ok) {
       await reply(ask.id, { claim: job.claim, markdown: result.text });
       log(ask.id, `beantwortet nach ${Math.round((Date.now() - t0) / 1000)} s (${result.text.length} Zeichen)`);
+    } else if (result.auth) {
+      // Abgemeldet: Ein neuer Versuch hilft erst nach dem Anmelden. Pause, Hinweis in der App und am Mac
+      pausedUntil = Date.now() + 1800000;
+      await reply(ask.id, { claim: job.claim, release: true, retryAfter: 1800, note: result.error });
+      log(ask.id, "Claude am Mac ist abgemeldet, Pause 30 Minuten");
+      notifyMac("Claude am Mac ist abgemeldet. Im Terminal claude starten und anmelden, dann beantwortet der Helfer die Fragen.");
     } else if (result.limit) {
       pausedUntil = result.retryAt;
       const at = new Date(result.retryAt).toLocaleTimeString("de-AT", { hour: "2-digit", minute: "2-digit" });
@@ -332,7 +339,7 @@ async function answer(ask) {
       const tries = (state.failures?.[ask.id] || 0) + 1;
       state.failures = { ...(state.failures || {}), [ask.id]: tries };
       saveState(state);
-      if (tries < 2 && !result.timeout) {
+      if (tries < 2 && !result.timeout && !result.final) {
         await reply(ask.id, {
           claim: job.claim, release: true, retryAfter: config.retrySeconds, note: "Fehler am Mac, neuer Versuch",
         });
@@ -395,7 +402,7 @@ async function fetchFiles(job, dir) {
     saveState(state);
   }
   files.pdf = job.doc.hasPDF && fs.existsSync(pdf) ? "dokument.pdf" : null;
-  if (files.pdf) Object.assign(files, await pageWindow(job, pdf, qdir, dir));
+  if (files.pdf && job.anchor.page >= 0) Object.assign(files, await pageWindow(job, pdf, qdir, dir));
   return files;
 }
 
@@ -468,7 +475,8 @@ function prompt(job, files, fresh) {
     lines.push(`Neue Frage zum selben Dokument${job.doc.title ? ` („${job.doc.title}“)` : ""}:`);
   }
   lines.push(`- ${files.question}: die handgeschriebene Frage`);
-  lines.push(`- ${files.page}: die ganze Seite ${job.anchor.page + 1}, die Frage darauf farbig umrandet`);
+  const page = job.anchor.page >= 0 ? `die ganze Seite ${job.anchor.page + 1}` : "die ganze Seite";
+  lines.push(`- ${files.page}: ${page}, die Frage darauf farbig umrandet`);
   if (files.window) lines.push(`- ${files.window}: die Seiten ${files.first} bis ${files.last} des Dokuments, um die Frage herum`);
   lines.push("");
   lines.push(
@@ -520,11 +528,21 @@ async function askClaude(job, dir, files, level) {
   return { ok: false, error: "Chat konnte nicht fortgesetzt werden" };
 }
 
-/// Die Umgebung ohne Werte des Helfers (für Claude und andere Programme)
+/// Die Umgebung ohne Werte des Helfers (für Claude und andere Programme); Claude Code aktualisiert sich dabei nicht
+/// selbst (das tut es, wenn Mathias es im Terminal startet)
 function cleanEnv() {
   const env = { ...process.env };
   for (const k of Object.keys(env)) if (/^(NOTIZBUCH|BETTERNOTES)_/i.test(k)) delete env[k];
+  env.DISABLE_AUTOUPDATER = "1";
   return env;
+}
+
+/// Mitteilung am Mac (Mitteilungszentrale), höchstens einmal je Stunde
+function notifyMac(text) {
+  if (Date.now() - (notifyMac.last || 0) < 3600000) return;
+  notifyMac.last = Date.now();
+  execFile(OSASCRIPT, ["-e", `display notification ${JSON.stringify(text)} with title "BetterNotes – Claude fragen"`],
+    { timeout: 30000, env: cleanEnv() }, () => {});
 }
 
 function runClaude(args, cwd, minutes) {
@@ -558,7 +576,13 @@ function parseResult({ code, out, err, timedOut }) {
   } catch {}
   const text = typeof r?.result === "string" ? r.result.trim() : "";
   if (r && !r.is_error && r.subtype === "success" && text) return { ok: true, text, sessionUsed: true };
+  if (r?.subtype === "error_max_turns") {
+    return { ok: false, final: true, error: "Claude brauchte zu viele Schritte für diese Frage.", sessionUsed: true };
+  }
   const message = (text || err || out || `Exit ${code}`).trim().slice(-500);
+  if (/\/login|not logged in|log ?in again|invalid api key|oauth token|authentication[_ ]error/i.test(message)) {
+    return { ok: false, auth: true, error: "Claude am Mac ist abgemeldet: im Terminal claude starten und anmelden." };
+  }
   if (/usage limit|limit reached|hit your limit|rate.?limit|out of (extra )?usage/i.test(message)) {
     // „…|1763305200“ (Ende des Limits als Unix-Zeit) oder „resets 5pm“: im Zweifel in 30 Minuten
     const ts = message.match(/\|(\d{10})\b/);

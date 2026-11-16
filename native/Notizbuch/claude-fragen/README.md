@@ -54,7 +54,7 @@ Schnittstelle am Server (alle mit `Authorization: Bearer <Schlüssel>`):
 | `PUT /api/doc/<doc>/asks/<id>` | App | neue Frage: multipart mit `meta` (JSON), `question` (PNG) und `page` (JPEG/PNG), beide mit Dateinamen |
 | `GET /api/doc/<doc>/asks` | App | alle Fragen des Dokuments mit Version `v` |
 | `DELETE /api/doc/<doc>/asks/<id>` | App | Markierung löschen |
-| `PATCH /api/doc/<doc>/asks` | App | Stellen nach Seitenänderungen: `{pv, anchors: {id: anchor oder null}}` |
+| `PATCH /api/doc/<doc>/asks` | App | Stellen nach Seitenänderungen: `{pv, anchors: {id: anchor oder null}}`; Seite −1 heißt: Seite gelöscht, Rückgängig noch möglich (nicht angezeigt) |
 | `GET /api/asks/ws` | Helfer | WebSocket: `{"type":"ask"}` bei neuen Fragen, `{"type":"cancel","id"}` beim Löschen; `ping` → `pong` |
 | `GET /api/asks/open` | Helfer | offene Fragen, `next`: Sekunden bis zur nächsten zurückgestellten |
 | `POST /api/asks/<id>/claim` | Helfer | übernehmen (`{lease}`), mit `{claim}` die Frist verlängern |

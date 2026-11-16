@@ -1684,9 +1684,11 @@ extension CanvasController {
         discardPageUndo()
         Task { [weak self] in
             guard let self else { return }
+            // Fragen an Claude, die andere Geräte eben gestellt haben, sollen auch mitrücken: zugleich mit den
+            // Strichen holen, danach höchstens noch 4 Sekunden darauf warten
+            self.sync.asks.refresh(self.doc.id)
             await self.fetchRemoteNow()
-            // Fragen an Claude, die andere Geräte eben gestellt haben, sollen auch mitrücken
-            await self.sync.asks.refreshAndWait(self.doc.id, upTo: 4)
+            await self.sync.asks.waitIdle(self.doc.id, upTo: 4)
             var backup: URL?
             var newPDF: CGPDFDocument?
             if let pdfEdit {

@@ -91,7 +91,7 @@ cat > "$PLIST" <<PLIST
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
-  <key>ProcessType</key><string>Background</string>
+  <key>ProcessType</key><string>Standard</string>
   <key>StandardOutPath</key><string>$DEST/launchd.log</string>
   <key>StandardErrorPath</key><string>$DEST/launchd.log</string>
 </dict>

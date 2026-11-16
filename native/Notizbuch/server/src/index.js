@@ -556,7 +556,8 @@ export class Store extends DurableObject {
     this.ctx.storage.transactionSync(() => {
       for (const [askId, a] of entries) {
         const row = this.sql.exec("SELECT id, status, pv FROM asks WHERE id = ? AND doc = ?", askId, doc).toArray()[0];
-        const anchor = a === null ? null : cleanAnchor(a);
+        // Seite −1: Die Seite der Frage wurde gelöscht, Rückgängig ist noch möglich (die Apps zeigen sie nicht)
+        const anchor = a === null ? null : cleanAnchor(a, true);
         if (!row || row.pv > pv || (a !== null && !anchor)) continue;
         if (!anchor) {
           gone.push(row);
@@ -807,11 +808,12 @@ function imageType(buffer) {
   return null;
 }
 
-/// Stelle einer Frage: Seite (ab 0) und Rechteck auf dieser Seite, in Seiteneinheiten (Breite 768, Ursprung oben links)
-function cleanAnchor(a) {
+/// Stelle einer Frage: Seite (ab 0) und Rechteck auf dieser Seite, in Seiteneinheiten (Breite 768, Ursprung oben links).
+/// `detached`: auch Seite −1 (nur beim Verschieben: Seite gelöscht, Rückgängig noch möglich)
+function cleanAnchor(a, detached = false) {
   if (!a || typeof a !== "object") return null;
   const page = Number(a.page), [x, y, w, h] = [a.x, a.y, a.w, a.h].map(Number);
-  if (!Number.isInteger(page) || page < 0 || page > 100000) return null;
+  if (!Number.isInteger(page) || page < (detached ? -1 : 0) || page > 100000) return null;
   if (![x, y, w, h].every((n) => Number.isFinite(n) && Math.abs(n) < 1e6) || w < 0 || h < 0) return null;
   return { page, x, y, w, h };
 }
