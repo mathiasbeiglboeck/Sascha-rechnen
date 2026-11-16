@@ -79,7 +79,8 @@ table { border-collapse: collapse; display: block; overflow-x: auto; }
 td, th { border: 1px solid #d1d1d6; padding: .25em .5em; }
 hr { border: none; border-top: 1px solid #d1d1d6; }
 .katex { font-size: 1.05em; }
-eq { display: inline; }
+/* Lange Formeln im Text scrollen für sich, statt die ganze Seite zu verbreitern */
+eq { display: inline-block; max-width: 100%; overflow-x: auto; overflow-y: hidden; vertical-align: middle; }
 section { margin: .4em 0 .8em; }
 eqn { display: block; overflow-x: auto; overflow-y: hidden; padding: .1em 0; }
 eqn .katex-display { margin: 0; }
@@ -98,10 +99,34 @@ section.eqno > span { margin-left: 1em; }
 // \\href und Co. (trust: false)
 const macros = { "\\\\R": "\\\\mathbb{R}", "\\\\N": "\\\\mathbb{N}", "\\\\Z": "\\\\mathbb{Z}", "\\\\Q": "\\\\mathbb{Q}",
   "\\\\C": "\\\\mathbb{C}" };
+const katexOptions = { throwOnError: false, strict: "ignore", output: "htmlAndMathml", trust: false, macros };
+// Abgesetzte Formeln ($$…$$, \\[…\\]) als eigener Block nur, wenn danach nichts mehr in der Zeile steht. Sonst ginge
+// der Rest der Zeile verloren; so setzt sie die Regel im Absatz ab, und der Text danach bleibt
+for (const set of ["dollars", "brackets"]) {
+  for (const rule of texmath.rules[set].block) {
+    const post = rule.post;
+    rule.post = (str, outer, end) => (!post || post(str, outer, end)) && /^[ \\t]*(?:\\r?\\n|$)/.test(str.slice(end + 1));
+  }
+}
+// \\[…\\] auch mitten im Absatz, abgesetzt wie $$…$$ (Claude schreibt sie oft direkt unter eine Textzeile)
+texmath.rules.brackets.inline.push({ name: "math_inline_bracket_display", rex: /\\\\\\[([\\s\\S]+?)\\\\\\]/gy,
+  tmpl: "<section><eqn>$1</eqn></section>", tag: "\\\\[", displayMode: true });
+// Keine Links, Bilder und Verweise ([x]: …) aus der Antwort: nichts lädt aus dem Netz, und „[0,1]: wachsend“ bleibt Text
 const md = window.markdownit({ html: false, linkify: false, typographer: false })
-  .disable(["link", "image", "autolink"])
-  .use(texmath, { engine: katex, delimiters: ["dollars", "brackets"],
-    katexOptions: { throwOnError: false, strict: "ignore", output: "htmlAndMathml", trust: false, macros } });
+  .disable(["link", "image", "autolink", "reference"])
+  .use(texmath, { engine: katex, delimiters: ["dollars", "brackets"], katexOptions });
+// Das HTML von KaTeX als Funktion einsetzen: als Ersatztext würde replace $&, $$ … darin umdeuten
+const esc = (t) => String(t).replace(/[&<>"']/g, (c) => "&#" + c.charCodeAt(0) + ";");
+for (const set of ["dollars", "brackets"]) {
+  for (const rule of texmath.rules[set].inline) {
+    md.renderer.rules[rule.name] = (tokens, i) =>
+      rule.tmpl.replace("$1", () => texmath.render(tokens[i].content, !!rule.displayMode, katexOptions));
+  }
+  for (const rule of texmath.rules[set].block) {
+    md.renderer.rules[rule.name] = (tokens, i) => rule.tmpl.replace(/\\$([12])/g, (_, n) =>
+      n === "1" ? texmath.render(tokens[i].content, true, katexOptions) : esc(tokens[i].info));
+  }
+}
 function render(text) {
   const out = document.getElementById("out");
   try {

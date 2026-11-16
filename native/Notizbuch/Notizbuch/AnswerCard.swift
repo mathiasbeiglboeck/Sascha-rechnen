@@ -186,68 +186,106 @@ struct AnswerCard: View {
     }
 }
 
-/// Die Antwort: Markdown mit Formeln, gesetzt von KaTeX in einer eingebauten Seite (Antwort.html, ohne Netz)
+/// Die Antwort: Markdown mit Formeln, gesetzt von KaTeX in einer eingebauten Seite (Antwort.html, ohne Netz). Alle
+/// Karten teilen sich eine Web-Ansicht, die schon lädt, sobald ein Dokument Markierungen hat: Beim ersten Mal startet
+/// WebKit sonst erst seinen Prozess und lädt KaTeX, und die Karte bliebe Sekunden lang leer
 struct AnswerWebView: UIViewRepresentable {
     let markdown: String
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeUIView(context: Context) -> UIView {
+        let box = UIView()
+        box.backgroundColor = .clear
+        AnswerPage.shared.attach(to: box)
+        return box
+    }
 
-    func makeUIView(context: Context) -> WKWebView {
+    func updateUIView(_ box: UIView, context: Context) {
+        // Eine andere Karte hat die Web-Ansicht inzwischen genommen: zurückholen
+        AnswerPage.shared.attach(to: box)
+        AnswerPage.shared.show(markdown)
+    }
+
+    static func dismantleUIView(_ box: UIView, coordinator: ()) {
+        AnswerPage.shared.detach(from: box)
+    }
+}
+
+/// Die eine Web-Ansicht für alle Antworten (nur vom Hauptthread benutzt, wie zuvor der Koordinator der Karte)
+final class AnswerPage: NSObject, WKNavigationDelegate {
+    static let shared = AnswerPage()
+
+    /// Früh laden (ein Dokument mit Markierungen ist offen), damit die erste Karte sofort etwas zeigt
+    static func prewarm() { _ = shared }
+
+    let web: WKWebView
+    private let page = Bundle.main.url(forResource: "Antwort", withExtension: "html")
+    private var loaded = false
+    /// Was die Karte zeigen soll, und was die Seite gerade zeigt
+    private var wanted: String?
+    private var shown: String?
+
+    private override init() {
         let config = WKWebViewConfiguration()
         config.dataDetectorTypes = []
         // Nichts bleibt liegen (keine Cookies, kein Cache)
         config.websiteDataStore = .nonPersistent()
-        let web = WKWebView(frame: .zero, configuration: config)
+        web = WKWebView(frame: .zero, configuration: config)
+        super.init()
         web.isOpaque = false
         web.backgroundColor = .clear
         web.scrollView.backgroundColor = .clear
-        web.navigationDelegate = context.coordinator
-        context.coordinator.pending = markdown
-        if let page = Bundle.main.url(forResource: "Antwort", withExtension: "html") {
-            context.coordinator.page = page
-            web.loadFileURL(page, allowingReadAccessTo: page)
-        }
-        return web
+        web.navigationDelegate = self
+        load()
     }
 
-    func updateUIView(_ web: WKWebView, context: Context) {
-        context.coordinator.show(markdown, in: web)
+    private func load() {
+        loaded = false
+        shown = nil
+        if let page { web.loadFileURL(page, allowingReadAccessTo: page) }
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
-        var page: URL?
-        var loaded = false
-        var pending: String?
-        private var shown: String?
+    func attach(to box: UIView) {
+        guard web.superview !== box else { return }
+        web.removeFromSuperview()
+        web.frame = box.bounds
+        web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        box.addSubview(web)
+    }
 
-        func show(_ markdown: String, in web: WKWebView) {
-            guard loaded else {
-                pending = markdown
-                return
-            }
-            guard markdown != shown else { return }
-            shown = markdown
-            web.callAsyncJavaScript("render(md)", arguments: ["md": markdown], in: nil, in: .page) { _ in }
-        }
+    func detach(from box: UIView) {
+        if web.superview === box { web.removeFromSuperview() }
+    }
 
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            loaded = true
-            if let pending {
-                self.pending = nil
-                show(pending, in: webView)
-            }
+    func show(_ markdown: String) {
+        wanted = markdown
+        guard loaded, markdown != shown else { return }
+        shown = markdown
+        web.callAsyncJavaScript("render(md)", arguments: ["md": markdown], in: nil, in: .page) { [weak self] result in
+            if case .failure = result, self?.shown == markdown { self?.shown = nil }
         }
+    }
 
-        /// Nur die eingebaute Seite; Links (sollte es keine geben) öffnen im Browser
-        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
-                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-            let url = navigationAction.request.url
-            if navigationAction.navigationType == .linkActivated {
-                if let url, ["http", "https"].contains(url.scheme?.lowercased() ?? "") { UIApplication.shared.open(url) }
-                decisionHandler(.cancel)
-                return
-            }
-            decisionHandler(url?.isFileURL == true && url?.path == page?.path ? .allow : .cancel)
+    /// Nach jedem Laden (auch dem Neuladen durch WebKit) die gewünschte Antwort zeigen
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        loaded = true
+        shown = nil
+        if let wanted { show(wanted) }
+    }
+
+    /// WebKits Prozess wurde beendet (etwa wegen Speicher im Hintergrund): neu laden, die Antwort kommt wieder
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        load()
+    }
+
+    /// Nur die eingebaute Seite; Links (sollte es keine geben) öffnen im Browser
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        let url = navigationAction.request.url
+        if navigationAction.navigationType == .linkActivated {
+            if let url, ["http", "https"].contains(url.scheme?.lowercased() ?? "") { UIApplication.shared.open(url) }
+            decisionHandler(.cancel)
+            return
         }
+        decisionHandler(url?.isFileURL == true && url?.path == page?.path ? .allow : .cancel)
     }
 }

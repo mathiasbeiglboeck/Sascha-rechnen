@@ -731,7 +731,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
                 let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
                 sheet.popoverPresentationController?.sourceView = self.view
                 sheet.popoverPresentationController?.sourceRect = CGRect(x: self.view.bounds.midX, y: 60, width: 1, height: 1)
-                self.present(sheet, animated: true)
+                self.presentOnTop(sheet)
             } catch {
                 self.onFlash("Teilen fehlgeschlagen: \(error.localizedDescription)")
             }
@@ -1306,6 +1306,13 @@ extension CanvasController {
         return short.isEmpty ? "Notizen" : short
     }
 
+    /// Über dem zeigen, was gerade offen ist (etwa der Karte mit der Antwort am iPhone): Sonst zeigt UIKit nichts
+    func presentOnTop(_ controller: UIViewController) {
+        var host: UIViewController = self
+        while let next = host.presentedViewController, !next.isBeingDismissed { host = next }
+        host.present(controller, animated: true)
+    }
+
     func share(_ kind: ShareKind, from sourceRect: CGRect) {
         saveNow()
         let i = currentPageIndex
@@ -1350,7 +1357,7 @@ extension CanvasController {
                 let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
                 sheet.popoverPresentationController?.sourceView = self.view
                 sheet.popoverPresentationController?.sourceRect = sourceRect
-                self.present(sheet, animated: true)
+                self.presentOnTop(sheet)
             } catch {
                 flash("Export fehlgeschlagen: \(error.localizedDescription)", 3)
             }
@@ -1963,6 +1970,9 @@ extension CanvasController: UIGestureRecognizerDelegate {
         canvas.endEditing(true)
     }
 
+    /// Die Seite für Antworten wird einmal je App-Start vorgeladen
+    private static var answerPageWarm = false
+
     /// Markierungen neu: nach Änderungen der Fragen, neuen Seiten, Drehen
     private func reloadAskMarks() {
         guard k > 0 else { return }
@@ -1970,10 +1980,16 @@ extension CanvasController: UIGestureRecognizerDelegate {
         askOverlay.set(list, frames: layout.frames, pagesVersion: currentPagesVersion)
         askOverlay.layout(scale: k * canvas.zoomScale)
         if canvas.subviews.last !== askOverlay { canvas.bringSubviewToFront(askOverlay) }
-        // Neue Antwort, während das Dokument offen ist
+        // Neue Antwort, während das Dokument offen ist. Gesammelt, nicht ersetzt: Eine Markierung, die mit ihrer Seite
+        // kurz verschwand (Seite gelöscht, dann Rückgängig), meldet sich danach nicht als neue Antwort
         let answered = Set(list.filter { $0.isAnswered && $0.isVisible }.map(\.id))
         if let known = knownAnswered, !answered.subtracting(known).isEmpty { onFlash("Claude hat geantwortet") }
-        knownAnswered = answered
+        knownAnswered = (knownAnswered ?? []).union(answered)
+        // Die Seite für die Antworten schon laden, damit die erste Karte gleich etwas zeigt
+        if !list.isEmpty, !Self.answerPageWarm {
+            Self.answerPageWarm = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { AnswerPage.prewarm() }
+        }
         // Die Frage der offenen Karte ist weg (gelöscht, auch auf einem anderen Gerät)
         if let card = answerCard, sync.asks.ask(doc.id, card.model.askID)?.isVisible != true {
             card.dismiss(animated: true)
@@ -2003,6 +2019,12 @@ extension CanvasController: UIGestureRecognizerDelegate {
         if let card = answerCard {
             card.model.askID = id
             askOverlay.highlight(id)
+            // Am iPad wandert die Karte zur neuen Markierung
+            if let pop = card.popoverPresentationController {
+                pop.sourceView = mark
+                pop.sourceRect = mark.bounds
+                pop.containerView?.setNeedsLayout()
+            }
             return
         }
         guard presentedViewController == nil else { return }
