@@ -1,5 +1,5 @@
 {
-  "aktuell": "todo",
+  "aktuell": "einkauf",
   "listen": [
     {
       "id": "todo",
@@ -19,18 +19,15 @@
     {
       "id": "einkauf",
       "titel": "Einkaufsliste",
-      "runde": "2026-10-29",
+      "runde": "2026-11-17",
       "eintraege": [
+        "Mehl",
+        "Nutella",
         "Milch für Mio",
         "Milch für Tilda",
-        "Nutella",
         {
           "text": "Gummis für Mio",
           "notiz": "für die Heimfahrt"
-        },
-        {
-          "text": "Mehl",
-          "notiz": "für Stockbrot und Palatschinken"
         },
         {
           "text": "Gurke",
