@@ -138,6 +138,26 @@ button { font: inherit; color: inherit; cursor: pointer; border: 0; background: 
 .nav button { flex: 1; }
 .tip { color: var(--muted); text-align: center; font-size: 15px; padding: 14px 6px; }
 
+/* Zuordnen */
+.zo-info { color: var(--muted); font-size: 14px; text-align: center; margin: 0 0 8px; line-height: 1.35; }
+.zo { display: flex; flex-direction: column; gap: 6px; padding-bottom: 90px; }
+.zo-row { display: flex; align-items: stretch; gap: 8px; }
+.zo-num { width: 54px; flex: none; display: grid; place-items: center; font-weight: 800; font-size: 19px; color: #3b2a0c; background: #f9dfae; border-radius: 12px; }
+.zo-slot { flex: 1; min-height: 44px; border-radius: 12px; border: 2px dashed transparent; }
+.zo-slot.over { border-color: var(--acc); background: #fff4d6; }
+.tile { height: 100%; min-height: 44px; display: flex; align-items: center; padding: 6px 12px; background: var(--card); border: 2px solid var(--line); border-radius: 12px;
+  font-size: 17px; font-weight: 650; touch-action: none; cursor: grab; box-shadow: 0 1px 2px rgba(0,0,0,.06); line-height: 1.15; }
+.tile::after { content: "⋮⋮"; margin-left: auto; padding-left: 8px; color: #c9bfa9; font-size: 14px; letter-spacing: -2px; }
+.tile.sel { border-color: var(--acc); background: #fff4d6; }
+.tile.ok { background: var(--okbg); border-color: var(--ok); color: #1e6b33; cursor: default; }
+.tile.ok::after { content: "✓"; color: var(--ok); letter-spacing: 0; font-size: 16px; }
+.tile.bad { background: var(--badbg); border-color: var(--bad); color: #9b2c22; }
+.tile.ghost { opacity: .25; }
+.tile.drag { position: fixed; z-index: 50; pointer-events: none; box-shadow: 0 8px 24px rgba(0,0,0,.22); border-color: var(--acc); transform: scale(1.03); }
+.zo-bar { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px max(14px, env(safe-area-inset-left)) calc(10px + env(safe-area-inset-bottom)); background: linear-gradient(rgba(246,241,230,0), var(--bg) 30%); }
+.zo-bar .go { max-width: 532px; margin: 0 auto; display: block; }
+.zo-done { margin: 4px 0 12px; }
+
 /* Ende */
 .end { text-align: center; }
 .end .big { font-size: 46px; margin: 6px 0 0; }
@@ -283,7 +303,7 @@ const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = Math.f
 const fmt = ms => { const s = ms / 1000, m = Math.floor(s / 60); return m + ":" + (s - m * 60).toFixed(1).padStart(4, "0"); };
 let cleanups = [];
 let onHome = false, updateReady = false;
-function clearScreen() { cleanups.forEach(f => { try { f(); } catch (e) {} }); cleanups = []; try { speechSynthesis.cancel(); } catch (e) {} }
+function clearScreen() { try { window.scrollTo(0, 0); } catch (e) {} cleanups.forEach(f => { try { f(); } catch (e) {} }); cleanups = []; try { speechSynthesis.cancel(); } catch (e) {} }
 const app = $("#app");
 
 // Richtung vom Stadtzentrum (Mittelpunkt des 1. Bezirks) aus
@@ -434,6 +454,9 @@ function home() {
       <button data-go="nz0">Name → Zahl<small>Welche Zahl?</small></button>
       <button data-go="mix0">Gemischt<small>Abwechselnd</small></button>
     </div>
+    <div class="menu" style="margin-top:8px">
+      <button data-go="zuordnen" class="wide"><span class="ic">🧩</span><div><b>Zuordnen</b><small>Namen zur richtigen Zahl schieben${S.best["z_" + set] ? " · Bestzeit " + fmt(S.best["z_" + set]) : ""}</small></div></button>
+    </div>
     <div class="foot">
       <button class="chip" id="ton">${S.ton ? "🔊 Vorlesen an" : "🔇 Vorlesen aus"}</button>
       <button class="link" id="reset">Sterne löschen</button>
@@ -445,7 +468,7 @@ function home() {
   app.querySelectorAll("[data-set]").forEach(b => b.onclick = () => { S.set = b.dataset.set; save(); home(); });
   app.querySelectorAll("[data-go]").forEach(b => b.onclick = () => {
     const g = b.dataset.go;
-    if (g === "lern") lern(); else if (g === "reihe") reihe(); else quiz(g);
+    if (g === "lern") lern(); else if (g === "reihe") reihe(); else if (g === "zuordnen") zuordnen(); else quiz(g);
   });
   $("#ton").onclick = () => { S.ton = !S.ton; save(); $("#ton").textContent = S.ton ? "🔊 Vorlesen an" : "🔇 Vorlesen aus"; if (S.ton) say("Vorlesen ist an"); };
   const r = $("#reset");
@@ -740,6 +763,159 @@ function quiz(kind) {
     $(".x").onclick = home; $("#fertig").onclick = home; $("#again").onclick = () => quiz(kind);
   }
   next();
+}
+
+// ---------- Zuordnen ----------
+// Links stehen die Zahlen, rechts die Namen in Kästchen. Kästchen ziehen (oder
+// zwei nacheinander antippen) tauscht sie. „Prüfen“ zeigt, was schon stimmt.
+function zuordnen() {
+  clearScreen();
+  onHome = false;
+  const set = S.set, ns = SETS[set].ns, key = "z_" + set;
+  const best = S.best[key];
+  // Namen so mischen, dass keiner schon richtig steht
+  let ord;
+  do { ord = shuffle(ns.slice()); } while (ord.some((n, i) => n === ns[i]));
+  const locked = new Set(), firstSeen = new Set();
+  let sel = null, checks = 0, t0 = performance.now(), timer = null, done = false;
+  app.innerHTML = `
+    <div class="top"><button class="x" aria-label="Zurück">✕</button><h2>Zuordnen</h2><div class="clock" id="clock">0:00.0</div></div>
+    <p class="zo-info">Schieb jeden Namen zu seiner Zahl. Oder tippe zwei Namen nacheinander an, dann tauschen sie.${ns.length > 9 ? "<br>Zum Scrollen links bei den Zahlen wischen." : ""}</p>
+    <div class="zo" id="zo"></div>
+    <div class="zo-bar"><button class="go" id="check">Prüfen ✓</button></div>`;
+  $(".x").onclick = home;
+  const clock = () => { if (!done) $("#clock").textContent = fmt(performance.now() - t0); };
+  timer = setInterval(clock, 100);
+  cleanups.push(() => clearInterval(timer));
+  const zo = $("#zo");
+  zo.innerHTML = ns.map((n, i) => `<div class="zo-row"><div class="zo-num">${n}.</div><div class="zo-slot" data-i="${i}"></div></div>`).join("");
+  const slots = [...zo.querySelectorAll(".zo-slot")];
+  function render() {
+    slots.forEach((sl, i) => {
+      const n = ord[i];
+      sl.innerHTML = `<div class="tile${locked.has(i) ? " ok" : ""}${sel === i ? " sel" : ""}" data-i="${i}">${B[n].name}</div>`;
+    });
+  }
+  render();
+  function swap(a, b) {
+    if (a === b || locked.has(a) || locked.has(b)) return;
+    [ord[a], ord[b]] = [ord[b], ord[a]];
+    tone("ok");
+    render();
+  }
+  // Ziehen mit Finger oder Maus
+  let drag = null;
+  const slotAt = y => {
+    const k = slots.findIndex(sl => { const r = sl.getBoundingClientRect(); return y >= r.top - 3 && y <= r.bottom + 3; });
+    if (k < 0 && y > slots[slots.length - 1].getBoundingClientRect().bottom) return slots.length - 1; // unter der letzten Zeile
+    return k;
+  };
+  zo.addEventListener("pointerdown", e => {
+    const t = e.target.closest(".tile");
+    if (!t || done) return;
+    const i = +t.dataset.i;
+    if (locked.has(i)) return;
+    const r = t.getBoundingClientRect();
+    drag = { i, t, x0: e.clientX, y0: e.clientY, dx: e.clientX - r.left, dy: e.clientY - r.top, w: r.width, h: r.height, moving: false, over: -1, y: e.clientY, id: e.pointerId };
+    try { t.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+  let scrollRaf = null;
+  function autoScroll() {
+    if (!drag || !drag.moving) { scrollRaf = null; return; }
+    const y = drag.y, H = window.innerHeight;
+    const v = y < 80 ? -Math.ceil((80 - y) / 6) : y > H - 110 ? Math.ceil((y - (H - 110)) / 6) : 0;
+    if (v) { window.scrollBy(0, v); moveOver(); }
+    scrollRaf = requestAnimationFrame(autoScroll);
+  }
+  function moveOver() {
+    const k = slotAt(drag.y);
+    if (k !== drag.over) {
+      if (drag.over >= 0) slots[drag.over].classList.remove("over");
+      drag.over = k;
+      if (k >= 0 && k !== drag.i && !locked.has(k)) slots[k].classList.add("over");
+    }
+  }
+  zo.addEventListener("pointermove", e => {
+    if (!drag || e.pointerId !== drag.id) return;
+    drag.y = e.clientY;
+    if (!drag.moving) {
+      if (Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < 6) return;
+      drag.moving = true;
+      drag.clone = drag.t.cloneNode(true); drag.clone.classList.add("drag"); drag.clone.classList.remove("sel");
+      drag.clone.style.width = drag.w + "px"; drag.clone.style.height = drag.h + "px";
+      document.body.appendChild(drag.clone);
+      drag.t.classList.add("ghost");
+      if (sel !== null) { sel = null; app.querySelectorAll(".tile.sel").forEach(x => x.classList.remove("sel")); }
+      scrollRaf = requestAnimationFrame(autoScroll);
+    }
+    drag.clone.style.left = (e.clientX - drag.dx) + "px";
+    drag.clone.style.top = (e.clientY - drag.dy) + "px";
+    moveOver();
+    e.preventDefault();
+  });
+  function endDrag(e, cancel) {
+    if (!drag || (e && e.pointerId !== drag.id)) return;
+    const d = drag; drag = null;
+    if (d.over >= 0) slots[d.over].classList.remove("over");
+    if (d.clone) d.clone.remove();
+    d.t.classList.remove("ghost");
+    if (cancel) return;
+    if (d.moving) {
+      if (d.over >= 0 && d.over !== d.i && !locked.has(d.over)) swap(d.i, d.over);
+      return;
+    }
+    // Antippen: erstes auswählen, zweites tauscht
+    if (sel === null) { sel = d.i; render(); }
+    else if (sel === d.i) { sel = null; render(); }
+    else { const a = sel; sel = null; swap(a, d.i); }
+  }
+  zo.addEventListener("pointerup", e => endDrag(e, false));
+  zo.addEventListener("pointercancel", e => endDrag(e, true));
+  cleanups.push(() => { if (drag && drag.clone) drag.clone.remove(); drag = null; });
+
+  $("#check").onclick = () => {
+    if (done) return;
+    checks++;
+    sel = null;
+    let wrong = 0;
+    ord.forEach((n, i) => {
+      const right = n === ns[i];
+      // Sterne: was beim ersten Prüfen schon stimmt, zählt als richtig (Fehler kosten hier nichts,
+      // weil man auch früh prüfen darf)
+      if (!firstSeen.has(ns[i])) { firstSeen.add(ns[i]); if (right) record(ns[i], true, false); }
+      if (right) locked.add(i); else wrong++;
+    });
+    render();
+    if (wrong) {
+      tone("bad");
+      slots.forEach((sl, i) => { if (!locked.has(i)) sl.firstChild.classList.add("bad"); });
+      setTimeout(() => slots.forEach(sl => sl.firstChild && sl.firstChild.classList.remove("bad")), 900);
+      $("#check").textContent = `Prüfen ✓  (noch ${wrong} falsch)`;
+      return;
+    }
+    // alles richtig
+    done = true; clearInterval(timer);
+    const ms = performance.now() - t0;
+    const rekord = !best || ms < best;
+    if (rekord) { S.best[key] = ms; save(); }
+    $("#clock").textContent = fmt(ms);
+    tone("win");
+    $(".zo-bar").remove();
+    const box = document.createElement("div");
+    box.className = "end zo-done";
+    box.innerHTML = `
+      <div class="big">${rekord ? "🏆" : "🎉"}</div>
+      <h2>${rekord && best ? "Neuer Rekord!" : "Alles richtig!"}</h2>
+      <p class="res">${fmt(ms)} · ${checks === 1 ? "gleich beim ersten Prüfen!" : checks + "-mal geprüft"}</p>
+      ${!rekord ? `<p>Bestzeit: ${fmt(best)}</p>` : ""}
+      <div class="panel" style="padding-top:12px">
+        <button class="go" id="again">Nochmal</button>
+        <button class="go sec" id="fertig">Fertig</button>
+      </div>`;
+    $(".zo-info").replaceWith(box);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    $("#again").onclick = zuordnen; $("#fertig").onclick = home;
+  };
 }
 
 // ---------- Der Reihe nach ----------
