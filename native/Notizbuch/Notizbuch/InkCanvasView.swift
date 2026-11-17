@@ -94,12 +94,14 @@ final class InkCanvasView: PKCanvasView {
             let base = result?.children ?? ((suggested as? [UIMenuElement]) ?? [])
             let removed = filtered(base)
             var kept = removed ?? base
-            // Menü einer Auswahl (nicht nur „Einsetzen“ auf einer leeren Stelle): vorn „Claude fragen“
+            // Menü einer Auswahl (nicht nur „Einsetzen“ auf einer leeren Stelle): vorn „Claude fragen“. Das gilt auch,
+            // wenn PencilKit kein eigenes Menü baut und UIKit seine Vorschläge zeigt
             var extra: [UIMenuElement] = []
-            // Nur in PencilKits eigenem Menü: UIKits Vorschläge (ohne Menü von PencilKit) sähen sonst wie eine Auswahl aus
-            if result != nil, let ink = canvas as? InkCanvasView, let make = ink.selectionMenuItems, isSelectionMenu(kept) {
-                let space = (interaction as? UIEditMenuInteraction)?.view ?? (me as? UIView)
-                let point = (configuration as? UIEditMenuConfiguration)?.sourcePoint ?? .zero
+            let space = (interaction as? UIEditMenuInteraction)?.view ?? (me as? UIView)
+            let point = (configuration as? UIEditMenuConfiguration)?.sourcePoint ?? .zero
+            // UIKit prüft seine Vorschläge an der Stelle des Menüs: ab der Ansicht dort (sie liegt in PencilKits Fläche)
+            let checked = space?.hitTest(point, with: nil) ?? space
+            if let ink = canvas as? InkCanvasView, let make = ink.selectionMenuItems, isSelectionMenu(kept, shownFrom: checked) {
                 extra = make(SelectionMenuContext(space: space, sourcePoint: point))
                 #if DEBUG
                 NSLog("InkCanvasView: Auswahl-Menü, Quelle %@ in %@", "\(point)", space.map { "\(type(of: $0))" } ?? "nil")
@@ -150,12 +152,22 @@ final class InkCanvasView: PKCanvasView {
         return canvas.tool is PKLassoTool && ((canvas as? InkCanvasView)?.editingAllowed ?? true)
     }
 
-    /// Menü einer Auswahl (Ausschneiden, Kopieren, Löschen, Duplizieren …) statt nur „Einsetzen“: zählt die Einträge
-    /// (ohne die ausgeblendeten) statt Titel zu vergleichen, gilt also in jeder Sprache
-    private static func isSelectionMenu(_ elements: [UIMenuElement]) -> Bool { leafCount(elements) >= 3 }
+    /// Menü einer Auswahl (Ausschneiden, Kopieren, Löschen, Duplizieren …) statt nur „Einsetzen“: zählt die Einträge,
+    /// die erscheinen (ohne die ausgeblendeten), statt Titel zu vergleichen, gilt also in jeder Sprache
+    private static func isSelectionMenu(_ elements: [UIMenuElement], shownFrom view: UIView?) -> Bool {
+        shownCount(elements, from: view) >= 3
+    }
 
-    private static func leafCount(_ elements: [UIMenuElement]) -> Int {
-        elements.reduce(0) { n, element in n + ((element as? UIMenu).map { leafCount($0.children) } ?? 1) }
+    /// PencilKits eigene Einträge (UIActions) erscheinen immer. Befehle (UICommand, etwa UIKits Vorschläge, wenn
+    /// PencilKit kein Menü baut) zeigt UIKit nur, wenn die Fläche oder jemand über ihr sie gerade ausführen kann;
+    /// Ausschneiden und Kopieren also nur mit einer Auswahl. Ohne diese Prüfung sähe jeder lange Finger auf einer
+    /// leeren Stelle wie eine Auswahl aus
+    private static func shownCount(_ elements: [UIMenuElement], from view: UIView?) -> Int {
+        elements.reduce(0) { n, element in
+            if let menu = element as? UIMenu { return n + shownCount(menu.children, from: view) }
+            guard let command = element as? UICommand else { return n + 1 }
+            return n + (view?.target(forAction: command.action, withSender: command) != nil ? 1 : 0)
+        }
     }
 
     /// Die Einträge ohne „Alles auswählen“ und „Leerzeile (oben) einfügen“, auch in Untermenüs; leer gewordene
