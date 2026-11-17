@@ -358,6 +358,21 @@ struct SyncSettingsView: View {
     @State private var result: String?
     @State private var testing = false
 
+    /// Versionsnummer dieser App-Datei. build-ipa.sh setzt sie (Zahl der Commits, „+“ bei ungespeicherten Änderungen)
+    /// und trägt Commit und Zeit ein; Bauten direkt aus Xcode heißen „1.0“ und haben keinen Commit
+    private static let versionNumber: String = {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let number = info["CFBundleShortVersionString"] as? String ?? "?"
+        return (info["BNCommit"] as? String)?.hasSuffix("+") == true ? number + "+" : number
+    }()
+
+    private static let versionNote: String = {
+        let info = Bundle.main.infoDictionary ?? [:]
+        guard let commit = info["BNCommit"] as? String, !commit.isEmpty else { return "Direkt aus Xcode gebaut." }
+        let date = (info["BNDate"] as? String).map { "vom \($0) " } ?? ""
+        return "Stand \(date)(\(commit)). Dieselbe Nummer steht im Namen der App-Datei."
+    }()
+
     var body: some View {
         NavigationStack {
             Form {
@@ -390,6 +405,11 @@ struct SyncSettingsView: View {
                     }
                     .disabled(!sync.isConfigured || testing)
                     if let result { Text(result).foregroundStyle(.secondary) }
+                }
+                Section {
+                    LabeledContent("Version", value: Self.versionNumber)
+                } footer: {
+                    Text(Self.versionNote)
                 }
             }
             .navigationTitle("Sync")

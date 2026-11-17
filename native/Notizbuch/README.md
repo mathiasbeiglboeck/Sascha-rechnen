@@ -11,7 +11,11 @@ Handschriftliche Notizen auf dünn grau kariertem A4 und Notizen auf PDFs, mit P
 Sync zwischen iPad und iPhone und der Briefkasten für KI-Agenten laufen über den Server in `server/` (Einrichtung dort im README, Nutzung in `BRIEFKASTEN.md`).
 
 ## Bauen und installieren (AltStore)
-1. `./build-ipa.sh` baut `build/Notizbuch.ipa` ohne Signatur.
+1. `./build-ipa.sh` baut `build/Notizbuch-<Nummer>.ipa` ohne Signatur. Die Versionsnummer ist die Zahl der Commits
+   bis zu diesem Stand, steigt also mit jedem neuen Stand; „+“ heißt: mit ungespeicherten Änderungen an den Quellen.
 2. Die .ipa mit AltServer („Sideload .ipa“) aufs iPad bzw. iPhone spielen.
+3. Welche App drauf ist, steht unten in den Sync-Einstellungen (Zahnrad in der Übersicht): dieselbe Nummer, dazu
+   Zeit und Kennung des Commits (bei „+“ die Zeit des Bauens). AltStore und die iPad-Einstellungen zeigen dieselbe
+   Nummer als Version.
 
 Alternativ `Notizbuch.xcodeproj` in Xcode öffnen und direkt aufs angeschlossene Gerät spielen.
