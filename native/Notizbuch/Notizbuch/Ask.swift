@@ -266,8 +266,10 @@ final class AskStore: ObservableObject {
     /// Seitenänderung, damit eben anderswo gestellte Fragen mitrücken)
     func waitIdle(_ doc: UUID, upTo seconds: Double) async {
         let end = Date().addingTimeInterval(seconds)
+        // In kleinen Schritten: Meist ist der Abgleich fast gleichzeitig mit dem der Striche fertig, und die
+        // Seitenänderung soll danach nicht noch auf einen ganzen Schritt warten
         while running.contains(doc), Date() < end {
-            try? await Task.sleep(for: .milliseconds(50))
+            try? await Task.sleep(for: .milliseconds(5))
         }
     }
 
