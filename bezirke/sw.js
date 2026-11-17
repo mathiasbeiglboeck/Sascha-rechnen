@@ -1,5 +1,5 @@
 // Offline: App-Dateien vorab speichern. Der Lernstand liegt im Handy (localStorage).
-const CACHE = "bezirke-v4";
+const CACHE = "bezirke-v5";
 const IMGS = Array.from({ length: 23 }, (_, i) => `img/${i + 1}.jpg`);
 const FILES = ["./", "index.html", "manifest.webmanifest", "icon-180.png", "icon-192.png", "icon-512.png", ...IMGS];
 self.addEventListener("install", e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
