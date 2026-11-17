@@ -1,5 +1,5 @@
 // Offline: App-Dateien vorab speichern. Der Lernstand liegt im Handy (localStorage).
-const CACHE = "bezirke-v3";
+const CACHE = "bezirke-v4";
 const IMGS = Array.from({ length: 23 }, (_, i) => `img/${i + 1}.jpg`);
 const FILES = ["./", "index.html", "manifest.webmanifest", "icon-180.png", "icon-192.png", "icon-512.png", ...IMGS];
 self.addEventListener("install", e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
@@ -12,6 +12,7 @@ self.addEventListener("fetch", e => {
   const url = new URL(e.request.url);
   if (url.origin !== location.origin) return;
   // Netz zuerst, damit Updates ankommen; offline aus dem Speicher
-  e.respondWith(fetch(e.request).then(r => { const c = r.clone(); caches.open(CACHE).then(x => x.put(e.request, c)); return r; })
+  // no-cache: immer beim Server nachfragen, ob es eine neuere Datei gibt
+  e.respondWith(fetch(e.request, { cache: "no-cache" }).then(r => { const c = r.clone(); caches.open(CACHE).then(x => x.put(e.request, c)); return r; })
     .catch(() => caches.match(e.request, { ignoreSearch: true }).then(r => r || caches.match("index.html"))));
 });

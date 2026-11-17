@@ -273,6 +273,7 @@ const $ = (s, el = document) => el.querySelector(s);
 const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 const fmt = ms => { const s = ms / 1000, m = Math.floor(s / 60); return m + ":" + (s - m * 60).toFixed(1).padStart(4, "0"); };
 let cleanups = [];
+let onHome = false, updateReady = false;
 function clearScreen() { cleanups.forEach(f => { try { f(); } catch (e) {} }); cleanups = []; try { speechSynthesis.cancel(); } catch (e) {} }
 const app = $("#app");
 
@@ -395,7 +396,9 @@ class Karte {
 
 // ---------- Startseite ----------
 function home() {
+  if (updateReady) { location.reload(); return; }
   clearScreen();
+  onHome = true;
   const set = S.set, ns = SETS[set].ns;
   const stars = ns.reduce((a, n) => a + lv(n), 0), max = ns.length * 3;
   const best = S.best[set];
@@ -440,6 +443,7 @@ function home() {
 // ---------- Anschauen ----------
 function lern(start) {
   clearScreen();
+  onHome = false;
   const set = S.set, ns = SETS[set].ns;
   app.innerHTML = `
     <div class="top"><button class="x" aria-label="Zurück">✕</button><h2>Anschauen</h2></div>
@@ -501,6 +505,7 @@ function record(n, firstTry, hinted) {
 
 function quiz(kind) {
   clearScreen();
+  onHome = false;
   const set = S.set, ns = SETS[set].ns;
   const queue = makeRound(set, kind);
   const before = ns.reduce((a, n) => a + lv(n), 0);
@@ -530,7 +535,8 @@ function quiz(kind) {
     // Fehler kommen in derselben Runde nochmal dran
     if (!first && extra < 3) {
       const at = Math.min(queue.length, i + 3);
-      queue.splice(at, 0, { n, dir: queue[i].dir === "zn" ? "nk" : "zn" });
+      // gleiche Richtung wie gewählt; nur bei „Gemischt“ andersherum
+      queue.splice(at, 0, { n, dir: kind === "mix" ? (queue[i].dir === "zn" ? "nk" : "zn") : queue[i].dir });
       extra++;
     }
     dots();
@@ -668,6 +674,7 @@ function quiz(kind) {
 // ---------- Der Reihe nach ----------
 function reihe() {
   clearScreen();
+  onHome = false;
   const set = S.set, ns = SETS[set].ns;
   const best = S.best[set];
   app.innerHTML = `
@@ -728,7 +735,20 @@ function reihe() {
 }
 
 home();
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+// Neue Version: beim Zurückkommen in die App nachsehen und neu laden,
+// sobald man auf der Startseite ist (nie mitten in einer Runde).
+if ("serviceWorker" in navigator) {
+  const hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!hadController) return;
+    updateReady = true;
+    if (onHome) location.reload();
+  });
+  const check = () => navigator.serviceWorker.getRegistration().then(r => r && r.update()).catch(() => {});
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") check(); });
+  window.addEventListener("pageshow", check);
+}
 </script>
 </body>
 </html>
