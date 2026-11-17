@@ -207,14 +207,14 @@ const B = [null,
  { name: "Brigittenau", f: "Er liegt mit dem 2. Bezirk zusammen auf einer Insel zwischen Donau und Donaukanal.",
    m: "Der 20., die Brigittenau, und der 2. teilen sich eine Insel zwischen Donau und Donaukanal.",
    s: "Mitten in der Aulandschaft an der Donau entstand im 17. Jahrhundert eine Kapelle für die heilige Brigitta von Schweden. Die Brigittakapelle gab der umliegenden Au ihren Namen und so schließlich auch dem 20. Bezirk.", q: "Bezirksmuseum Brigittenau · Wien-Brigittenau" },
- { name: "Floridsdorf", f: "Er liegt ganz im Norden, auf der anderen Seite der Donau.",
-   m: "Der 21., Floridsdorf, ist ganz oben im Norden, gleich über der Donau.",
+ { name: "Floridsdorf", f: "Er liegt ganz im Norden (oben), auf der anderen Seite der Donau.",
+   m: "Der 21., Floridsdorf, ist ganz im Norden (oben), gleich über der Donau.",
    s: "1786 stellte das Stift Klosterneuburg Siedlern Baugrund zur Verfügung. Die neue Siedlung hieß nach dem damaligen Propst Floridus Leeb zunächst „Floridusdorf“. Daraus wurde „Floridsdorf“.", q: "Stift Klosterneuburg · Ein florierendes Dorf" },
  { name: "Donaustadt", f: "Das ist der größte Bezirk, auf der anderen Seite der Donau, mit der UNO-City.",
    m: "Der 22., die Donaustadt, ist der größte Bezirk. Der Fluss steckt schon im Namen.",
    s: "„Donaustadt“ hieß zunächst ein neues Viertel am regulierten Donauufer in der Leopoldstadt. Seit 1954 trägt der 22. Bezirk auf der anderen Seite des Stroms diesen Namen.", q: "Volkskundemuseum · Lebensbezirk Donaustadt, S. 149–150" },
- { name: "Liesing", f: "Das ist der allerletzte Bezirk, ganz im Süden. Ein Waldbach gab ihm den Namen.",
-   m: "Der 23., Liesing, ist der letzte, ganz unten im Süden am Liesingbach.",
+ { name: "Liesing", f: "Das ist der allerletzte Bezirk, ganz im Südwesten (links unten). Ein Waldbach gab ihm den Namen.",
+   m: "Der 23., Liesing, ist der letzte, ganz im Südwesten (links unten) am Liesingbach.",
    s: "Der Bezirk hat seinen Namen vom Liesingbach, der im Wienerwald entspringt. Der Bachname geht auf die slawischen Formen „Lesnica“ oder „Lesnička“ zurück und bedeutet „Waldbach“.", q: "Stadt Wien · Erlebnis Liesingbach" }
 ];
 const ORD = ["", "erste", "zweite", "dritte", "vierte", "fünfte", "sechste", "siebte", "achte", "neunte", "zehnte", "elfte", "zwölfte",
@@ -285,8 +285,9 @@ function richtung(n) {
   const i = Math.round(a / 45) % 8;
   const adj = ["östlich", "nordöstlich", "nördlich", "nordwestlich", "westlich", "südwestlich", "südlich", "südöstlich"][i];
   const sub = ["Osten", "Nordosten", "Norden", "Nordwesten", "Westen", "Südwesten", "Süden", "Südosten"][i];
-  if (n <= 9) return `Er liegt nah an der Mitte, ${adj} vom 1. Bezirk.`;
-  return `Er liegt im ${sub} von Wien.`;
+  const einfach = ["rechts", "rechts oben", "oben", "links oben", "links", "links unten", "unten", "rechts unten"][i];
+  if (Math.hypot(dx, dy) < 125) return `Er liegt nah an der Mitte, ${adj} (${einfach}) vom 1. Bezirk.`;
+  return `Er liegt im ${sub} (${einfach}) von Wien.`;
 }
 
 // ---------- Die Karte ----------
