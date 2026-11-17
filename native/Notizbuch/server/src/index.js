@@ -675,8 +675,8 @@ export class Store extends DurableObject {
   }
 
   /// Der Helfer meldet sich zurück, mit dem claim seines Auftrags. JSON {claim, markdown}: beantwortet;
-  /// {claim, error}: gescheitert (die App zeigt den Text); {claim, release: true, note?, retryAfter?}: zurück in die
-  /// Warteschlange, frühestens nach retryAfter Sekunden (etwa am Nutzungslimit; die App zeigt note). Statt JSON geht
+  /// {claim, error}: gescheitert (die App zeigt den Text); {claim, release: true, note?, retryAfter?, count?}: zurück
+  /// in die Warteschlange, frühestens nach retryAfter Sekunden (etwa am Nutzungslimit; die App zeigt note). Statt JSON geht
   /// auch text/markdown mit ?claim=…. Wiederholt er eine Antwort (Antwort verloren), ändert sich nichts
   async answerAsk(askId, request, url) {
     const raw = (request.headers.get("content-type") || "").startsWith("text/markdown");
@@ -691,12 +691,19 @@ export class Store extends DurableObject {
     if (row.status === "answered" || row.status === "failed") return json({ ok: true, v: row.v });
     if (body.release) {
       const now = Date.now() / 1000;
+      const retryAfter = Math.min(Math.max(Number(body.retryAfter) || 0, 0), 86400);
+      // Gibt ein Helfer dieselbe Frage immer wieder gleich zurück (etwa nach einem Fehler am Mac), zählt das wie eine
+      // abgelaufene Frist: Nach MAX_ASK_RETRIES gibt der Server auf, statt sie endlos kreisen zu lassen (jede Runde
+      // schreibt Zeilen). Nicht bei langen Pausen und nicht bei count: false (der Helfer sagt, es liegt nicht an
+      // dieser Frage: abgemeldet, Nutzungslimit, Neustart, oder er zählt selbst)
+      const retries = row.retries + (body.count !== false && retryAfter < 600 ? 1 : 0);
       let v;
       this.ctx.storage.transactionSync(() => {
         v = this.nextAsksV();
         this.sql.exec(
-          "UPDATE asks SET status = 'open', claim = NULL, lease = ?, note = ?, updated = ?, v = ? WHERE id = ?",
-          now + Math.min(Math.max(Number(body.retryAfter) || 0, 0), 86400),
+          "UPDATE asks SET status = 'open', claim = NULL, lease = ?, retries = ?, note = ?, updated = ?, v = ? " +
+            "WHERE id = ?",
+          now + retryAfter, retries,
           typeof body.note === "string" && body.note ? body.note.slice(0, 300) : null, now, v, askId,
         );
       });

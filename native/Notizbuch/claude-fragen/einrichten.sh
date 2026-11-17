@@ -40,6 +40,19 @@ mkdir -p "$DEST"
 chmod 700 "$DEST"
 cp "$HERE/helfer.mjs" "$DEST/helfer.mjs"
 
+# macOS schützt Dokumente, Schreibtisch und Downloads: Ein Dienst im Hintergrund (launchd) darf dort ohne eigene
+# Freigabe nichts starten. Liegt node dort (etwa in Sascha/.notizbuch-tools), läuft der Helfer mit einer Kopie neben
+# sich; erst unter neuem Namen, dann umbenannt, damit ein laufender Helfer seine Datei behält
+RUN_NODE=$NODE
+case $NODE in
+  "$HOME"/Documents/*|"$HOME"/Desktop/*|"$HOME"/Downloads/*|"$HOME"/Library/Mobile\ Documents/*)
+    cp -f "$NODE" "$DEST/node.neu"
+    chmod 755 "$DEST/node.neu"
+    mv -f "$DEST/node.neu" "$DEST/node"
+    RUN_NODE="$DEST/node"
+    ;;
+esac
+
 if [[ ! -f "$DEST/config.json" ]]; then
   # URL und Schlüssel aus der Zugangsdatei, ohne sie auszugeben. Gelingt das nicht, fragt das Skript danach.
   umask 077
@@ -80,7 +93,7 @@ chmod 600 "$DEST/config.json"
 
 # launchd: beim Anmelden starten, nach einem Absturz neu starten
 mkdir -p "$HOME/Library/LaunchAgents"
-SEARCH="${NODE:h}:${CLAUDE:+${CLAUDE:h}:}$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+SEARCH="${RUN_NODE:h}:${CLAUDE:+${CLAUDE:h}:}$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -89,7 +102,7 @@ cat > "$PLIST" <<PLIST
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$NODE</string>
+    <string>$RUN_NODE</string>
     <string>$DEST/helfer.mjs</string>
   </array>
   <key>WorkingDirectory</key><string>$DEST</string>
@@ -111,10 +124,32 @@ PLIST
 
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 sleep 1
-launchctl bootstrap "gui/$UID" "$PLIST"
+START=$(date -u +%Y-%m-%dT%H:%M:%S)
+# Gleich nach dem Anhalten klappt das Starten manchmal erst beim zweiten Mal
+if ! launchctl bootstrap "gui/$UID" "$PLIST" 2>/dev/null; then
+  sleep 2
+  launchctl bootstrap "gui/$UID" "$PLIST"
+fi
+# Läuft er wirklich? Auf seine Zeile „gestartet“ warten, höchstens 15 Sekunden
+STARTED=""
+for i in {1..15}; do
+  sleep 1
+  if [[ -f "$DEST/helfer.log" ]] &&
+      tail -n 50 "$DEST/helfer.log" | awk -v s="$START" '$1 >= s && / gestartet /' | grep -q .; then
+    STARTED=1
+    break
+  fi
+done
+if [[ -z $STARTED ]]; then
+  echo "Der Helfer ist nicht angelaufen. Was macOS dazu meldet:"
+  launchctl print "gui/$UID/$LABEL" 2>&1 | grep -E 'state =|last exit|program =' || true
+  tail -n 5 "$DEST/launchd.log" 2>/dev/null || true
+  echo "Bitte diese Ausgabe an Claude schicken."
+  exit 1
+fi
+sleep 2
 echo "Helfer läuft. Letzte Zeilen aus seinem Protokoll:"
-sleep 4
-tail -n 5 "$DEST/helfer.log" 2>/dev/null || echo "(noch nichts)"
+tail -n 5 "$DEST/helfer.log"
 echo
 echo "Protokoll: $DEST/helfer.log"
 echo "Chats ansehen und weiterschreiben: zsh ${HERE}/chat.sh"

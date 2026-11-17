@@ -145,6 +145,9 @@ let socket = null;
 let socketAlive = 0; // Zeit des letzten Lebenszeichens (oder des Verbindungsversuchs)
 let reconnectDelay = 5;
 let pausedUntil = 0; // Nutzungslimit von Claude, abgemeldet: bis dahin nichts übernehmen
+let localPause = 0; // Sekunden der letzten Pause wegen eines Fehlers am Mac selbst (wächst bei jedem weiteren Mal)
+// Fehler des Macs selbst (etwa die Festplatte voll), nicht der Frage: Dann hilft keine andere Frage weiter
+const LOCAL_ERRORS = new Set(["ENOSPC", "EDQUOT", "EROFS", "EACCES", "EPERM", "ENOTDIR", "EISDIR", "EIO", "EMFILE", "ENFILE"]);
 let readyWatch = null;
 let oldServer = false;
 
@@ -234,7 +237,7 @@ function pollBy(at) {
 
 let running = false;
 let again = false;
-let current = null; // { id, child, cancelled }
+let current = null; // { id, claim, child, cancelled }
 
 function wake(why) {
   if (running) {
@@ -354,7 +357,7 @@ async function answer(ask) {
   const renew = setInterval(() => {
     api("POST", `/api/asks/${ask.id}/claim`, { json: { lease, claim: job.claim } }).catch(() => {});
   }, 300000);
-  current = { id: ask.id, child: null, cancelled: false };
+  current = { id: ask.id, claim: job.claim, child: null, cancelled: false };
   try {
     const dir = path.join(CHATS, job.doc.id);
     const files = await fetchFiles(job, dir);
@@ -362,6 +365,7 @@ async function answer(ask) {
     const result = await askClaude(job, dir, files, level);
     if (current.cancelled) return;
     if (result.ok) {
+      localPause = 0;
       await reply(ask.id, { claim: job.claim, markdown: result.text });
       log(ask.id, `beantwortet nach ${Math.round((Date.now() - t0) / 1000)} s (${result.text.length} Zeichen)` +
         (result.denied?.length ? `, abgelehnt: ${result.denied.join(", ")}` : ""));
@@ -370,7 +374,7 @@ async function answer(ask) {
       // 30 Minuten), Hinweis in der App und am Mac. Die Frage selbst wartet nicht am Server: Dieser Helfer nimmt sie
       // gleich nach dem Anmelden, ein neu gestarteter sofort
       pauseUntilReady(result.auth ? "auth" : "setup");
-      await reply(ask.id, { claim: job.claim, release: true, retryAfter: 0, note: result.error });
+      await reply(ask.id, { claim: job.claim, release: true, retryAfter: 0, count: false, note: result.error });
       log(ask.id, result.auth ? `Claude am Mac ist abgemeldet, Pause bis zur Anmeldung (${result.detail})`
         : "Claude Code fehlt, Pause bis es da ist");
       notifyMac(result.auth
@@ -380,7 +384,7 @@ async function answer(ask) {
       pausedUntil = result.retryAt;
       const at = new Date(result.retryAt).toLocaleTimeString("de-AT", { hour: "2-digit", minute: "2-digit" });
       await reply(ask.id, {
-        claim: job.claim, release: true, retryAfter: Math.ceil((result.retryAt - Date.now()) / 1000),
+        claim: job.claim, release: true, retryAfter: Math.ceil((result.retryAt - Date.now()) / 1000), count: false,
         note: `Claude-Limit erreicht, neuer Versuch um ${at}`,
       });
       log(ask.id, `Nutzungslimit, zurückgestellt bis ${at}`);
@@ -388,10 +392,12 @@ async function answer(ask) {
       const tries = (state.failures?.[ask.id] || 0) + 1;
       state.failures = { ...(state.failures || {}), [ask.id]: tries };
       saveState(state);
-      // Vorübergehend (etwa erneuert gerade ein anderes Claude Code die Anmeldung): öfter versuchen
+      // Vorübergehend (etwa erneuert gerade ein anderes Claude Code die Anmeldung): öfter versuchen. Hier zählt der
+      // Helfer selbst (count: false, sonst gäbe der Server schon nach dem dritten Mal auf)
       if (tries < (result.transient ? 5 : 2) && !result.timeout && !result.final) {
         await reply(ask.id, {
-          claim: job.claim, release: true, retryAfter: config.retrySeconds, note: "Fehler am Mac, neuer Versuch",
+          claim: job.claim, release: true, retryAfter: config.retrySeconds, count: false,
+          note: "Fehler am Mac, neuer Versuch",
         });
         log(ask.id, `Fehler, neuer Versuch in ${config.retrySeconds} s:`, result.error);
       } else {
@@ -402,9 +408,33 @@ async function answer(ask) {
   } catch (e) {
     if (current.cancelled) return;
     log(ask.id, "Fehler:", e.message);
-    // Zurück in die Warteschlange; die Frist des Servers fängt den Rest ab
-    await reply(ask.id, { claim: job.claim, release: true, retryAfter: 120, note: "Fehler am Mac, neuer Versuch" })
-      .catch(() => {});
+    if (LOCAL_ERRORS.has(e.code)) {
+      // Am Mac selbst klemmt es (etwa die Festplatte voll): Das liegt nicht an dieser Frage. Eine Weile nichts
+      // übernehmen (beim nächsten Mal doppelt so lang, höchstens 6 Stunden), statt eine Frage nach der anderen zu holen
+      // und gleich zurückzugeben; jede Runde schreibt am Server Zeilen und zählt gegen sein Tageslimit
+      localPause = Math.min(localPause ? localPause * 2 : 600, 6 * 3600);
+      pausedUntil = Date.now() + localPause * 1000;
+      await reply(ask.id, {
+        claim: job.claim, release: true, retryAfter: localPause, count: false, note: "Fehler am Mac, neuer Versuch später",
+      }).catch(() => {});
+      log(`Pause ${Math.round(localPause / 60)} Minuten wegen eines Fehlers am Mac (${e.code})`);
+      notifyMac(`Der Helfer für „Claude fragen“ macht eine Pause: ${e.message.slice(0, 120)}`);
+    } else {
+      // Sonst (etwa das Dokument lässt sich nicht laden): mit wachsendem Abstand noch zweimal, dann aufgeben. Der
+      // Server zählt diese kurzen Rückgaben mit, als Sicherung
+      const tries = (state.failures?.[ask.id] || 0) + 1;
+      state.failures = { ...(state.failures || {}), [ask.id]: tries };
+      try { saveState(state); } catch {}
+      if (tries < 3) {
+        await reply(ask.id, {
+          claim: job.claim, release: true, retryAfter: config.retrySeconds * 2 ** (tries - 1),
+          note: "Fehler am Mac, neuer Versuch",
+        }).catch(() => {});
+      } else {
+        await reply(ask.id, { claim: job.claim, error: `Gescheitert: ${e.message.slice(0, 300)}` }).catch(() => {});
+        log(ask.id, "gescheitert:", e.message);
+      }
+    }
   } finally {
     clearInterval(renew);
     current = null;
@@ -729,9 +759,23 @@ process.on("unhandledRejection", (e) => {
   log("Absturz:", e?.message || String(e));
   process.exit(1);
 });
-process.on("SIGTERM", () => {
-  if (current?.child) stop(current.child);
+process.on("SIGTERM", async () => {
+  // Beim Neustart (Einrichten, Abmelden, Neustart des Macs): die laufende Frage gleich wieder freigeben, sonst wartet
+  // sie bis zum Ende ihrer Frist (20 bis 50 Minuten). Höchstens 3 Sekunden, launchd wartet 20
+  const c = current;
+  if (c) {
+    c.cancelled = true;
+    stop(c.child);
+  }
   log("beendet");
+  if (c?.claim) {
+    await Promise.race([
+      api("PUT", `/api/asks/${c.id}/answer`, {
+        json: { claim: c.claim, release: true, retryAfter: 0, count: false, note: "Helfer neu gestartet" }, timeout: 3000,
+      }).catch(() => {}),
+      new Promise((r) => setTimeout(r, 3000)),
+    ]);
+  }
   process.exit(0);
 });
 

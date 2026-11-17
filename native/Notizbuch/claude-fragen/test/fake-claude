@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Ersatz für claude in Tests des Helfers: schreibt jeden Aufruf nach $FAKE_STATE/calls.jsonl und antwortet je nach
 // $FAKE_STATE/mode.json ({"mode": "ok" | "rich" | "denied" | "limit" | "limit-old" | "error" | "auth" | "authexpired" |
-// "refreshlock" | "maxturns", "delayMs": …}). "rich" antwortet mit Formeln, Liste, Code und Quellen (Links), zum
+// "refreshlock" | "maxturns" | "huge", "delayMs": …}). "rich" antwortet mit Formeln, Liste, Code und Quellen (Links), zum
 // Ansehen der Karte in der App; "denied" antwortet, meldet aber abgelehnte Werkzeuge. `claude auth status` sagt angemeldet (Exit 0), wenn $FAKE_STATE/auth.json {"loggedIn": true} enthält
 const fs = require("fs"), path = require("path");
 const DIR = process.env.FAKE_STATE || path.join(require("os").tmpdir(), "betternotes-fake");
@@ -102,7 +102,9 @@ const finish = () => {
     "",
     "Quellen: [Produktregel (Wikipedia)](https://de.wikipedia.org/wiki/Produktregel) und https://de.wikipedia.org/wiki/Differentialrechnung",
   ].join("\n");
-  out({ type: "result", subtype: "success", is_error: false, result: mode.mode === "rich" ? rich : `Antwort (${get("--effort")}) auf ${files.join(", ")}: $x^2$`, session_id: session });
-  process.exit(0);
+  // "huge": eine Antwort über der Grenze des Servers (200 000 Zeichen), die er mit 413 ablehnt
+  const text = mode.mode === "rich" ? rich : mode.mode === "huge" ? "x".repeat(210000) : `Antwort (${get("--effort")}) auf ${files.join(", ")}: $x^2$`;
+  // Erst beenden, wenn alles geschrieben ist: Eine lange Antwort passt nicht auf einmal in die Pipe
+  process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: text, session_id: session }) + "\n", () => process.exit(0));
 };
 setTimeout(finish, mode.delayMs || 200);

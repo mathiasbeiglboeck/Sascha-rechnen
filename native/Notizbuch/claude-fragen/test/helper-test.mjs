@@ -364,6 +364,49 @@ async function main() {
   const back = await waitFor(async () => (await askOf(doc, a.id)).status === "answered" && (await askOf(doc, b2.id)).status === "answered", 20000, 300);
   ok(back && /wieder angemeldet/.test(logText()) && Date.now() - tLogin < 8000, `after logging in both are answered within seconds (${((Date.now() - tLogin) / 1000).toFixed(1)} s, retrySeconds 60)`);
 
+  console.log("== error on the Mac itself (folder not writable): pause, no cycling through the questions");
+  await restartWith(() => writeConfig());
+  setMode({ mode: "ok" });
+  const broken = uuid(), nowB = Date.now() / 1000;
+  await api("PUT", `/api/library/${broken}`, { json: { id: broken, title: "Kaputt", kind: "notebook", created: nowB, modified: nowB, pageCount: 1 } });
+  fs.mkdirSync(path.join(HOME, "chats"), { recursive: true });
+  fs.writeFileSync(path.join(HOME, "chats", broken), "kein Ordner");
+  const notifyBefore = calls().filter((x) => x.notify).length;
+  const lf = await createAsk(broken, "quick", 0);
+  const lfOpen = await waitFor(async () => { const x = await askOf(broken, lf.id); return x.status === "open" && x.note ? x : null; }, 15000, 200);
+  ok(lfOpen && /später/.test(lfOpen.note), "question handed back with a note", lfOpen);
+  ok(/Pause 10 Minuten wegen eines Fehlers am Mac \(ENOTDIR\)/.test(logText()), "helper pauses and logs why");
+  await sleep(300);
+  ok(calls().filter((x) => x.notify).length === notifyBefore + 1, "one notification on the Mac");
+  const waiting = await createAsk(doc, "quick", 1);
+  await sleep(4000);
+  ok((await askOf(doc, waiting.id)).status === "open" && (await askOf(broken, lf.id)).status === "open", "during the pause nothing else is taken, and the question is not given up");
+  fs.rmSync(path.join(HOME, "chats", broken));
+  await restartWith(() => writeConfig());
+  ok(await waitFor(async () => (await askOf(doc, waiting.id)).status === "answered", 15000, 200), "after a restart the waiting question is answered");
+  await api("DELETE", `/api/doc/${broken}/asks/${lf.id}`);
+
+  console.log("== other errors (answer too long for the server): two more tries with growing gaps, then failed");
+  setMode({ mode: "huge" });
+  const hg = await createAsk(doc, "quick", 1);
+  const hgDone = await waitFor(async () => { const x = await askOf(doc, hg.id); return x.status === "failed" ? x : null; }, 40000, 300);
+  ok(hgDone && /^Gescheitert: /.test(hgDone.note), "failed after the third try, with the reason", hgDone);
+  const hgRuns = calls().filter((x) => x.args && x.mode === "huge").length;
+  ok(hgRuns === 3, `Claude ran 3 times for it, not endlessly (${hgRuns})`);
+
+  console.log("== restart while Claude works: the question is handed back at once");
+  setMode({ mode: "ok", delayMs: 8000 });
+  const rs = await createAsk(doc, "quick", 1);
+  ok(await waitFor(async () => (await askOf(doc, rs.id)).status === "claimed", 10000, 100), "claimed");
+  helper.kill("SIGTERM");
+  const rsBack = await waitFor(async () => { const x = await askOf(doc, rs.id); return x.status === "open" ? x : null; }, 5000, 100);
+  ok(rsBack && /neu gestartet/.test(rsBack.note || ""), "handed back right away with a note", rsBack);
+  setMode({ mode: "ok" });
+  await sleep(500);
+  const tRestart = Date.now();
+  startHelper();
+  ok(await waitFor(async () => (await askOf(doc, rs.id)).status === "answered", 15000, 200), `answered right after the restart (${((Date.now() - tRestart) / 1000).toFixed(1)} s), not after its 20-minute lease`);
+
   helper.kill("SIGTERM");
   const logPath = path.join(HOME, "helfer.log");
   if (!failures && !process.env.KEEP) fs.rmSync(TMP, { recursive: true, force: true });

@@ -352,6 +352,33 @@ async function main() {
   ok(!gm.some((m) => m.includes('"asks"') || m.includes('"ask"')), "guest got no asks/ask message", gm);
   guest.close();
 
+  console.log("== quick hand-backs count like expired claims; count: false and long pauses do not");
+  const a9 = uuid();
+  await createAsk(doc, a9, { anchor: anchor(2), pv: 0 });
+  let rel;
+  for (let i = 0; i < 4; i++) {
+    rel = await api("POST", `/api/asks/${a9}/claim`, { json: {} });
+    if (rel.status !== 200) break;
+    r = await api("PUT", `/api/asks/${a9}/answer`, { json: { claim: rel.data.claim, release: true, retryAfter: 120, note: "Fehler am Mac, neuer Versuch" } });
+    if (r.status !== 200) break;
+  }
+  ok(rel.status === 409 && rel.data.code === "failed", "claim after the third quick hand-back → failed, no endless cycling", rel);
+  const e9 = (await api("GET", `/api/doc/${doc}/asks`)).data.asks.find((a) => a.id === a9);
+  ok(e9.status === "failed" && /mehrmals/.test(e9.note), "failed with note", e9);
+  const a10 = uuid();
+  await createAsk(doc, a10, { anchor: anchor(2), pv: 0 });
+  rel = await api("POST", `/api/asks/${a10}/claim`, { json: {} });
+  for (let i = 0; i < 5 && rel.status === 200; i++) {
+    await api("PUT", `/api/asks/${a10}/answer`, { json: { claim: rel.data.claim, release: true, retryAfter: 0, count: false, note: "Claude am Mac ist abgemeldet" } });
+    rel = await api("POST", `/api/asks/${a10}/claim`, { json: {} });
+  }
+  ok(rel.status === 200, "hand-backs with count: false (logged out, restart) never use up the retries", rel);
+  for (let i = 0; i < 4 && rel.status === 200; i++) {
+    await api("PUT", `/api/asks/${a10}/answer`, { json: { claim: rel.data.claim, release: true, retryAfter: 3600, note: "Claude-Limit erreicht" } });
+    rel = await api("POST", `/api/asks/${a10}/claim`, { json: {} });
+  }
+  ok(rel.status === 200, "long pauses (usage limit) never use up the retries", rel);
+
   // Aufräumen: Offene Fragen blieben sonst für den nächsten Lauf (oder den Helfer-Test) liegen
   for (const a of (await api("GET", `/api/doc/${doc}/asks`)).data.asks) await api("DELETE", `/api/doc/${doc}/asks/${a.id}`);
   r = await api("GET", "/api/asks/open");
