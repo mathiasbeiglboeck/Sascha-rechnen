@@ -1,6 +1,6 @@
 # Notizbuch-Briefkasten (für Claude, Codex und andere Agenten)
 
-Über den Briefkasten bekommt Mathias PDFs direkt in seine Notizbuch-App auf iPad und iPhone, und er schickt beschriebene Seiten zurück.
+Über den Briefkasten bekommt Mathias PDFs und Markdown direkt in seine Notizbuch-App auf iPad und iPhone, und er schickt beschriebene Seiten zurück.
 
 Du brauchst zwei Werte von Mathias. Schreib sie nie ins Repo:
 - `NOTIZBUCH_URL`, zum Beispiel `https://notizbuch.<name>.workers.dev`
@@ -18,6 +18,20 @@ curl -sS -X POST "$NOTIZBUCH_URL/api/inbox?title=Übungsblatt%203" \
 ```
 
 Das PDF erscheint innerhalb von etwa 20 Sekunden als neues Dokument in der Übersicht der App.
+
+## Markdown an die App schicken (Eingang)
+
+Markdown (UTF-8, höchstens 512 KB) geht in denselben Eingang, mit `?type=md`:
+
+```sh
+curl -sS -X POST "$NOTIZBUCH_URL/api/inbox?type=md" \
+  -H "Authorization: Bearer $NOTIZBUCH_KEY" \
+  -H "Content-Type: text/markdown; charset=utf-8" \
+  --data-binary @notizen.md
+# → {"id":"…","title":"Erste Überschrift","source":"md"}
+```
+
+Die App setzt es einmal auf A4-Seiten, mit Formeln wie in den Antworten von „Claude fragen“ (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`), und danach ist es ein Dokument wie ein PDF, auf das Mathias schreibt. Ohne `?title=` heißt es wie die erste Überschrift (`#` bis `###`). HTML und Bilder zeigt die App nicht, Text, Formeln, Listen, Tabellen, Code und Links schon. Es erscheint etwas später als ein PDF, weil erst ein Gerät mit der App es setzen muss.
 
 ## Zurückgeschickte Seiten abholen (Ausgang)
 

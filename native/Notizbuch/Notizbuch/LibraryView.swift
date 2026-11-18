@@ -14,6 +14,8 @@ struct LibraryView: View {
     @State private var newTitle = ""
     @State private var deleting: NoteDocument?
     @State private var importError: String?
+    /// So viele importierte Markdown-Dateien werden gerade auf Seiten gesetzt
+    @State private var typesetting = 0
     /// Geöffneter Ordner (nil = oberste Ebene)
     @State private var currentFolder: String?
     /// Name für einen neuen Ordner; `moving` ist dann das Dokument, das gleich hinein soll
@@ -131,7 +133,7 @@ struct LibraryView: View {
                 if visibleDocs.isEmpty && (currentFolder != nil || folders.isEmpty) {
                     ContentUnavailableView(currentFolder == nil ? "Noch leer" : "Ordner ist leer", systemImage: "square.and.pencil",
                                            description: Text(currentFolder == nil
-                                                             ? "Leg ein Notizbuch an oder importiere ein PDF."
+                                                             ? "Leg ein Notizbuch an oder importiere ein PDF oder Markdown."
                                                              : "Leg hier ein Notizbuch an, oder verschieb ein Dokument hierher (lange drücken)."))
                 }
             }
@@ -152,23 +154,28 @@ struct LibraryView: View {
                             askingFolderName = true
                         } label: { Label("Neuer Ordner", systemImage: "folder.badge.plus") }
                     }
-                    Button { importing = true } label: { Label("PDF importieren", systemImage: "doc.badge.plus") }
+                    Button { importing = true } label: { Label("PDF oder Markdown importieren", systemImage: "doc.badge.plus") }
                     Button {
                         tabs.open(store.createNotebook(inFolder: currentFolder))
                         Task { await sync.syncLibrary() }
                     } label: { Label("Neues Notizbuch", systemImage: "square.and.pencil") }
                 }
             }
-            .fileImporter(isPresented: $importing, allowedContentTypes: [.pdf]) { result in
+            .fileImporter(isPresented: $importing, allowedContentTypes: [.pdf] + MarkdownTypesetter.contentTypes) { result in
                 do {
-                    let doc = try store.importPDF(from: result.get(), inFolder: currentFolder)
+                    let url = try result.get()
+                    if MarkdownTypesetter.isMarkdown(url) {
+                        importMarkdown(url, inFolder: currentFolder)
+                        return
+                    }
+                    let doc = try store.importPDF(from: url, inFolder: currentFolder)
                     tabs.open(doc)
                     Task { await sync.syncLibrary() }
                 } catch {
                     importError = error.localizedDescription
                 }
             }
-            // PDFs, die aus einer anderen App (Dateien, Mail, AirDrop …) mit „Notizbuch“ geöffnet werden
+            // PDFs und Markdown, die aus einer anderen App (Dateien, Mail, AirDrop …) mit „Notizbuch“ geöffnet werden
             .onOpenURL { url in
                 // Einrichtungslink: notizbuch://setup?url=https://…&key=…
                 // Gilt erst nach Bestätigung: Ein Link, etwa von einer Webseite, soll die Synchronisation nicht unbemerkt
@@ -178,6 +185,10 @@ struct LibraryView: View {
                     let setup = SetupLink(server: items.first(where: { $0.name == "url" })?.value,
                                           key: items.first(where: { $0.name == "key" })?.value)
                     if setup.server != nil || setup.key != nil { pendingSetup = setup }
+                    return
+                }
+                if MarkdownTypesetter.isMarkdown(url) {
+                    importMarkdown(url, inFolder: nil)
                     return
                 }
                 guard url.pathExtension.lowercased() == "pdf" else { return }
@@ -220,7 +231,14 @@ struct LibraryView: View {
                 Button("Abbrechen", role: .cancel) {}
                 Button("OK") { if let old = renamingFolder { renameFolder(old, to: folderName) } }
             }
-            .alert("PDF konnte nicht importiert werden",
+            .overlay {
+                if typesetting > 0 {
+                    ProgressView("Markdown wird gesetzt …")
+                        .padding(20)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                }
+            }
+            .alert("Konnte nicht importiert werden",
                    isPresented: Binding(get: { importError != nil }, set: { if !$0 { importError = nil } })) {
                 Button("OK", role: .cancel) {}
             } message: {
@@ -276,6 +294,22 @@ extension LibraryView {
         return [temp] + Set(store.documents.compactMap(\.folder) + emptyFolders)
             .subtracting([temp])
             .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    /// Markdown wird erst auf Seiten gesetzt (ein, zwei Sekunden), dann öffnet es wie ein importiertes PDF in einem Tab
+    private func importMarkdown(_ url: URL, inFolder folder: String?) {
+        typesetting += 1
+        Task { @MainActor in
+            do {
+                let doc = try await store.importMarkdown(from: url, inFolder: folder)
+                typesetting -= 1
+                tabs.open(doc)
+                await sync.syncLibrary()
+            } catch {
+                typesetting -= 1
+                importError = error.localizedDescription
+            }
+        }
     }
 
     private var visibleDocs: [NoteDocument] {

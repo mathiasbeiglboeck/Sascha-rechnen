@@ -107,6 +107,26 @@ final class DocumentStore: ObservableObject {
         return doc
     }
 
+    /// Markdown importieren: einmal auf A4-Seiten gesetzt (siehe MarkdownTypesetter), danach ein PDF-Dokument wie jedes
+    /// andere. Der Name ist wie bei PDFs der Dateiname
+    func importMarkdown(from url: URL, inFolder: String? = nil) async throws -> NoteDocument {
+        let data: Data
+        do {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            data = try Data(contentsOf: url)
+        }
+        let title = url.deletingPathExtension().lastPathComponent
+        let pdf = try await MarkdownTypesetter.pdf(from: try MarkdownTypesetter.text(of: data), title: title)
+        let now = Date()
+        let doc = NoteDocument(id: UUID(), title: title, kind: .pdf, created: now, modified: now, pageCount: 0,
+                               layoutVersion: PageLayout.currentVersion, folder: inFolder)
+        try fm.createDirectory(at: folder(doc.id), withIntermediateDirectories: true)
+        try pdf.write(to: pdfURL(doc.id), options: .atomic)
+        save(doc)
+        return doc
+    }
+
     func save(_ doc: NoteDocument) {
         if let data = try? JSONEncoder().encode(doc) {
             try? data.write(to: metaURL(doc.id), options: .atomic)

@@ -27,6 +27,8 @@ struct RemoteMeta: Codable {
     /// Wann Name bzw. Ordner zuletzt geändert wurden (siehe NoteDocument); fehlen bei Einträgen älterer Apps
     var titleSet: Date?
     var folderSet: Date?
+    /// "md": Markdown aus dem Eingang. Solange es kein PDF hat, setzt es das erste Gerät, das es sieht (`typeset`)
+    var source: String?
 }
 
 /// Was dieses Gerät über den Sync-Stand eines Dokuments weiß (liegt als sync.json im Dokumentordner)
@@ -187,6 +189,13 @@ final class SyncEngine: ObservableObject {
 
     /// Höchste Änderungsnummer der Striche je Dokument laut letzter Abfrage der Bibliothek
     private var remoteSeqs: [UUID: Int] = [:]
+
+    /// Markdown aus dem Eingang, das dieses Gerät gerade setzt, und wann es nach einem Fehler wieder dran ist (nur im
+    /// Speicher: Nach einem Neustart versucht es das gleich wieder)
+    private var typesetting = Set<UUID>()
+    private var typesetRetry: [UUID: (after: Date, failures: Int)] = [:]
+    /// Hier gesetzt und als erstes am Server abgelegt: Das neue Dokument nimmt dieses PDF, statt es gleich wieder zu laden
+    private var typesetPDFs: [UUID: Data] = [:]
 
     /// Dokumente mit Strichen am Server, die dieses Gerät noch nicht geholt hat (etwa weil ihr Abgleich eben
     /// fehlschlug), und solche, deren Abgleich gerade läuft (seine Antwort kann Neues bringen). Das Aufräumen von temp
@@ -622,9 +631,11 @@ final class SyncEngine: ObservableObject {
                 pendingPurgeSeqs[idString] = nil
             }
 
+            var markdownWaiting: [RemoteMeta] = []
             for r in remote {
                 let local = store.documents.first { $0.id == r.id }
                 if r.deleted == true {
+                    typesetPDFs[r.id] = nil
                     // Gelöscht: Was Schritt 3 beim Zurückholen vorhatte, entscheidet er neu. Erst während der Abfrage
                     // Vermerktes bleibt: Die Antwort dazu kann einen neueren Eintrag kennen als diese Abfrage
                     if lostAtServer.contains(r.id), lostBefore.contains(r.id) { lostAtServer.remove(r.id) }
@@ -766,8 +777,19 @@ final class SyncEngine: ObservableObject {
                     if !refetching.contains(r.id) { refetching.insert(r.id) }
                     try? FileManager.default.removeItem(at: stateURL(r.id))
                     if r.kind == .pdf {
-                        guard r.hasPDF == true else { continue }
-                        let pdf = try await request("GET", "/api/pdf/\(Self.path(r.id))")
+                        guard r.hasPDF == true else {
+                            // Markdown aus dem Eingang, das noch kein Gerät gesetzt hat: setzt dieses, neben dem Abgleich
+                            if r.source == "md" { markdownWaiting.append(r) }
+                            continue
+                        }
+                        typesetRetry[r.id] = nil
+                        let pdf: Data
+                        if let mine = typesetPDFs.removeValue(forKey: r.id), (r.pdfVersion ?? 0) == 0 {
+                            // Eben hier gesetzt, und am Server liegt genau dieses
+                            pdf = mine
+                        } else {
+                            pdf = try await request("GET", "/api/pdf/\(Self.path(r.id))")
+                        }
                         try FileManager.default.createDirectory(at: store.folder(r.id), withIntermediateDirectories: true)
                         try pdf.write(to: store.pdfURL(r.id), options: .atomic)
                     } else {
@@ -781,6 +803,7 @@ final class SyncEngine: ObservableObject {
                                             titleSet: r.titleSet, folderSet: r.folderSet))
                 }
             }
+            for r in markdownWaiting { typeset(r) }
 
             // 3. Eigene Dokumente hochladen, wenn neu oder neuer, oder wenn hier eine neuere Seitenänderung liegt
             //    (der Server übernimmt die dann auch in einen sonst neueren Stand)
@@ -834,6 +857,35 @@ final class SyncEngine: ObservableObject {
             status = ""
         } catch {
             status = error.localizedDescription
+        }
+    }
+
+    /// Markdown aus dem Eingang: holen, auf A4-Seiten setzen (MarkdownTypesetter) und das PDF ablegen. Setzen es mehrere
+    /// Geräte zugleich, gilt das erste PDF am Server (PUT …?ifMissing=1). Danach holt jedes Gerät das Dokument wie ein
+    /// neues PDF, so liegen die Striche überall auf demselben PDF. Ältere Apps übergehen PDF-Dokumente ohne PDF, sehen
+    /// es also erst dann
+    private func typeset(_ r: RemoteMeta) {
+        guard !typesetting.contains(r.id), (typesetRetry[r.id]?.after ?? .distantPast) <= Date() else { return }
+        typesetting.insert(r.id)
+        Task {
+            do {
+                let data = try await request("GET", "/api/md/\(Self.path(r.id))")
+                let pdf = try await MarkdownTypesetter.pdf(from: try MarkdownTypesetter.text(of: data), title: r.title)
+                let answer = try await request("PUT", "/api/pdf/\(Self.path(r.id))?ifMissing=1", body: pdf,
+                                               contentType: "application/pdf")
+                struct First: Decodable { var ok: Bool? }
+                if (try? Self.decoder.decode(First.self, from: answer))?.ok == true { typesetPDFs[r.id] = pdf }
+                typesetRetry[r.id] = nil
+            } catch {
+                // Später noch einmal (etwa ohne Netz), nach 1 Minute, dann immer seltener (höchstens stündlich)
+                let failures = (typesetRetry[r.id]?.failures ?? 0) + 1
+                typesetRetry[r.id] = (Date().addingTimeInterval(min(60 * pow(2, Double(failures - 1)), 3600)), failures)
+                Log.sync.error("Markdown \(r.id.uuidString, privacy: .public) nicht gesetzt: \(error.localizedDescription, privacy: .public)")
+                typesetting.remove(r.id)
+                return
+            }
+            typesetting.remove(r.id)
+            await syncLibrary()
         }
     }
 

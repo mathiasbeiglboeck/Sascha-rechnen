@@ -5,6 +5,8 @@ Handschriftliche Notizen auf dünn grau kariertem A4 und Notizen auf PDFs, mit P
 - Seiten liegen untereinander und werden vertikal gescrollt; im Notizbuch kommt automatisch eine neue Seite dazu, sobald auf der letzten geschrieben wird.
 - Am iPad schreibt nur der Pencil, der Finger scrollt und zoomt.
 - Stift mit 5 Farben und 5 Dicken, Radierer (löscht ganze Striche), Rückgängig.
+- Markdown (`.md`, über „Importieren“, „Öffnen in“ oder den Briefkasten) wird einmal auf A4-Seiten gesetzt, mit Formeln wie in
+  den Antworten von „Claude fragen“; danach ist es ein PDF-Dokument wie jedes andere (der Text ist nicht bearbeitbar).
 - Apple Pencil Pro: **Drücken** blendet alle Menüs aus und wieder ein, **Doppeltippen** wechselt zwischen Stift und Radierer.
 - Daten: `Dokumente/Notizbuch/<id>/` mit `meta.json`, `drawing.data` (PKDrawing über alle Seiten, 768 Punkte breites Seitenkoordinatensystem) und bei PDFs `source.pdf`. Der Ordner ist in der Dateien-App unter „Auf meinem iPad > Notizbuch“ sichtbar.
 

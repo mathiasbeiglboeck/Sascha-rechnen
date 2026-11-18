@@ -23,6 +23,8 @@ const MAX_OPEN_ASKS = 50;
 const MAX_QUESTION_BYTES = 4 * 1024 * 1024;
 const MAX_PAGE_BYTES = 8 * 1024 * 1024;
 const MAX_ANSWER_CHARS = 200000;
+// Markdown im Eingang (die App setzt es auf A4-Seiten): höchstens so groß
+const MAX_MARKDOWN_BYTES = 512 * 1024;
 const EFFORTS = ["quick", "thorough"];
 // Frist, in der der Helfer eine übernommene Frage beantwortet (er kann sie verlängern), in Sekunden
 const ASK_LEASE = 900;
@@ -136,10 +138,15 @@ export class Store extends DurableObject {
       if (area === "doc" && id && sub === "sync" && method === "POST") return json(this.syncDoc(id, await request.json()));
 
       if (area === "pdf" && id && method === "PUT") {
-        this.putBlob(`pdf/${id}`, await request.arrayBuffer(), "application/pdf");
+        const bytes = await request.arrayBuffer();
+        // Gesetztes Markdown aus dem Eingang: Es gilt das PDF des ersten Geräts (siehe putFirstPDF)
+        if (url.searchParams.get("ifMissing") === "1") return json(this.putFirstPDF(id, bytes));
+        this.putBlob(`pdf/${id}`, bytes, "application/pdf");
         return json({ ok: true });
       }
       if (area === "pdf" && id && method === "GET") return this.blobResponse(`pdf/${id}`);
+      // Das Markdown eines Dokuments aus dem Eingang (die App setzt es auf Seiten)
+      if (area === "md" && id && method === "GET") return this.blobResponse(`md/${id}`);
 
       if (area === "inbox" && !id && method === "POST") return json(await this.inbox(request, url));
 
@@ -206,6 +213,7 @@ export class Store extends DurableObject {
       if (result.deleted) {
         this.sql.exec("DELETE FROM strokes WHERE doc = ?", id);
         this.deleteBlob(`pdf/${id}`);
+        this.deleteBlob(`md/${id}`);
         this.deleteDocAsks(id);
       }
     }
@@ -745,18 +753,46 @@ export class Store extends DurableObject {
 
   // ---------- Briefkasten ----------
 
-  /// Ein PDF in den Eingang: wird ein neues Dokument, das auf allen Geräten erscheint
+  /// Ein PDF oder Markdown in den Eingang: wird ein neues Dokument, das auf allen Geräten erscheint
   async inbox(request, url) {
     const bytes = await request.arrayBuffer();
-    const head = new Uint8Array(bytes.slice(0, 5));
-    if (String.fromCharCode(...head) !== "%PDF-") throw new Error("Das ist kein PDF");
+    const isPDF = String.fromCharCode(...new Uint8Array(bytes.slice(0, 5))) === "%PDF-";
+    if (!isPDF && !markdownRequested(request, url)) {
+      throw new Error("Das ist kein PDF. Markdown bitte mit ?type=md (oder Content-Type: text/markdown) schicken");
+    }
     const id = crypto.randomUUID().toUpperCase();
     const now = Date.now() / 1000;
-    const title = (url.searchParams.get("title") || "Aus dem Eingang").slice(0, 200);
-    this.putBlob(`pdf/${id}`, bytes, "application/pdf");
     // Was Claude oder ChatGPT schicken, landet im Ordner „temp“ (die App löscht es dort nach 2 Wochen)
-    this.putMeta(id, { id, title, kind: "pdf", created: now, modified: now, pageCount: 0, layoutVersion: 2, folder: "temp" });
-    return { id, title };
+    const meta = { id, title: "", kind: "pdf", created: now, modified: now, pageCount: 0, layoutVersion: 2, folder: "temp" };
+    if (isPDF) {
+      meta.title = (url.searchParams.get("title") || "Aus dem Eingang").slice(0, 200);
+      this.putBlob(`pdf/${id}`, bytes, "application/pdf");
+      this.putMeta(id, meta);
+      return { id, title: meta.title };
+    }
+    // Markdown: ein PDF-Dokument, das noch kein PDF hat. Das erste Gerät mit einer App, die Markdown kennt, setzt es
+    // und lädt das PDF hoch (putFirstPDF); ältere Apps übergehen PDF-Dokumente ohne PDF, sehen es also erst danach
+    const text = markdownText(bytes);
+    meta.title = (url.searchParams.get("title") || markdownTitle(text) || "Aus dem Eingang").slice(0, 200);
+    meta.source = "md";
+    const utf8 = new TextEncoder().encode(text);
+    this.ctx.storage.transactionSync(() => {
+      this.writeBlob(`md/${id}`, utf8.buffer.slice(utf8.byteOffset, utf8.byteOffset + utf8.byteLength),
+        "text/markdown; charset=utf-8");
+      this.putMeta(id, meta);
+    });
+    return { id, title: meta.title, source: "md" };
+  }
+
+  /// Das PDF eines Markdown aus dem Eingang, gesetzt von einem Gerät. Setzen es mehrere zugleich, gilt das erste:
+  /// Alle laden dann genau dieses, sonst lägen die Striche auf jedem Gerät auf einem etwas anders gesetzten PDF
+  putFirstPDF(id, bytes) {
+    if (String.fromCharCode(...new Uint8Array(bytes.slice(0, 5))) !== "%PDF-") throw new Error("Das ist kein PDF");
+    const row = this.sql.exec("SELECT meta FROM docs WHERE id = ?", id).toArray()[0];
+    if (!row || JSON.parse(row.meta).deleted) return { ok: false, gone: true };
+    if (this.sql.exec("SELECT 1 FROM blobmeta WHERE key = ?", `pdf/${id}`).toArray().length) return { ok: false, exists: true };
+    this.putBlob(`pdf/${id}`, bytes, "application/pdf");
+    return { ok: true };
   }
 
   listOutbox(to) {
@@ -807,6 +843,73 @@ export class Store extends DurableObject {
     }
     return new Response(out, { headers: { "content-type": meta.type || "application/octet-stream" } });
   }
+}
+
+/// Markdown im Eingang: ausdrücklich mit ?type=md, oder als Text geschickt (Content-Type text/markdown oder text/plain)
+function markdownRequested(request, url) {
+  const type = (url.searchParams.get("type") || "").toLowerCase();
+  if (type === "md" || type === "markdown") return true;
+  const ct = (request.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  return ct === "text/markdown" || ct === "text/x-markdown" || ct === "text/plain";
+}
+
+/// Der Text eines Markdown aus dem Eingang: UTF-8 (ein BOM fällt weg), nicht leer, nicht zu groß, keine Binärdatei
+function markdownText(bytes) {
+  if (bytes.byteLength > MAX_MARKDOWN_BYTES) throw new Error(`Markdown zu groß (höchstens ${MAX_MARKDOWN_BYTES / 1024} KB)`);
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (e) {
+    throw new Error("Markdown muss UTF-8 sein");
+  }
+  if (!text.trim()) throw new Error("Leere Datei");
+  if (/[\u0000-\u0008\u000E-\u001F\u007F]/.test(text)) throw new Error("Das ist keine Textdatei");
+  return text;
+}
+
+/// Name für Markdown ohne ?title: title im Vorspann (YAML zwischen --- am Anfang), sonst die erste Überschrift
+/// (# bis ###) außerhalb von Codeblöcken, ohne Markdown-Zeichen
+function markdownTitle(text) {
+  const lines = text.split(/\r\n?|\n/);
+  let start = 0;
+  if (/^---[ \t]*$/.test(lines[0])) {
+    // Nur echter Vorspann (er beginnt mit „schlüssel:“), nicht eine Trennlinie am Anfang
+    const end = lines.findIndex((l, i) => i > 0 && /^(---|\.\.\.)[ \t]*$/.test(l));
+    const first = end > 0 ? lines.slice(1, end).find((l) => l.trim()) : undefined;
+    if (end > 0 && end < 200 && first && /^[\w-]+:/.test(first)) {
+      for (const l of lines.slice(1, end)) {
+        const m = /^title:[ \t]*(.*?)[ \t]*$/i.exec(l);
+        const t = m && plainTitle(m[1].replace(/^(["'])(.*)\1$/, "$2"));
+        if (t) return t;
+      }
+      start = end + 1;
+    }
+  }
+  let fence = null;
+  for (const line of lines.slice(start, start + 500)) {
+    const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) {
+      if (f && f[1][0] === fence[0] && f[1].length >= fence.length && !f[2].trim()) fence = null;
+      continue;
+    }
+    if (f) {
+      fence = f[1];
+      continue;
+    }
+    const h = /^ {0,3}#{1,3}[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$/.exec(line);
+    const t = h && plainTitle(h[1]);
+    if (t) return t;
+  }
+  return "";
+}
+
+/// Überschrift als Name: Links werden zu ihrem Text, Hervorhebung, Code- und Formelzeichen fallen weg
+function plainTitle(s) {
+  return s
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\*+|`+|\$+|\\[()[\]]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 // Seitenänderungen (löschen, einfügen) tragen eine eigene Version: pagesVersion für Seitenzahl und
