@@ -33,6 +33,8 @@ curl -sS -X POST "$NOTIZBUCH_URL/api/inbox?type=md" \
 
 Die App setzt es einmal auf A4-Seiten, mit Formeln wie in den Antworten von „Claude fragen“ (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`), und danach ist es ein Dokument wie ein PDF, auf das Mathias schreibt. Ohne `?title=` heißt es wie die erste Überschrift (`#` bis `###`). HTML und Bilder zeigt die App nicht, Text, Formeln, Listen, Tabellen, Code und Links schon. Es erscheint etwas später als ein PDF, weil erst ein Gerät mit der App es setzen muss.
 
+Für Notizen und Antworten mit Formeln reicht Markdown, ein PDF muss dafür nicht erst gebaut werden. Ein PDF nur, wenn es schon eines gibt oder Bilder und eigenes Layout wichtig sind. Antwortet der Eingang mit „Das ist kein PDF …“, läuft dort noch ein älterer Server: dann wie bisher ein PDF schicken.
+
 ## Zurückgeschickte Seiten abholen (Ausgang)
 
 Der Ausgang ist nach Empfänger getrennt. In der App wählt Mathias im Teilen-Menü „Seite an Claude senden“ oder „Seite an ChatGPT senden“. Eine einzelne Seite kommt als `<Titel> – Seite N.pdf` und als `.png`, ein ganzes Dokument („Ganzes Dokument“, höchstens 80 Seiten) als `<Titel>.pdf` bzw. `<Titel> – Seiten 1-80.pdf` in den Ordner dieses Empfängers.
