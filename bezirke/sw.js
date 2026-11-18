@@ -1,5 +1,5 @@
 // Offline: App-Dateien vorab speichern. Der Lernstand liegt im Handy (localStorage).
-const CACHE = "bezirke-v8";
+const CACHE = "bezirke-v9";
 const IMGS = Array.from({ length: 23 }, (_, i) => `img/${i + 1}.jpg`);
 const FILES = ["./", "index.html", "app.js", "app.css", "manifest.webmanifest", "icon-180.png", "icon-192.png", "icon-512.png",
   "sascha/", "sascha/manifest.webmanifest", "sascha/orte.enc.json", ...IMGS];
