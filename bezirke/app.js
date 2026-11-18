@@ -305,6 +305,7 @@ function home() {
     </div>
     <div class="menu" style="margin-top:8px">
       <button data-go="zuordnen" class="wide"><span class="ic">🧩</span><div><b>Zuordnen</b><small>Namen zur richtigen Zahl schieben${S.best["z_" + set] ? " · Bestzeit " + fmt(S.best["z_" + set]) : ""}</small></div></button>
+      ${PRIV ? '<button data-go="salat" class="wide"><span class="ic">🔤</span><div><b>Wortsalat</b><small>Buchstaben in die richtige Reihenfolge bringen</small></div></button>' : ""}
     </div>
     <div class="foot">
       <button class="chip" id="ton">${S.ton ? "🔊 Vorlesen an" : "🔇 Vorlesen aus"}</button>
@@ -317,7 +318,7 @@ function home() {
   app.querySelectorAll("[data-set]").forEach(b => b.onclick = () => { S.set = b.dataset.set; save(); home(); });
   app.querySelectorAll("[data-go]").forEach(b => b.onclick = () => {
     const g = b.dataset.go;
-    if (g === "lern") lern(); else if (g === "reihe") reihe(); else if (g === "zuordnen") zuordnen(); else quiz(g);
+    if (g === "lern") lern(); else if (g === "reihe") reihe(); else if (g === "zuordnen") zuordnen(); else if (g === "salat") salat(); else quiz(g);
   });
   $("#ton").onclick = () => { S.ton = !S.ton; save(); $("#ton").textContent = S.ton ? "🔊 Vorlesen an" : "🔇 Vorlesen aus"; if (S.ton) say("Vorlesen ist an"); };
   const r = $("#reset");
@@ -766,6 +767,203 @@ function zuordnen() {
     window.scrollTo({ top: 0, behavior: "smooth" });
     $("#again").onclick = zuordnen; $("#fertig").onclick = home;
   };
+}
+
+// ---------- Wortsalat (nur Saschas Version) ----------
+// Oben steht die Zahl, darunter eine Lücke pro Buchstabe. Die Buchstaben liegen
+// durcheinander darunter: antippen, dann wandern sie in die markierte Lücke.
+// Lange Namen werden abgeteilt, damit sie am Handy Platz haben:
+// „/“ = hier darf man abteilen, „|“ = hier beginnt immer eine neue Zeile.
+const TEILE = { 1: "Innere Stadt", 2: "Leopold/stadt", 3: "Land/straße", 5: "Marga/reten", 6: "Maria/hilf",
+  8: "Josef/stadt", 9: "Alser/grund", 10: "Favo/riten", 11: "Sim/mering", 15: "Rudolfs/heim-|Fünf/haus",
+  16: "Otta/kring", 20: "Bri/git/te/nau", 21: "Florids/dorf", 22: "Donau/stadt" };
+function salatZeilen(n, max) {
+  const parts = [];
+  (TEILE[n] || B[n].name).split(" ").forEach((w, wi) => w.split("|").forEach((h, hi) => h.split("/").forEach((t, k) =>
+    parts.push({ t, space: wi > 0 && hi === 0 && k === 0, hard: hi > 0 && k === 0, soft: k > 0 }))));
+  const rows = [];
+  let row = null;
+  for (const p of parts) {
+    const len = [...p.t].length + (p.space ? 1 : 0);
+    if (row && !p.hard && row.len + len <= max) { row.items.push(p); row.len += len; }
+    else { if (row && p.soft) row.dash = true; p.space = false; row = { items: [p], len: [...p.t].length }; rows.push(row); }
+  }
+  return rows;
+}
+function salat() {
+  clearScreen();
+  onHome = false;
+  const set = S.set, ns = SETS[set].ns;
+  const sc = n => ((S.due[n] ?? 0) <= S.q ? 0 : 8) + lv(n) * 3 + Math.random() * 5;
+  const queue = shuffle(ns.map(n => [n, sc(n)]).sort((a, b) => a[1] - b[1]).slice(0, Math.min(6, ns.length)).map(a => a[0]));
+  const before = ns.reduce((a, n) => a + lv(n), 0);
+  let i = 0, perfect = 0;
+  const results = [];
+  app.innerHTML = `
+    <div class="top"><button class="x" aria-label="Zurück">✕</button><div class="dots" id="dots"></div></div>
+    <div class="panel ohne" id="p"></div>`;
+  $(".x").onclick = home;
+  const dots = () => { $("#dots").innerHTML = queue.map((_, k) => `<i class="${results[k] || (k === i ? "now" : "")}"></i>`).join(""); };
+  let offResize = null;
+  cleanups.push(() => offResize && offResize());
+
+  function next() {
+    if (offResize) { offResize(); offResize = null; }
+    if (i >= queue.length) return ende();
+    dots();
+    ask(queue[i]);
+  }
+
+  function ask(n) {
+    const exp = [...B[n].name].filter(c => c !== " " && c !== "-"); // die Buchstaben, die in Lücken kommen
+    let tiles;
+    do { tiles = shuffle(exp.slice()); } while (exp.length > 1 && tiles.join("") === exp.join(""));
+    const inSlot = exp.map(() => null);   // welches Kärtchen in welcher Lücke liegt
+    const atSlot = tiles.map(() => null); // in welcher Lücke ein Kärtchen liegt
+    const ok = exp.map(() => false);
+    let cur = 0, tries = 0, hints = 0, done = false, busy = false;
+    $("#p").innerHTML = `
+      <div class="ask">Wie heißt der <span class="big">${n}.</span> Bezirk?</div>
+      <div class="ws" id="ws"></div>
+      <div class="note" id="note"></div>
+      <div class="ws-pool" id="pool">${tiles.map((c, j) => `<button class="ws-tile" data-j="${j}">${c}</button>`).join("")}</div>
+      <div class="row" id="hr"><button class="hint-btn" id="hb">💡 Tipp</button><div class="hint" id="hint"></div></div>
+      <div id="fb"></div>`;
+    if (exp.length > 12) $("#pool").classList.add("klein");
+    const ws = $("#ws");
+    function build() {
+      const W = ws.clientWidth || 340, g = 5;
+      const max = Math.max(6, Math.floor((W + g) / (32 + g)));
+      const rows = salatZeilen(n, max);
+      let k = 0, s = 46;
+      ws.innerHTML = rows.map(r => {
+        let html = "", letters = 0, glyphs = 0, spaces = 0, els = 0;
+        for (const p of r.items) {
+          if (p.space) { html += '<span class="ws-sp"></span>'; spaces++; els++; }
+          for (const c of p.t) {
+            if (c === "-") { html += '<span class="ws-fix">-</span>'; glyphs++; }
+            else { html += `<button class="ws-slot" data-k="${k++}"></button>`; letters++; }
+            els++;
+          }
+        }
+        if (r.dash) { html += '<span class="ws-dash">-</span>'; glyphs++; els++; }
+        s = Math.min(s, Math.floor((W - g * (els - 1)) / (letters + spaces * .5 + glyphs * .35)));
+        return `<div class="ws-row">${html}</div>`;
+      }).join("");
+      ws.style.setProperty("--s", Math.max(24, s) + "px");
+      ws.querySelectorAll(".ws-slot").forEach(b => b.onclick = () => tapSlot(+b.dataset.k));
+      draw();
+    }
+    function draw() {
+      ws.querySelectorAll(".ws-slot").forEach(b => {
+        const k = +b.dataset.k, j = inSlot[k];
+        b.textContent = j === null ? "" : tiles[j];
+        b.classList.toggle("full", j !== null);
+        b.classList.toggle("ok", ok[k]);
+        b.classList.toggle("cur", !done && k === cur && j === null);
+      });
+      app.querySelectorAll(".ws-tile").forEach(b => b.classList.toggle("used", atSlot[+b.dataset.j] !== null));
+    }
+    const firstEmpty = (from = 0) => {
+      for (let d = 0; d < exp.length; d++) { const k = (from + d) % exp.length; if (inSlot[k] === null) return k; }
+      return null;
+    };
+    function put(j, k) { inSlot[k] = j; atSlot[j] = k; }
+    function take(k) { const j = inSlot[k]; if (j !== null) { atSlot[j] = null; inSlot[k] = null; } }
+    function tapSlot(k) {
+      if (done || busy || ok[k]) return;
+      take(k); cur = k; $("#note").textContent = ""; draw();
+    }
+    app.querySelectorAll(".ws-tile").forEach(b => b.onclick = () => {
+      const j = +b.dataset.j;
+      if (done || busy || atSlot[j] !== null) return;
+      if (cur === null || inSlot[cur] !== null) cur = firstEmpty();
+      if (cur === null) return;
+      put(j, cur);
+      cur = firstEmpty(cur + 1);
+      $("#note").textContent = "";
+      draw();
+      if (cur === null) { busy = true; setTimeout(check, 250); }
+    });
+    function check() {
+      const wrong = exp.map((c, k) => tiles[inSlot[k]] !== c);
+      if (!wrong.some(x => x)) return geschafft();
+      tries++; tone("bad");
+      exp.forEach((_, k) => { if (!wrong[k]) ok[k] = true; });
+      draw();
+      ws.querySelectorAll(".ws-slot").forEach(b => { if (wrong[+b.dataset.k]) b.classList.add("bad"); });
+      $("#note").textContent = ok.some(x => x) ? "Noch nicht ganz! Die grünen Buchstaben stimmen schon." : "Noch nicht ganz! Probier es nochmal.";
+      setTimeout(() => {
+        if (done || !ws.isConnected) return;
+        exp.forEach((_, k) => { if (wrong[k]) take(k); });
+        ws.querySelectorAll(".ws-slot.bad").forEach(b => b.classList.remove("bad"));
+        cur = firstEmpty(); busy = false; draw();
+      }, 900);
+    }
+    $("#hb").onclick = () => {
+      if (done || busy) return;
+      hints++;
+      if (hints === 1) { $("#hint").textContent = B[n].f; $("#hb").textContent = "💡 Buchstabe"; return; }
+      // den nächsten fehlenden Buchstaben richtig einsetzen
+      const k = ok.indexOf(false);
+      if (k < 0) return;
+      if (inSlot[k] === null || tiles[inSlot[k]] !== exp[k]) {
+        take(k);
+        let j = tiles.findIndex((c, j) => c === exp[k] && atSlot[j] === null);
+        if (j < 0) { j = tiles.findIndex((c, j) => c === exp[k] && !ok[atSlot[j]]); take(atSlot[j]); }
+        put(j, k);
+      }
+      ok[k] = true;
+      if (cur === k || cur === null || inSlot[cur] !== null) cur = firstEmpty(k + 1);
+      tone("ok"); draw();
+      if (firstEmpty() === null) { busy = true; setTimeout(check, 250); }
+    };
+    function geschafft() {
+      done = true; busy = false;
+      exp.forEach((_, k) => ok[k] = true);
+      draw();
+      const gut = tries === 0 && hints === 0;
+      record(n, true, !gut); // Rechtschreib-Fehler kosten keine Sterne, bringen aber auch keinen
+      results[i] = gut ? "ok" : "half";
+      if (gut) perfect++;
+      dots();
+      tone("ok"); sayB(n);
+      $("#pool").remove(); $("#hr").remove(); $("#note").remove();
+      $("#fb").innerHTML = `
+        <div class="fb ok"><b>✓ ${gut ? "Richtig!" : "Geschafft!"}</b> <span class="st">${STARS(lv(n))}</span><br>${B[n].m}</div>
+        <button class="go" id="weiter">Weiter →</button>`;
+      $("#weiter").onclick = () => { i++; next(); };
+      $("#weiter").scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+    build();
+    const onR = () => build();
+    window.addEventListener("resize", onR);
+    offResize = () => window.removeEventListener("resize", onR);
+  }
+
+  function ende() {
+    clearScreen();
+    S.runden++; save();
+    const after = ns.reduce((a, n) => a + lv(n), 0), total = queue.length, gain = after - before;
+    tone("win");
+    app.innerHTML = `
+      <div class="top"><button class="x" aria-label="Zurück">✕</button><h2>Wortsalat</h2></div>
+      <div class="end">
+        <div class="big">${perfect >= total - 1 ? "🏆" : perfect >= total / 2 ? "🎉" : "💪"}</div>
+        <h2>${perfect >= total - 1 ? "Super gemacht!" : perfect >= total / 2 ? "Gut gemacht!" : "Weiter so!"}</h2>
+        <p class="res">${perfect} von ${total} gleich richtig geschrieben</p>
+        <p>${gain > 0 ? `+${gain} neue Sterne ★` : "Übung macht den Meister."}</p>
+      </div>
+      <div id="m"></div>
+      <div class="panel">
+        <button class="go" id="again">Noch eine Runde</button>
+        <button class="go sec" id="fertig">Fertig</button>
+      </div>`;
+    const map = new Karte($("#m"), { set, onTap: n => lern(n) });
+    for (const n of ns) map.fill(n, LV_COL[lv(n)]);
+    $(".x").onclick = home; $("#fertig").onclick = home; $("#again").onclick = salat;
+  }
+  next();
 }
 
 // ---------- Der Reihe nach ----------

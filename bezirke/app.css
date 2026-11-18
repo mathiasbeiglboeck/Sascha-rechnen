@@ -172,3 +172,22 @@ button { font: inherit; color: inherit; cursor: pointer; border: 0; background: 
 .pin-pad { display: grid; grid-template-columns: repeat(3, 76px); gap: 14px; justify-content: center; margin-top: 10px; }
 .pin-pad button { height: 76px; border-radius: 38px; background: var(--card); border: 1px solid var(--line); font-size: 28px; font-weight: 600; }
 .pin-pad button:active { background: #f0e6cf; }
+/* Wortsalat */
+.ws { display: flex; flex-direction: column; align-items: center; gap: 8px; margin: 6px 0 0; --s: 40px; }
+.ws-row { display: flex; gap: 5px; justify-content: center; align-items: center; }
+.ws-slot { width: var(--s); height: calc(var(--s) * 1.2); border-radius: 10px; border: 2px dashed #cdbf9f; background: transparent; padding: 0;
+  font-size: calc(var(--s) * .62); font-weight: 750; display: grid; place-items: center; line-height: 1; transition: background .15s, border-color .15s; }
+.ws-slot.full { border-style: solid; border-color: var(--line); background: var(--card); }
+.ws-slot.cur { border-style: solid; border-color: var(--acc); background: #fff4d6; box-shadow: 0 0 0 3px #f6b04d55; }
+.ws-slot.ok { border-style: solid; background: var(--okbg); border-color: var(--ok); color: #1e6b33; }
+.ws-slot.bad { border-style: solid; background: var(--badbg); border-color: var(--bad); color: #9b2c22; }
+.ws-sp { width: calc(var(--s) * .5); flex: none; }
+.ws-fix, .ws-dash { width: calc(var(--s) * .35); text-align: center; font-size: calc(var(--s) * .62); font-weight: 750; flex: none; }
+.ws-dash { color: #c4b897; }
+.ws-pool { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin: 2px 0 6px; }
+.ws-tile { width: 46px; height: 52px; border-radius: 12px; background: #fffaf0; border: 2px solid #e6c98f; box-shadow: 0 3px 0 #e6c98f;
+  font-size: 26px; font-weight: 750; padding: 0; line-height: 1; }
+.ws-tile:active { transform: translateY(2px); box-shadow: 0 1px 0 #e6c98f; }
+.ws-tile.used { visibility: hidden; }
+.ws-pool.klein { gap: 7px; }
+.ws-pool.klein .ws-tile { width: 42px; height: 48px; font-size: 24px; }
