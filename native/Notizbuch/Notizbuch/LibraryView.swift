@@ -164,6 +164,7 @@ struct LibraryView: View {
             .fileImporter(isPresented: $importing, allowedContentTypes: [.pdf] + MarkdownTypesetter.contentTypes) { result in
                 do {
                     let url = try result.get()
+                    // Nach dem Inhalt: Was kein PDF ist, wird als Markdown gesetzt
                     if MarkdownTypesetter.isMarkdown(url) {
                         importMarkdown(url, inFolder: currentFolder)
                         return
@@ -187,18 +188,18 @@ struct LibraryView: View {
                     if setup.server != nil || setup.key != nil { pendingSetup = setup }
                     return
                 }
-                if MarkdownTypesetter.isMarkdown(url) {
-                    importMarkdown(url, inFolder: nil)
+                #if DEBUG
+                // Nur für Tests im Simulator: notizbuch://debug/import?file=<Name in Dokumente> wie „Öffnen in“
+                if url.scheme == "notizbuch", url.host == "debug", url.path == "/import",
+                   let name = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                       .first(where: { $0.name == "file" })?.value {
+                    openFile(URL.documentsDirectory.appendingPathComponent(name))
                     return
                 }
-                guard url.pathExtension.lowercased() == "pdf" else { return }
-                do {
-                    // In einem neuen Tab, auch wenn gerade ein Dokument offen ist
-                    let doc = try store.importPDF(from: url)
-                    tabs.open(doc)
-                } catch {
-                    importError = error.localizedDescription
-                }
+                #endif
+                // Nur Dateien (Info.plist bietet die App für PDF und Markdown an)
+                guard url.isFileURL else { return }
+                openFile(url)
             }
             .fullScreenCover(isPresented: $tabs.editorShown, onDismiss: { store.reload() }) {
                 EditorView(tabs: tabs, tools: tabs.tools).environmentObject(store).environmentObject(sync)
@@ -294,6 +295,20 @@ extension LibraryView {
         return [temp] + Set(store.documents.compactMap(\.folder) + emptyFolders)
             .subtracting([temp])
             .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    /// Eine Datei aus einer anderen App: PDF oder (nach dem Inhalt) Markdown, in einem neuen Tab, auch wenn gerade ein
+    /// Dokument offen ist
+    private func openFile(_ url: URL) {
+        if MarkdownTypesetter.isMarkdown(url) {
+            importMarkdown(url, inFolder: nil)
+            return
+        }
+        do {
+            tabs.open(try store.importPDF(from: url))
+        } catch {
+            importError = error.localizedDescription
+        }
     }
 
     /// Markdown wird erst auf Seiten gesetzt (ein, zwei Sekunden), dann öffnet es wie ein importiertes PDF in einem Tab

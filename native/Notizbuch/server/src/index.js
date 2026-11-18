@@ -765,7 +765,7 @@ export class Store extends DurableObject {
     // Was Claude oder ChatGPT schicken, landet im Ordner „temp“ (die App löscht es dort nach 2 Wochen)
     const meta = { id, title: "", kind: "pdf", created: now, modified: now, pageCount: 0, layoutVersion: 2, folder: "temp" };
     if (isPDF) {
-      meta.title = (url.searchParams.get("title") || "Aus dem Eingang").slice(0, 200);
+      meta.title = clipTitle(url.searchParams.get("title") || "Aus dem Eingang");
       this.putBlob(`pdf/${id}`, bytes, "application/pdf");
       this.putMeta(id, meta);
       return { id, title: meta.title };
@@ -773,7 +773,7 @@ export class Store extends DurableObject {
     // Markdown: ein PDF-Dokument, das noch kein PDF hat. Das erste Gerät mit einer App, die Markdown kennt, setzt es
     // und lädt das PDF hoch (putFirstPDF); ältere Apps übergehen PDF-Dokumente ohne PDF, sehen es also erst danach
     const text = markdownText(bytes);
-    meta.title = (url.searchParams.get("title") || markdownTitle(text) || "Aus dem Eingang").slice(0, 200);
+    meta.title = clipTitle(url.searchParams.get("title") || markdownTitle(text) || "Aus dem Eingang");
     meta.source = "md";
     const utf8 = new TextEncoder().encode(text);
     this.ctx.storage.transactionSync(() => {
@@ -785,13 +785,21 @@ export class Store extends DurableObject {
   }
 
   /// Das PDF eines Markdown aus dem Eingang, gesetzt von einem Gerät. Setzen es mehrere zugleich, gilt das erste:
-  /// Alle laden dann genau dieses, sonst lägen die Striche auf jedem Gerät auf einem etwas anders gesetzten PDF
+  /// Alle laden dann genau dieses, sonst lägen die Striche auf jedem Gerät auf einem etwas anders gesetzten PDF.
+  /// Erst jetzt erscheint es auf den Geräten, also gilt es ab jetzt als geändert (die 2 Wochen im Ordner „temp“
+  /// zählen ab hier, und in der Übersicht steht es oben)
   putFirstPDF(id, bytes) {
     if (String.fromCharCode(...new Uint8Array(bytes.slice(0, 5))) !== "%PDF-") throw new Error("Das ist kein PDF");
-    const row = this.sql.exec("SELECT meta FROM docs WHERE id = ?", id).toArray()[0];
-    if (!row || JSON.parse(row.meta).deleted) return { ok: false, gone: true };
+    const row = this.sql.exec("SELECT meta, modified FROM docs WHERE id = ?", id).toArray()[0];
+    const meta = row ? JSON.parse(row.meta) : null;
+    if (!meta || meta.deleted) return { ok: false, gone: true };
     if (this.sql.exec("SELECT 1 FROM blobmeta WHERE key = ?", `pdf/${id}`).toArray().length) return { ok: false, exists: true };
-    this.putBlob(`pdf/${id}`, bytes, "application/pdf");
+    meta.modified = Math.max(Number(row.modified) || 0, Date.now() / 1000);
+    this.ctx.storage.transactionSync(() => {
+      this.writeBlob(`pdf/${id}`, bytes, "application/pdf");
+      this.sql.exec("UPDATE docs SET meta = ?, modified = ?, seq = ? WHERE id = ?",
+        JSON.stringify(meta), meta.modified, this.nextSeq(), id);
+    });
     return { ok: true };
   }
 
@@ -843,6 +851,12 @@ export class Store extends DurableObject {
     }
     return new Response(out, { headers: { "content-type": meta.type || "application/octet-stream" } });
   }
+}
+
+/// Name eines Dokuments aus dem Eingang: höchstens 200 Zeichen, ohne ein halbes Zeichenpaar am Ende (etwa von einem
+/// Emoji). Das ergäbe JSON, das die Apps nicht lesen können, und damit hielte die ganze Bibliothek auf allen Geräten an
+function clipTitle(s) {
+  return s.slice(0, 200).replace(/[\uD800-\uDBFF]$/, "");
 }
 
 /// Markdown im Eingang: ausdrücklich mit ?type=md, oder als Text geschickt (Content-Type text/markdown oder text/plain)

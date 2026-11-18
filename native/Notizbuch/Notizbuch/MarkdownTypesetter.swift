@@ -17,20 +17,31 @@ enum MarkdownTypesetter {
     /// Die Fläche für den Text, von oben links gemessen (Ränder etwa 2 cm, unten mehr für die Seitenzahl)
     static let area = CGRect(x: 56, y: 56, width: 483, height: 722)
 
-    /// Dateiendungen von Markdown (Öffnen aus der Dateien-App, Import)
-    static let fileExtensions: Set<String> = ["md", "markdown", "mdown", "mkd", "mkdn"]
     /// Markdown für den Import-Dialog (in Info.plist deklariert, falls iOS den Typ nicht selbst kennt)
     static let contentTypes: [UTType] = [UTType("net.daringfireball.markdown")].compactMap { $0 }
 
-    static func isMarkdown(_ url: URL) -> Bool { fileExtensions.contains(url.pathExtension.lowercased()) }
+    /// Wird die Datei als Markdown gesetzt? Nach dem Inhalt, nicht nach der Endung (iOS kennt Markdown auch unter
+    /// anderen): alles, was nicht in den ersten 1024 Bytes %PDF- hat, wie PDF-Leser es prüfen. Eine kaputte .pdf-Datei
+    /// bleibt beim PDF-Import, der sie mit „Das ist kein PDF“ ablehnt
+    static func isMarkdown(_ url: URL) -> Bool {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let head = (try? FileHandle(forReadingFrom: url)).flatMap { handle -> Data? in
+            defer { try? handle.close() }
+            return try? handle.read(upToCount: 1024)
+        }
+        if let head, head.range(of: Data("%PDF-".utf8)) != nil { return false }
+        return url.pathExtension.lowercased() != "pdf"
+    }
 
     enum Failure: LocalizedError {
-        case tooLarge, notText, noPage, timeout, crashed, script(String), noPDF
+        case tooLarge, notText, empty, noPage, timeout, crashed, script(String), noPDF
 
         var errorDescription: String? {
             switch self {
             case .tooLarge: return "Markdown zu groß (höchstens \(MarkdownTypesetter.maxBytes / 1024) KB)"
             case .notText: return "Die Datei ist kein Text in UTF-8"
+            case .empty: return "Die Datei ist leer"
             case .noPage: return "Antwort.html fehlt in der App"
             case .timeout: return "Setzen des Markdown dauert zu lange"
             case .crashed: return "WebKit wurde beim Setzen beendet"
@@ -40,11 +51,15 @@ enum MarkdownTypesetter {
         }
     }
 
-    /// Der Text einer Markdown-Datei: UTF-8, ein BOM fällt weg
+    /// Der Text einer Markdown-Datei: UTF-8, ein BOM fällt weg. Dieselben Regeln wie im Eingang des Servers
+    /// (markdownText), nie strenger: Was der Eingang annimmt, muss hier durchgehen, sonst setzte es kein Gerät
     static func text(of data: Data) throws -> String {
         guard data.count <= maxBytes else { throw Failure.tooLarge }
         guard var text = String(data: data, encoding: .utf8) else { throw Failure.notText }
         if text.unicodeScalars.first == "\u{FEFF}" { text.unicodeScalars.removeFirst() }
+        // Steuerzeichen außer Tab und Zeilenwechseln: eine Binärdatei (oder UTF-16), kein Text
+        guard !text.unicodeScalars.contains(where: { $0.value <= 0x08 || (0x0E...0x1F).contains($0.value) || $0.value == 0x7F })
+        else { throw Failure.notText }
         return text
     }
 
@@ -106,6 +121,7 @@ enum MarkdownTypesetter {
         }
 
         func run(_ markdown: String, title: String?) async throws -> Data {
+            let start = Date()
             defer {
                 web.navigationDelegate = nil
                 web.stopLoading()
@@ -129,8 +145,11 @@ enum MarkdownTypesetter {
             else { throw Failure.script("unerwartete Antwort der Seite") }
             // So hoch wie das ganze Dokument: Jeder Ausschnitt liegt dann in der Ansicht. Sie hängt in keinem Fenster,
             // zeichnet also nichts auf den Bildschirm (und belegt dafür keinen Speicher)
-            web.frame.size.height = max(CGFloat(layout.height), area.height)
-            return try await compose(layout, title: title)
+            web.frame.size.height = max(ceil(CGFloat(layout.height)) + 2, area.height)
+            let pdf = try await compose(layout, title: title)
+            let seconds = String(format: "%.2f", Date().timeIntervalSince(start))
+            Log.sync.info("Markdown gesetzt: \(markdown.utf8.count) Bytes, \(layout.pages.count) Seiten in \(seconds, privacy: .public) s")
+            return pdf
         }
 
         /// Jede Seite: den Ausschnitt als eigenes PDF von WebKit, mit Rändern auf A4, dazu die Seitenzahl
@@ -146,21 +165,29 @@ enum MarkdownTypesetter {
             for (number, range) in layout.pages.enumerated() {
                 guard range.count == 2, range[1] > range[0] else { continue }
                 if crashed { throw Failure.crashed }
+                // WebKit bekommt ganze Punkte (sonst rundet es selbst, und am Rand fehlte ein Stück einer Linie).
+                // Gezeigt wird danach genau der Ausschnitt range[0] … range[1]
+                let x0 = floor(layout.left), x1 = ceil(layout.left + layout.width)
+                let y0 = floor(range[0]), y1 = ceil(range[1])
                 let config = WKPDFConfiguration()
-                config.rect = CGRect(x: layout.left, y: range[0], width: layout.width, height: range[1] - range[0])
+                config.rect = CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
                 let data = try await web.pdf(configuration: config)
                 guard let provider = CGDataProvider(data: data as CFData),
                       let slice = CGPDFDocument(provider)?.page(at: 1)
                 else { throw Failure.noPDF }
-                // PDF-Koordinaten: Ursprung unten links. Oben bündig mit der Textfläche, ihre Breite füllend
+                // PDF-Koordinaten: Ursprung unten links; f = Einheiten des Ausschnitt-PDFs je Punkt der Ansicht (1).
+                // Oben bündig mit der Textfläche, die Breite des Texts füllt ihre Breite
                 let box = slice.getBoxRect(.mediaBox)
                 guard box.width > 0, box.height > 0 else { throw Failure.noPDF }
-                let scale = area.width / box.width
-                let top = paper.height - area.minY, height = box.height * scale
+                let f = box.width / CGFloat(x1 - x0)
+                let scale = area.width / (CGFloat(layout.width) * f)
+                let top = paper.height - area.minY
+                let shown = CGFloat(range[1] - range[0]) * f * scale
+                let skip = CGFloat(range[0] - y0) * f * scale, left = CGFloat(layout.left - x0) * f * scale
                 ctx.beginPDFPage(nil)
                 ctx.saveGState()
-                ctx.clip(to: CGRect(x: 0, y: top - height, width: paper.width, height: height))
-                ctx.translateBy(x: area.minX, y: top - height)
+                ctx.clip(to: CGRect(x: 0, y: top - shown, width: paper.width, height: shown))
+                ctx.translateBy(x: area.minX - left, y: top + skip - box.height * scale)
                 ctx.scaleBy(x: scale, y: scale)
                 ctx.translateBy(x: -box.minX, y: -box.minY)
                 ctx.drawPDFPage(slice)
@@ -173,11 +200,19 @@ enum MarkdownTypesetter {
             return out as Data
         }
 
-        private func call(_ body: String, _ arguments: [String: Any]) async throws -> Any {
+        /// Das Skript in der Seite, mit einer Frist: Hängt es, wartete sonst jedes spätere Markdown mit
+        private func call(_ body: String, _ arguments: [String: Any], seconds: UInt64 = 120) async throws -> Any {
             do {
                 return try await withCheckedThrowingContinuation { (c: CheckedContinuation<Any, Error>) in
-                    web.callAsyncJavaScript(body, arguments: arguments, in: nil, in: .page) { c.resume(with: $0) }
+                    let once = Once(c)
+                    web.callAsyncJavaScript(body, arguments: arguments, in: nil, in: .page) { once.resume(with: $0) }
+                    Task {
+                        try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+                        once.resume(with: .failure(Failure.timeout))
+                    }
                 }
+            } catch let failure as Failure {
+                throw failure
             } catch {
                 throw crashed ? Failure.crashed : Failure.script(error.localizedDescription)
             }
@@ -207,6 +242,17 @@ enum MarkdownTypesetter {
                      decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
             let url = navigationAction.request.url
             decisionHandler(url?.isFileURL == true && url?.path == page?.path ? .allow : .cancel)
+        }
+    }
+
+    /// Setzt eine Fortsetzung genau einmal fort, wer auch zuerst kommt (Antwort der Seite oder Frist). Beide kommen
+    /// auf dem Hauptthread
+    private final class Once {
+        private var continuation: CheckedContinuation<Any, Error>?
+        init(_ continuation: CheckedContinuation<Any, Error>) { self.continuation = continuation }
+        func resume(with result: Result<Any, Error>) {
+            continuation?.resume(with: result)
+            continuation = nil
         }
     }
 
@@ -266,8 +312,28 @@ enum MarkdownTypesetter {
     out.style.width = width + "px";
     render(md);
     // Erst das Layout anstoßen: Die Schriften von KaTeX laden erst, wenn Text sie braucht
+    const fonts = () => Promise.race([document.fonts.ready, new Promise((done) => setTimeout(done, 5000))]);
     out.getBoundingClientRect();
-    await document.fonts.ready;
+    await fonts();
+
+    // Nummerierte Listen: links Platz für die breiteste Nummer (100., 1000.), sonst stünde sie über den Rand hinaus
+    const em = parseFloat(getComputedStyle(out).fontSize) || 11.5;
+    for (const ol of out.querySelectorAll("ol")) {
+      const items = ol.querySelectorAll(":scope > li");
+      if (!items.length) continue;
+      const last = String(Math.max(1, ol.start || 1) + items.length - 1);
+      const probe = document.createElement("span");
+      probe.style.cssText = "position: absolute; visibility: hidden; white-space: pre;";
+      items[0].appendChild(probe);
+      let need = 0;
+      for (const t of [last, "0".repeat(last.length), "8".repeat(last.length)]) {
+        probe.textContent = t + ". ";
+        need = Math.max(need, probe.getBoundingClientRect().width);
+      }
+      probe.remove();
+      const pad = Math.ceil(need + 0.35 * (parseFloat(getComputedStyle(items[0]).fontSize) || em));
+      if (pad > (parseFloat(getComputedStyle(ol).paddingLeft) || 0)) ol.style.paddingLeft = pad + "px";
+    }
 
     // Zu breite Formeln und Tabellen kleiner setzen (höchstens auf 40 %), statt sie abzuschneiden. Ein paar Punkte
     // zählen nicht: KaTeX hängt an Indizes einen 2 Punkte breiten Abstandhalter, der immer übersteht
@@ -288,7 +354,7 @@ enum MarkdownTypesetter {
     }
     root.classList.add("fitted");
     out.getBoundingClientRect();
-    await document.fonts.ready;
+    await fonts();
 
     // Was nicht durchgeschnitten werden darf: jede Textzeile, jede Formel, jede Tabellenzeile
     const sy = window.scrollY, sx = window.scrollX;
@@ -343,11 +409,14 @@ enum MarkdownTypesetter {
       i = j;
     }
     if (!pages.length) pages.push([0, Math.max(1, Math.min(pageHeight, docHeight))]);
-    // Etwas Luft um jeden Ausschnitt (Unterlängen, Hintergründe), höchstens bis zur Mitte des Abstands zum nächsten
+    // Etwas Luft um jeden Ausschnitt (Unterlängen, Hintergründe), höchstens bis zur Mitte des Abstands zum nächsten.
+    // Mindestens 1 Punkt auch dort, wo nichts dazwischen ist (Tabellenzeilen): Die Linie zwischen zwei Zeilen liegt
+    // genau auf der Grenze und stünde sonst auf keiner der beiden Seiten ganz
     const padded = pages.map(([a, b], k) => {
       const before = k > 0 ? pages[k - 1][1] : 0;
       const after = k + 1 < pages.length ? pages[k + 1][0] : docHeight;
-      return [Math.max(0, Math.max(a - 2, (before + a) / 2)), Math.min(docHeight, Math.min(b + 2, (b + after) / 2))];
+      return [Math.max(0, a - 2, Math.min(a - 1, (before + a) / 2)),
+              Math.min(docHeight, b + 2, Math.max(b + 1, (b + after) / 2))];
     });
     return JSON.stringify({ left: outRect.left + sx, width: outRect.width, height: docHeight, pages: padded });
     """#

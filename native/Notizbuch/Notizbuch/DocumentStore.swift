@@ -34,6 +34,9 @@ struct NoteDocument: Codable, Identifiable, Hashable {
     var folderSet: Date? = nil
 }
 
+/// Import abgelehnt, mit Text für die Meldung
+struct ImportError: LocalizedError { var errorDescription: String? }
+
 @MainActor
 final class DocumentStore: ObservableObject {
     @Published private(set) var documents: [NoteDocument] = []
@@ -102,7 +105,14 @@ final class DocumentStore: ObservableObject {
                                kind: .pdf, created: now, modified: now, pageCount: 0,
                                layoutVersion: PageLayout.currentVersion, folder: inFolder)
         try fm.createDirectory(at: folder(doc.id), withIntermediateDirectories: true)
-        try fm.copyItem(at: url, to: pdfURL(doc.id))
+        do {
+            try fm.copyItem(at: url, to: pdfURL(doc.id))
+            // Nur echte PDFs: Was keins ist, ginge sonst als PDF an alle Geräte
+            guard CGPDFDocument(pdfURL(doc.id) as CFURL) != nil else { throw ImportError(errorDescription: "Das ist kein PDF") }
+        } catch {
+            try? fm.removeItem(at: folder(doc.id))
+            throw error
+        }
         save(doc)
         return doc
     }
@@ -116,13 +126,20 @@ final class DocumentStore: ObservableObject {
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             data = try Data(contentsOf: url)
         }
+        let text = try MarkdownTypesetter.text(of: data)
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw MarkdownTypesetter.Failure.empty }
         let title = url.deletingPathExtension().lastPathComponent
-        let pdf = try await MarkdownTypesetter.pdf(from: try MarkdownTypesetter.text(of: data), title: title)
+        let pdf = try await MarkdownTypesetter.pdf(from: text, title: title)
         let now = Date()
         let doc = NoteDocument(id: UUID(), title: title, kind: .pdf, created: now, modified: now, pageCount: 0,
                                layoutVersion: PageLayout.currentVersion, folder: inFolder)
         try fm.createDirectory(at: folder(doc.id), withIntermediateDirectories: true)
-        try pdf.write(to: pdfURL(doc.id), options: .atomic)
+        do {
+            try pdf.write(to: pdfURL(doc.id), options: .atomic)
+        } catch {
+            try? fm.removeItem(at: folder(doc.id))
+            throw error
+        }
         save(doc)
         return doc
     }

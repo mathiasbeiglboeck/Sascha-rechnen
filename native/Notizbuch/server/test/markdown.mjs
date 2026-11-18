@@ -72,6 +72,15 @@ async function main() {
   ok(same(r.data, utf8("# BOM-Titel\r\nText\r\n")), "BOM fällt weg", Array.from(r.data.slice(0, 4)));
   r = await inbox(utf8("# " + "Lang ".repeat(100)));
   ok(r.status === 200 && r.data.title.length === 200, "Name höchstens 200 Zeichen", r.data.title?.length);
+  // Ein Emoji genau an der Grenze: kein halbes Zeichenpaar im Namen (das JSON wäre für die Apps unlesbar)
+  r = await inbox(utf8("# " + "a".repeat(199) + "😀 Rest\n"));
+  const emoji = r.data.id;
+  ok(r.status === 200 && r.data.title === "a".repeat(199), "Emoji an der Grenze fällt ganz weg", r.data.title?.length);
+  r = await api("GET", "/api/library");
+  const rawLib = await (await fetch(BASE + "/api/library", { headers: H })).text();
+  ok(!/\\ud83d"/i.test(rawLib) && (await entry(emoji)).title === "a".repeat(199), "Bibliothek ohne halbes Zeichenpaar");
+  r = await inbox(PDF("emoji"), "?title=" + encodeURIComponent("b".repeat(199) + "😀"));
+  ok(r.status === 200 && r.data.title === "b".repeat(199), "auch beim PDF-Namen", r.data.title?.length);
 
   console.log("== Abgelehnt");
   const count0 = (await library()).length;
@@ -104,14 +113,18 @@ async function main() {
   ok((await library()).length === before + 2, "nur die zwei PDFs dazu");
 
   console.log("== Das erste gesetzte PDF gilt");
+  const postedAt = (await entry(md)).modified;
+  await new Promise((done) => setTimeout(done, 1100));
   r = await api("PUT", `/api/pdf/${md}?ifMissing=1`, { body: PDF("A"), headers: { "content-type": "application/pdf" } });
   ok(r.status === 200 && r.data.ok === true, "erstes Gerät legt sein PDF ab", r);
+  const typesetAt = (await entry(md)).modified;
+  ok(typesetAt >= postedAt + 1, "gilt ab dem Setzen als geändert (temp, Reihenfolge)", { postedAt, typesetAt });
   r = await api("PUT", `/api/pdf/${md}?ifMissing=1`, { body: PDF("B"), headers: { "content-type": "application/pdf" } });
   ok(r.status === 200 && r.data.ok === false && r.data.exists === true, "zweites bekommt exists", r);
   r = await api("GET", `/api/pdf/${md}`);
   ok(same(r.data, PDF("A")), "am Server liegt das erste");
   e = await entry(md);
-  ok(e.hasPDF === true && e.source === "md", "Bibliothek: jetzt mit PDF", e);
+  ok(e.hasPDF === true && e.source === "md" && e.modified === typesetAt, "Bibliothek: jetzt mit PDF", e);
   r = await api("PUT", `/api/pdf/${uuid()}?ifMissing=1`, { body: PDF("C") });
   ok(r.status === 200 && r.data.gone === true, "unbekanntes Dokument: gone", r);
   r = await api("PUT", `/api/pdf/${bom}?ifMissing=1`, { body: utf8("<html>kein pdf</html>") });
@@ -127,6 +140,8 @@ async function main() {
   ok(winners.length === 1 && results.filter((x) => x.exists === true).length === 3, "gleichzeitig: genau eins gewinnt", results);
   r = await api("GET", `/api/pdf/${race}`);
   ok(winners.length === 1 && same(r.data, PDF(winners[0].t)), "…und sein PDF liegt am Server");
+  r = await api("PUT", `/api/pdf/${race}?ifMissing=1`, { body: PDF("spät") });
+  ok(r.data.exists === true, "später noch einmal: exists, nichts geändert", r.data);
 
   // Ein normales Hochladen (etwa nach dem Löschen von Seiten) ersetzt es wie bisher
   r = await api("PUT", `/api/pdf/${md}`, { body: PDF("neu"), headers: { "content-type": "application/pdf" } });
