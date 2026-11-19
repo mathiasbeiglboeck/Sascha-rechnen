@@ -77,8 +77,17 @@ struct LibraryView: View {
             // (sonst erfährt das andere Gerät erst nach dem Schließen von einem neuen Dokument)
             .task {
                 while !Task.isCancelled {
-                    for id in store.purgeTemp(keeping: Set(tabs.ids)) { sync.noteDeleted(id) }
+                    let before = sync.lastSync
                     await sync.syncLibrary()
+                    // Den temp-Ordner erst nach einem gelungenen Abgleich aufräumen, also auf dem Stand des Servers.
+                    // Sonst löschte ein lange nicht geöffnetes Gerät von seinem alten Stand aus Dokumente, die ein
+                    // anderes inzwischen behalten (verschoben) oder beschrieben hat, und mit ihm überall. Dokumente mit
+                    // noch nicht geholten Strichen bleiben ebenso stehen
+                    if !sync.isConfigured || sync.lastSync != before {
+                        let purged = store.purgeTemp(keeping: Set(tabs.ids).union(sync.unfetched))
+                        for doc in purged { sync.noteDeleted(doc.id, unchangedSince: doc.modified) }
+                        if !purged.isEmpty { await sync.syncLibrary() }
+                    }
                     try? await Task.sleep(for: .seconds(20))
                 }
             }

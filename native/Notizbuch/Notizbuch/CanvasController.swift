@@ -394,6 +394,13 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     var hasUnsyncedLocalChanges: Bool { localChanged }
     var isRestructuring: Bool { restructuring }
 
+    /// Das Dokument kam zurück, nachdem es anderswo gelöscht war: alle Striche noch einmal hinauf (welche das sind,
+    /// weiß der Abgleich)
+    func resendAll() {
+        localChanged = true
+        syncCycle()
+    }
+
     /// Leinwand- in Seitenpunkte
     private var toPage: CGAffineTransform { CGAffineTransform(scaleX: 1 / k, y: 1 / k) }
 

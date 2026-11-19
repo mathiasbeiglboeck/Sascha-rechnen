@@ -26,6 +26,12 @@ struct NoteDocument: Codable, Identifiable, Hashable {
     /// Zeitpunkt (ms) der letzten Seitenänderung (löschen, einfügen) auf irgendeinem Gerät. Seitenzahl und
     /// PDF-Version folgen der neuesten Seitenänderung, nicht der letzten Änderung am Dokument überhaupt
     var pagesVersion: Int? = nil
+    /// Wann der Name zuletzt geändert wurde, auf irgendeinem Gerät (fehlt = seit dem Anlegen nicht). Beim Abgleich
+    /// gewinnt der zuletzt vergebene Name, auch wenn danach auf einem anderen Gerät noch ins Dokument geschrieben
+    /// wurde (das ändert nur `modified`)
+    var titleSet: Date? = nil
+    /// Wann das Dokument zuletzt in einen anderen Ordner kam; wie `titleSet`
+    var folderSet: Date? = nil
 }
 
 @MainActor
@@ -41,6 +47,9 @@ final class DocumentStore: ObservableObject {
     /// Zeichnungen, die gerade geschrieben werden: Wer liest, bekommt sie, nie einen älteren Stand von der Platte
     private var writing: [UUID: PendingDrawing] = [:]
     private var writes = 0
+
+    /// Wird die Zeichnung gerade geschrieben? Erst danach zeigt `modified`, ob sie hier bearbeitet wurde
+    func isWriting(_ id: UUID) -> Bool { writing[id] != nil }
 
     private struct PendingDrawing {
         let number: Int
@@ -114,13 +123,19 @@ final class DocumentStore: ObservableObject {
     /// Nach so vielen Tagen ohne Änderung wird ein Dokument im temp-Ordner gelöscht
     static let tempDays = 14
 
-    /// Löscht Dokumente im temp-Ordner, die seit `tempDays` Tagen nicht geändert wurden (außer den in Tabs offenen);
-    /// gibt ihre IDs zurück
-    func purgeTemp(keeping open: Set<UUID>) -> [UUID] {
+    /// Löscht Dokumente im temp-Ordner, die seit `tempDays` Tagen nicht geändert wurden (außer denen in `keep`, etwa
+    /// den in Tabs offenen); gibt sie zurück. Auch fremde Striche (von anderen Geräten oder Gästen im Browser) zählen
+    /// als Änderung: Sie ändern nur die Zeichnung, nicht `modified`
+    func purgeTemp(keeping keep: Set<UUID>) -> [NoteDocument] {
         let limit = Date().addingTimeInterval(-Double(Self.tempDays) * 86400)
-        let old = documents.filter { $0.folder == Self.tempFolder && $0.modified < limit && !open.contains($0.id) }
+        let old = documents.filter { doc in
+            guard doc.folder == Self.tempFolder, doc.modified < limit, !keep.contains(doc.id), writing[doc.id] == nil
+            else { return false }
+            let written = try? drawingURL(doc.id).resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            return (written ?? .distantPast) < limit
+        }
         for doc in old { delete(doc) }
-        return old.map(\.id)
+        return old
     }
 
     /// Verschiebt ein Dokument in einen Ordner (nil = oberste Ebene); gilt nach dem Sync auf allen Geräten.
@@ -132,8 +147,10 @@ final class DocumentStore: ObservableObject {
         let name = folder?.trimmingCharacters(in: .whitespacesAndNewlines)
         let target = (name?.isEmpty ?? true) ? nil : name
         guard target != d.folder else { return }
+        let now = Date()
         d.folder = target
-        d.modified = Date()
+        d.folderSet = now
+        d.modified = now
         save(d)
     }
 
@@ -147,8 +164,10 @@ final class DocumentStore: ObservableObject {
         // Unverändert ist auch der Name, mit dem der Dialog aufging: Kam inzwischen ein neuer Name von einem anderen
         // Gerät, bliebe der sonst durch bloßes „OK“ überall wieder der alte
         guard !name.isEmpty, name != doc.title, name != d.title else { return }
+        let now = Date()
         d.title = name
-        d.modified = Date()
+        d.titleSet = now
+        d.modified = now
         save(d)
     }
 
@@ -241,6 +260,11 @@ final class DocumentStore: ObservableObject {
         io.async {
             if let data = make() { try? data.write(to: url, options: .atomic) }
         }
+    }
+
+    /// Wartet, bis alles bisher zum Schreiben Angestoßene auf der Platte ist (hält so lange an, also nur selten nutzen)
+    func waitForWrites() {
+        io.sync {}
     }
 
     /// Seiten wurden gelöscht oder eingefügt (bei PDFs auch das PDF selbst geändert): Die anderen Geräte
