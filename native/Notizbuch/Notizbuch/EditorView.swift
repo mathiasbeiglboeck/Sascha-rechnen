@@ -12,11 +12,14 @@ enum ToolMode {
 final class ToolState: ObservableObject {
     static let colors: [UIColor] = [
         UIColor(red: 0.10, green: 0.10, blue: 0.11, alpha: 1), // schwarz
-        UIColor(red: 0.12, green: 0.27, blue: 0.64, alpha: 1), // blau
-        UIColor(red: 0.80, green: 0.17, blue: 0.15, alpha: 1), // rot
-        UIColor(red: 0.13, green: 0.52, blue: 0.29, alpha: 1), // grün
-        UIColor(red: 0.92, green: 0.52, blue: 0.10, alpha: 1), // orange
+        UIColor(red: 0.52, green: 0.52, blue: 0.54, alpha: 1), // grau
+        // Blau, Rot, Grün und Orange wie in Mathias' Notizen (aus seinem Bild gemessen, Display P3)
+        UIColor(displayP3Red: 0x1D / 255.0, green: 0x45 / 255.0, blue: 0x8A / 255.0, alpha: 1), // blau
+        UIColor(displayP3Red: 0x6B / 255.0, green: 0x13 / 255.0, blue: 0x0A / 255.0, alpha: 1), // rot
+        UIColor(displayP3Red: 0x2B / 255.0, green: 0x64 / 255.0, blue: 0x53 / 255.0, alpha: 1), // grün
+        UIColor(displayP3Red: 0xE8 / 255.0, green: 0x9F / 255.0, blue: 0x43 / 255.0, alpha: 1), // orange
     ]
+    static let colorNames = ["Schwarz", "Grau", "Blau", "Rot", "Grün", "Orange"]
     /// Strichbreiten in Seitenpunkten (Seite = 768 Punkte breit)
     static let widths: [CGFloat] = [1.2, 2.2, 3.5, 5.5, 9]
 
@@ -425,7 +428,7 @@ struct ToolBar: View {
                         tools.colorIndex = i
                         tools.mode = .pen
                     } label: {
-                        Label(["Schwarz", "Blau", "Rot", "Grün", "Orange"][i], systemImage: "circle.fill")
+                        Label(ToolState.colorNames[i], systemImage: "circle.fill")
                     }
                 }
             } label: {
