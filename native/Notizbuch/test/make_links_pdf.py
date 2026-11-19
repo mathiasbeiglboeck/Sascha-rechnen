@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Baut links.pdf: ein Test-PDF mit Links an Stellen im selben Dokument (für die Vorschau beim Halten des Radierers).
+"""Baut links.pdf: ein Test-PDF mit Links (für die Vorschau beim Halten des Radierers).
 
-Seite 1 hat sechs Links in verschiedenen Formen, wie sie PDFs aus LaTeX (hyperref) oder Word enthalten:
+Seite 1 hat acht Links in verschiedenen Formen, wie sie PDFs aus LaTeX (hyperref) oder Word enthalten:
   0 explizites Ziel (Seite 3, y 500)
   1 benanntes Ziel über „Gehe zu“ (Seite 2, y 300, im Namensbaum wie bei LaTeX)
   2 benanntes Ziel direkt am Link (Seite 2, y 600, Namensbaum)
   3 „Gehe zu“ mit explizitem Ziel „ganze Seite“ (Seite 2)
-  4 Internet (zählt nicht)                  5 Befehl „nächste Seite“ (zählt nicht)
+  4 Internet über https (Webseite)          5 Befehl „nächste Seite“ (Seite 2 oben)
+  6 Internet über http (die Vorschau lädt über https)
+  7 E-Mail (zählt nicht)
 Benannte Ziele im alten /Dests-Wörterbuch (wie aus Chrome) deckt links-browser.pdf ab (make_links_browser.js).
 Seite 3 hat einen beschnittenen Rahmen (CropBox) und einen Link zurück, Seite 4 ist gedreht und hat einen Link.
 Jedes Ziel ist auf seiner Seite mit einer roten Linie markiert, die Schrift „Ziel …“ steht direkt darunter.
@@ -130,10 +132,11 @@ def test_pages():
     link_line(72, 660, "1: Ziel B (Seite 2, benannt, Gehe zu)", "/A << /S /GoTo /D (zielB) >>", a1, c1)
     link_line(72, 620, "2: Ziel C (Seite 2, benannt)", "/Dest (zielC)", a1, c1)
     link_line(72, 580, "3: Seite 2 (ganze Seite, Gehe zu)", "/A << /S /GoTo /D [%s /Fit] >>" % ref(P[1]), a1, c1)
-    link_line(72, 540, "4: example.com (Internet, keine Vorschau)",
-              "/A << /S /URI /URI (https://example.com/) >>", a1, c1)
-    link_line(72, 500, "5: Nächste Seite (Befehl, keine Vorschau)", "/A << /S /Named /N /NextPage >>", a1, c1)
-    filler(440, 80, c1)
+    link_line(72, 540, "4: example.com (Internet, Webseite)", "/A << /S /URI /URI (https://example.com/) >>", a1, c1)
+    link_line(72, 500, "5: Nächste Seite (Befehl, Seite 2 oben)", "/A << /S /Named /N /NextPage >>", a1, c1)
+    link_line(72, 460, "6: example.com über http (Webseite)", "/A << /S /URI /URI (http://example.com/) >>", a1, c1)
+    link_line(72, 420, "7: E-Mail (keine Vorschau)", "/A << /S /URI /URI (mailto:test@example.com) >>", a1, c1)
+    filler(370, 80, c1)
     pages.append(("/MediaBox [0 0 595 842]", c1, a1))
 
     # Seite 2: Ziele B (y 300) und C (y 600)

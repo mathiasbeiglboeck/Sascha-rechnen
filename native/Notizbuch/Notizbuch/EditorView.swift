@@ -12,7 +12,7 @@ enum ToolMode {
 final class ToolState: ObservableObject {
     static let colors: [UIColor] = [
         UIColor(red: 0.10, green: 0.10, blue: 0.11, alpha: 1), // schwarz
-        UIColor(red: 0.52, green: 0.52, blue: 0.54, alpha: 1), // grau
+        UIColor(red: 0.66, green: 0.66, blue: 0.68, alpha: 1), // grau
         // Blau, Rot, Grün und Orange wie in Mathias' Notizen (aus seinem Bild gemessen, Display P3)
         UIColor(displayP3Red: 0x1D / 255.0, green: 0x45 / 255.0, blue: 0x8A / 255.0, alpha: 1), // blau
         UIColor(displayP3Red: 0x6B / 255.0, green: 0x13 / 255.0, blue: 0x0A / 255.0, alpha: 1), // rot
@@ -20,11 +20,23 @@ final class ToolState: ObservableObject {
         UIColor(displayP3Red: 0xE8 / 255.0, green: 0x9F / 255.0, blue: 0x43 / 255.0, alpha: 1), // orange
     ]
     static let colorNames = ["Schwarz", "Grau", "Blau", "Rot", "Grün", "Orange"]
-    /// Strichbreiten in Seitenpunkten (Seite = 768 Punkte breit)
-    static let widths: [CGFloat] = [1.2, 2.2, 3.5, 5.5, 9]
+    /// Eingestellte Strichbreiten in Seitenpunkten (Seite = 768 Punkte breit, 1 Punkt ≈ 0,27 mm auf A4). Gezeichnet
+    /// werden sie anders: PencilKits Stift (.pen) brachte bei Mathias' Druck nur etwa 0,69 + 0,22 × Breite aufs Papier
+    /// (gemessen 19.11. an seiner Seite mit den Stufen von 120) und geht nur von etwa 0,88 bis 25,66 Punkte der
+    /// Leinwand. Daraus zurückgerechnet, damit die Striche geometrisch gleichmäßig werden, je etwa 1,7-mal so dick wie
+    /// der vorige: gezeichnet ≈ 0,45 · 0,83 · 1,39 · 2,32 · 3,88 (≈ 0,12 · 0,23 · 0,38 · 0,63 · 1,06 mm). Die dünnste
+    /// ist der Feinstift mit fester Breite (.monoline, ohne Druck), die zweite der Stift an seiner Untergrenze. Die
+    /// dickste passt auch quer am 13-Zoll-iPad noch unter die Obergrenze (14,3 × 1376/768 = 25,6), so wird sie hochkant
+    /// und quer gleich dick. Fester Druck macht die dicken Stufen deutlich dicker
+    static let widths: [CGFloat] = [0.45, 0.65, 3.15, 7.3, 14.3]
+    /// Die dünnste Stufe zeichnet der Feinstift (siehe CanvasController.inkingTool)
+    static let fineIndex = 0
+    /// Durchmesser der Punkte, die in der Leiste für die Dicken stehen: gleiche Schritte wie die Wurzel der Dicke
+    static let widthDots: [CGFloat] = [3, 6.5, 10, 13.5, 17]
 
     @Published var colorIndex = 0
-    @Published var widthIndex = 1
+    /// Beim Start Dicke 3 (≈ 0,38 mm), am nächsten an der bisherigen Startdicke (120: ≈ 0,32 mm)
+    @Published var widthIndex = 2
     @Published var mode = ToolMode.pen
     /// Am iPhone startet jedes Dokument im Nur-Sehen-Modus
     @Published var viewOnly = UIDevice.current.userInterfaceIdiom == .phone
@@ -86,10 +98,21 @@ struct EditorView: View {
     /// Höhe der Tab-Zeile samt Abstand zur Leiste
     static let tabRowHeight: CGFloat = 32
 
+    /// Am iPad zeichnet die App die Zeile über der Leiste selbst (Uhrzeit, Tabs, Akku) statt der Statusleiste des
+    /// Systems: So stehen die Tabs oben zwischen Uhrzeit und Akku, und eine Zeile wird frei. Erst ab iPadOS 26: Davor
+    /// läge oben in der Mitte der Knopf fürs Multitasking („•••“) über den Tabs; ab 26 sitzen die Fensterknöpfe links,
+    /// und die Zeile weicht ihnen aus (StatusLine)
+    private var ownStatusLine: Bool {
+        guard UIDevice.current.userInterfaceIdiom == .pad else { return false }
+        if #available(iOS 26, *) { return true }
+        return false
+    }
     private var collapsed: Bool { UIDevice.current.userInterfaceIdiom == .pad && tools.menuCollapsed }
     /// Tabs stehen über der Leiste, wenn sie eingeblendet und ausgeklappt ist; auch ein einzelner, damit sich jeder
     /// Tab mit seinem Kreuz schließen lässt (der letzte führt zurück zur Übersicht)
     private var tabsShown: Bool { !tools.menusHidden && !collapsed && !tabs.ids.isEmpty }
+    /// Was über der Leiste steht: am iPad die eigene Zeile, am iPhone die Tabs
+    private var aboveBar: CGFloat { ownStatusLine ? StatusLine.height : (tabsShown ? Self.tabRowHeight : 0) }
 
     var body: some View {
         // Leiste als Overlay: Wird sie breiter, darf das nie die Größe der Leinwand ändern
@@ -98,14 +121,16 @@ struct EditorView: View {
                 ZStack(alignment: .top) {
                     if !tools.menusHidden {
                         VStack(spacing: 6) {
-                            if tabsShown {
+                            if ownStatusLine {
+                                StatusLine(tabs: tabs, showTabs: tabsShown) { tools.canvas?.scrollToTop() }
+                            } else if tabsShown {
                                 TabStrip(tabs: tabs)
                                     .transition(.opacity)
                             }
                             ToolBar(tools: tools, onClose: { tabs.closeEditor() })
                                 .padding(.horizontal, 12)
                         }
-                        .padding(.top, 6)
+                        .padding(.top, ownStatusLine ? 0 : 6)
                         .transition(.move(edge: .top).combined(with: .opacity))
                     }
 
@@ -118,18 +143,20 @@ struct EditorView: View {
                             .padding(.horizontal, 14).padding(.vertical, 7)
                             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 17, style: .continuous))
                             .padding(.horizontal, 16)
-                            .padding(.top, tools.menusHidden ? 10 : 64 + (tabsShown ? Self.tabRowHeight : 0))
+                            .padding(.top, tools.menusHidden ? 10 : 64 + aboveBar)
                             .transition(.opacity)
                     }
                 }
             }
             .background {
                 // Je Tab und Wechsel eine eigene Leinwand: Die vorige ist da schon geschlossen (TabsModel). Platz für
-                // die Tab-Zeile hat sie immer, auch bei eingeklappter Leiste: Die Zeile kommt und geht ohne neue
-                // Leinwand (Ausklappen, Menüs ein), ihr Rand oben gilt aber ab dem Öffnen
+                // die Tab-Zeile (am iPad die eigene Zeile) hat sie immer, auch bei eingeklappter Leiste: Die Zeile
+                // kommt und geht ohne neue Leinwand (Ausklappen, Menüs ein), ihr Rand oben gilt aber ab dem Öffnen
                 if let doc = tabs.activeDocument {
                     CanvasRepresentable(doc: doc, store: store, sync: sync, tools: tools,
-                                        start: tabs.viewport(for: doc.id), topExtra: Self.tabRowHeight)
+                                        start: tabs.viewport(for: doc.id),
+                                        topExtra: ownStatusLine ? StatusLine.height : Self.tabRowHeight,
+                                        ownStatusLine: ownStatusLine)
                         .id("\(doc.id.uuidString)-\(tabs.generation)")
                         .ignoresSafeArea()
                 }
@@ -139,11 +166,17 @@ struct EditorView: View {
         .overlay {
             if tools.overviewShown, let canvas = tools.canvas {
                 PageOverview(controller: canvas) { tools.overviewShown = false }
+                    // Auch über der Übersicht die eigene Zeile statt der Statusleiste: Kommt diese beim Öffnen wieder,
+                    // ändert sich der sichere Bereich, und Leiste und Leinwand darunter springen
+                    .safeAreaInset(edge: .top, spacing: 0) {
+                        if ownStatusLine { StatusLine(tabs: tabs, showTabs: false) }
+                    }
                     .transition(.opacity)
             }
         }
         .animation(.easeOut(duration: 0.15), value: tools.overviewShown)
-        .statusBarHidden(tools.menusHidden)
+        // Am iPad ersetzt die eigene Zeile die Statusleiste, auch über der Seitenübersicht
+        .statusBarHidden(tools.menusHidden || ownStatusLine)
         .persistentSystemOverlays(tools.menusHidden ? .hidden : .automatic)
         .animation(.easeOut(duration: 0.2), value: tools.menusHidden)
         .animation(.easeOut(duration: 0.2), value: tools.menuCollapsed)
@@ -153,10 +186,12 @@ struct EditorView: View {
         // Nur für Tests im Simulator: notizbuch://debug/… (CanvasController.debugCommand)
         .onOpenURL { url in
             guard url.scheme == "notizbuch", url.host == "debug" else { return }
-            // debug/tool?mode=pen|eraser|lasso|pointer&edit: Werkzeug wie in der Leiste wählen (edit: wie „Bearbeiten“)
+            let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            func value(_ name: String) -> String? { items.first { $0.name == name }?.value }
+            // debug/tool?mode=pen|eraser|lasso|pointer&edit: Werkzeug wie in der Leiste wählen (edit: wie „Bearbeiten“);
+            // &width=0…4, &overview=1|0 (Seitenübersicht), &collapsed=1|0 (eingeklappte Leiste), &menus=0|1 (Menüs aus/an)
             if url.path == "/tool" {
-                let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
-                switch items.first(where: { $0.name == "mode" })?.value {
+                switch value("mode") {
                 case "pen"?: tools.mode = .pen
                 case "eraser"?: tools.mode = .eraser
                 case "lasso"?: tools.mode = .lasso
@@ -164,6 +199,15 @@ struct EditorView: View {
                 default: break
                 }
                 if items.contains(where: { $0.name == "edit" }) { tools.viewOnly = false }
+                if let i = value("width").flatMap({ Int($0) }), ToolState.widths.indices.contains(i) { tools.widthIndex = i }
+                if let v = value("overview") { tools.overviewShown = v == "1" }
+                if let v = value("collapsed") { tools.menuCollapsed = v == "1" }
+                if let v = value("menus") { tools.menusHidden = v == "0" }
+                return
+            }
+            // debug/awake?lowpower=1|0|auto&seconds=N: Stromsparmodus vortäuschen, Frist verkürzen; meldet den Stand
+            if url.path == "/awake" {
+                KeepAwake.shared.debug(lowPower: value("lowpower"), seconds: value("seconds").flatMap { Double($0) })
                 return
             }
             tools.canvas?.debugCommand(url)
@@ -179,11 +223,14 @@ struct CanvasRepresentable: UIViewControllerRepresentable {
     @ObservedObject var tools: ToolState
     /// Wo die Leinwand öffnet (zurück in einem Tab); nil = oben
     var start: Viewport? = nil
-    /// Platz für die Tabs über der Leiste
+    /// Platz für die Tabs über der Leiste (am iPad für die eigene Zeile)
     var topExtra: CGFloat = 0
+    /// Am iPad steht die eigene Zeile an Stelle der Statusleiste des Systems
+    var ownStatusLine = false
 
     func makeUIViewController(context: Context) -> CanvasController {
-        let controller = CanvasController(doc: doc, store: store, sync: sync, start: start, topExtra: topExtra)
+        let controller = CanvasController(doc: doc, store: store, sync: sync, start: start, topExtra: topExtra,
+                                          ownStatusLine: ownStatusLine)
         controller.onFlash = { [weak tools] in tools?.show($0) }
         controller.onFlashTimed = { [weak tools] in tools?.show($0, seconds: $1) }
         // Gästezahl nur für das Dokument, das gerade zu sehen ist: Eine späte Antwort einer schon verlassenen Leinwand
@@ -201,6 +248,7 @@ struct CanvasRepresentable: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: CanvasController, context: Context) {
         controller.apply(color: ToolState.colors[tools.colorIndex],
                          width: ToolState.widths[tools.widthIndex],
+                         fine: tools.widthIndex == ToolState.fineIndex,
                          mode: tools.mode,
                          viewOnly: tools.viewOnly)
     }
@@ -217,12 +265,18 @@ struct ToolBar: View {
     @ObservedObject var tools: ToolState
     let onClose: () -> Void
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.colorScheme) private var colorScheme
+
+    /// Hintergrund der Leiste: durchscheinend wie die Tabs dahinter, ohne Schatten (Wunsch 19.11., zum Ausprobieren)
+    static let backgroundOpacity: Double = 0.55
 
     var body: some View {
         if isPad && tools.menuCollapsed {
             collapsedBar
         } else if sizeClass == .compact {
-            bar(spacing: 7, compact: true)
+            // Am iPhone (und in schmalen Fenstern am iPad) über die ganze Breite: Jedes Feld wird so breit, wie Platz
+            // ist, und so hoch wie die Leiste, das Tippen geht leichter
+            bar(spacing: 0, compact: true, wide: true)
         } else {
             // Schmale iPads (iPad mini: 744 bis 768 Punkte im Hochformat) und geteilter Bildschirm: erst enger, dann
             // wie am iPhone, statt über den Rand hinaus
@@ -234,22 +288,28 @@ struct ToolBar: View {
         }
     }
 
-    private func bar(spacing: CGFloat, compact: Bool) -> some View {
+    private func bar(spacing: CGFloat, compact: Bool, wide: Bool = false) -> some View {
         HStack(spacing: spacing) {
             Button(action: onClose) {
-                Image(systemName: "chevron.left").font(.body.weight(.semibold))
+                Image(systemName: "chevron.left").font(.body.weight(.semibold)).cell(wide)
             }
-            Button { tools.overviewShown = true } label: { Image(systemName: "square.grid.3x3") }
+            Button { tools.overviewShown = true } label: { Image(systemName: "square.grid.3x3").cell(wide) }
             divider
             if tools.viewOnly {
-                shareMenu
+                shareMenu(wide)
                 divider
                 Button { tools.viewOnly = false } label: {
+                    // Nie gekürzt und nie über die Nachbarn: Das Feld ist genau so breit wie die Beschriftung, die
+                    // anderen teilen sich den Rest
                     Label("Bearbeiten", systemImage: "pencil.tip").labelStyle(.titleAndIcon)
+                        .padding(.horizontal, wide ? 10 : 0)
+                        .frame(minHeight: wide ? 44 : nil)
+                        .contentShape(Rectangle())
+                        .fixedSize()
                 }
             } else {
             if compact {
-                compactPickers
+                compactPickers(wide)
             } else {
                 colorButtons
                 divider
@@ -258,33 +318,41 @@ struct ToolBar: View {
             divider
             if compact {
                 // Am iPhone ist zu wenig Platz: Werkzeuge in einem Menü
-                modeMenu
+                modeMenu(wide)
             } else {
                 modeButton(.pointer, symbol: "scribble", tint: Color(uiColor: PointerOverlay.ownColor))
                 modeButton(.eraser, symbol: "eraser")
                 modeButton(.lasso, symbol: "lasso")
             }
-            Button { tools.canvas?.undo() } label: { Image(systemName: "arrow.uturn.backward") }
-            Button { tools.canvas?.redo() } label: { Image(systemName: "arrow.uturn.forward") }
+            Button { tools.canvas?.undo() } label: { Image(systemName: "arrow.uturn.backward").cell(wide) }
+            Button { tools.canvas?.redo() } label: { Image(systemName: "arrow.uturn.forward").cell(wide) }
             divider
-            shareMenu
+            shareMenu(wide)
             if UIDevice.current.userInterfaceIdiom == .phone {
                 divider
-                Button { tools.viewOnly = true } label: { Image(systemName: "eye") }
+                Button { tools.viewOnly = true } label: { Image(systemName: "eye").cell(wide) }
             }
             if isPad {
                 divider
-                Button { tools.menuCollapsed = true } label: { Image(systemName: "arrow.down.right.and.arrow.up.left") }
-                    .accessibilityLabel("Leiste einklappen")
+                Button { tools.menuCollapsed = true } label: {
+                    Image(systemName: "arrow.down.right.and.arrow.up.left").cell(wide)
+                }
+                .accessibilityLabel("Leiste einklappen")
             }
             }
         }
         .font(.body)
         .tint(.primary)
-        .padding(.horizontal, compact ? 12 : 16)
-        .padding(.vertical, 8)
-        .background(.regularMaterial, in: Capsule())
-        .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+        .padding(.horizontal, wide ? 6 : (compact ? 12 : 16))
+        .padding(.vertical, wide ? 2 : 8)
+        // Quer am iPhone nicht über die ganze, sehr breite Zeile
+        .frame(maxWidth: wide ? 600 : nil)
+        .background { Self.background }
+    }
+
+    /// Halbdurchsichtig wie die Tabs hinter dem vorderen
+    private static var background: some View {
+        Capsule().fill(.regularMaterial).opacity(backgroundOpacity)
     }
 
     private var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
@@ -302,13 +370,12 @@ struct ToolBar: View {
         .tint(.primary)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(.regularMaterial, in: Capsule())
-        .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+        .background { Self.background }
     }
 
-    private var shareMenu: some View {
+    private func shareMenu(_ wide: Bool) -> some View {
         HStack(spacing: 4) {
-            shareMenuButton
+            shareMenuButton(wide)
             // Außerhalb des Menüs: dessen Beschriftung zeigt nur Symbole, die Zahl fehlte sonst
             if let n = tools.guests, n > 0 {
                 Image(systemName: "eye").font(.caption)
@@ -317,7 +384,7 @@ struct ToolBar: View {
         }
     }
 
-    private var shareMenuButton: some View {
+    private func shareMenuButton(_ wide: Bool) -> some View {
         Menu {
             Button { tools.canvas?.startLiveSharing() } label: { Label("Live teilen (Link)", systemImage: "link") }
             if tools.guests != nil {
@@ -339,7 +406,7 @@ struct ToolBar: View {
                 Button { share(.sendDocumentTo("chatgpt")) } label: { Label("Ganzes Dokument", systemImage: "doc.on.doc") }
             } label: { Label("An ChatGPT senden", systemImage: "tray.and.arrow.up") }
         } label: {
-            Image(systemName: "square.and.arrow.up")
+            Image(systemName: "square.and.arrow.up").cell(wide)
         }
     }
 
@@ -350,7 +417,7 @@ struct ToolBar: View {
     }
 
     /// Stift, Zeigestift, Radierer und Lasso in einem Menü; zeigt das aktuelle Werkzeug
-    private var modeMenu: some View {
+    private func modeMenu(_ wide: Bool) -> some View {
         Menu {
             Button { tools.mode = .pen } label: { Label("Stift", systemImage: "pencil.tip") }
             Button { tools.mode = .pointer } label: { Label("Zeigestift", systemImage: "scribble") }
@@ -361,6 +428,7 @@ struct ToolBar: View {
                 .foregroundStyle(tools.mode == .pointer ? Color(uiColor: PointerOverlay.ownColor) : Color.primary)
                 .padding(5)
                 .background(tools.mode == .pen ? Color.clear : Color.primary.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+                .cell(wide)
         }
     }
 
@@ -409,7 +477,7 @@ struct ToolBar: View {
             let selected = tools.widthIndex == i
             Circle()
                 .fill(Color.primary.opacity(selected ? 0.9 : 0.3))
-                .frame(width: 4 + CGFloat(i) * 3, height: 4 + CGFloat(i) * 3)
+                .frame(width: ToolState.widthDots[i], height: ToolState.widthDots[i])
                 .frame(width: 24, height: 24)
                 .contentShape(Rectangle())
                 .onTapGesture {
@@ -419,9 +487,10 @@ struct ToolBar: View {
         }
     }
 
-    /// Am iPhone ist zu wenig Platz: Farbe und Dicke je als kleines Menü
-    private var compactPickers: some View {
-        HStack(spacing: 14) {
+    /// Am iPhone ist zu wenig Platz: Farbe und Dicke je als kleines Menü. Zwei eigene Felder der Leiste (Group statt
+    /// HStack): In der breiten Leiste bekommt so jedes so viel Platz wie die anderen
+    private func compactPickers(_ wide: Bool) -> some View {
+        Group {
             Menu {
                 ForEach(ToolState.colors.indices, id: \.self) { i in
                     Button {
@@ -432,8 +501,10 @@ struct ToolBar: View {
                     }
                 }
             } label: {
-                Circle().fill(Color(uiColor: ToolState.colors[tools.colorIndex])).frame(width: 20, height: 20)
+                Self.dot(ToolState.colors[tools.colorIndex], diameter: 20).cell(wide)
             }
+            // Schmales iPad: wie bisher etwas mehr Abstand zwischen Farbe und Dicke
+            .padding(.trailing, wide ? 0 : 7)
             Menu {
                 ForEach(ToolState.widths.indices, id: \.self) { i in
                     Button("Dicke \(i + 1)") {
@@ -442,10 +513,33 @@ struct ToolBar: View {
                     }
                 }
             } label: {
-                Circle().fill(Color.primary).frame(width: 4 + CGFloat(tools.widthIndex) * 3,
-                                                   height: 4 + CGFloat(tools.widthIndex) * 3)
-                    .frame(width: 24, height: 24)
+                Self.dot(colorScheme == .dark ? .white : UIColor(white: 0.1, alpha: 1),
+                         diameter: ToolState.widthDots[tools.widthIndex]).cell(wide)
             }
+        }
+    }
+
+    /// Ein gefüllter Kreis als fertiges Bild (24 × 24 Punkte): Die Beschriftung eines Menüs zeigt ein Bild verlässlich
+    /// so, wie es ist; der Punkt für die Dicke war als Form darin am iPhone nicht zu sehen
+    private static func dot(_ color: UIColor, diameter: CGFloat) -> some View {
+        let box: CGFloat = 24
+        let image = UIGraphicsImageRenderer(size: CGSize(width: box, height: box)).image { _ in
+            color.setFill()
+            UIBezierPath(ovalIn: CGRect(x: (box - diameter) / 2, y: (box - diameter) / 2,
+                                        width: diameter, height: diameter)).fill()
+        }
+        return Image(uiImage: image.withRenderingMode(.alwaysOriginal)).renderingMode(.original)
+    }
+}
+
+private extension View {
+    /// Ein Feld der breiten Leiste am iPhone: so breit, wie Platz ist (alle gleich), und 44 Punkte hoch; die ganze
+    /// Fläche nimmt das Tippen an, nicht nur das Symbol
+    @ViewBuilder func cell(_ wide: Bool) -> some View {
+        if wide {
+            frame(maxWidth: .infinity, minHeight: 44).contentShape(Rectangle())
+        } else {
+            self
         }
     }
 }

@@ -45,6 +45,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     private var inkColor = UIColor.black
     private var inkWidth: CGFloat = 2
+    /// Dünnste Stufe: Feinstift mit fester Breite statt des Stifts mit Druck
+    private var inkFine = false
     private var erasing = false
     private var lasso = false
     private var pointing = false
@@ -88,7 +90,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     /// ein neues PDF oder ein inzwischen geöffnetes Fenster (etwa eine Antwort) bricht das ab: Sie soll nie mitten in
     /// etwas anderem auftauchen
     private var linkPresentation: Task<Void, Never>?
-    private weak var linkPreview: LinkPreviewController?
+    /// Das offene Fenster einer Vorschau (eine Stelle im PDF oder eine Seite im Internet)
+    private weak var linkPreview: UIViewController?
     /// Kreis um den Radierer, der sich bis zur Vorschau füllt
     private let holdRing = CAShapeLayer()
     /// Kurzes Tippen im Pencil Pro (am iPhone im Gerät), wenn die Vorschau kommt (UICanvasFeedbackGenerator, ab iOS 17.5)
@@ -96,13 +99,13 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     /// Der Radierer wartet auf einem Link, ob er still bleibt
     private struct LinkHold {
-        let target: LinkTarget
+        let goal: LinkGoal
         /// Wo er aufsetzte: in der Ansicht (für den Spielraum) und in der Zeichnung (ohne Zoom, zum Radieren: Der Zoom
         /// kann sich während des Wartens noch ändern, etwa wenn er nach dem Aufziehen zurückfedert)
         let viewPoint: CGPoint
         let drawingPoint: CGPoint
         let timers: [DispatchWorkItem]
-        /// Bilder der Vorschau: Sie werden ab dem Erscheinen des Kreises im Hintergrund gezeichnet
+        /// Bilder der Vorschau einer Stelle im PDF: Sie werden ab dem Erscheinen des Kreises im Hintergrund gezeichnet
         var images: Task<LinkPreviewImages?, Never>?
     }
 
@@ -110,15 +113,19 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     /// Wo die Leinwand öffnet: zurück in einem Tab dort, wo er zuletzt stand (nil = oben)
     private let start: Viewport?
-    /// Zusätzlicher Rand oben für die Tab-Zeile über der Leiste
+    /// Zusätzlicher Rand oben für die Tab-Zeile über der Leiste (am iPad für die eigene Zeile)
     private let topExtra: CGFloat
+    /// Am iPad steht die eigene Zeile (Uhrzeit, Tabs, Akku) an Stelle der Statusleiste des Systems
+    private let ownStatusLine: Bool
 
-    init(doc: NoteDocument, store: DocumentStore, sync: SyncEngine, start: Viewport? = nil, topExtra: CGFloat = 0) {
+    init(doc: NoteDocument, store: DocumentStore, sync: SyncEngine, start: Viewport? = nil, topExtra: CGFloat = 0,
+         ownStatusLine: Bool = false) {
         self.doc = doc
         self.store = store
         self.sync = sync
         self.start = start
         self.topExtra = topExtra
+        self.ownStatusLine = ownStatusLine
         pageCount = max(doc.pageCount, 1)
         super.init(nibName: nil, bundle: nil)
     }
@@ -254,8 +261,11 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         guard abs(newK - k) > 0.0001 else { return }
 
         if k == 0 {
-            // Erstes Layout: Ränder einmalig festlegen und Zeichnung laden (stehen Tabs über der Leiste, oben mehr Platz)
-            let top = view.safeAreaInsets.top + 56 + topExtra
+            // Erstes Layout: Ränder einmalig festlegen und Zeichnung laden (stehen Tabs über der Leiste, oben mehr Platz).
+            // Mit der eigenen Zeile am iPad zählt die Statusleiste des Systems nicht: Sie wird ausgeblendet, ist es
+            // beim ersten Layout aber vielleicht noch nicht
+            let statusBar = ownStatusLine ? (view.window?.windowScene?.statusBarManager?.statusBarFrame.height ?? 0) : 0
+            let top = max(view.safeAreaInsets.top - statusBar, 0) + 56 + topExtra
             canvas.contentInset = UIEdgeInsets(top: top, left: 0, bottom: view.safeAreaInsets.bottom + 24, right: 0)
             canvas.verticalScrollIndicatorInsets = canvas.contentInset
             // Erst Seiten und Größe der Leinwand, dann die Tinte: PencilKit legt seine Kacheln so gleich für die
@@ -756,6 +766,17 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         sendView()
     }
 
+    /// Wie ein Tippen auf die Statusleiste des Systems: ganz nach oben. Am iPad steht statt ihr die eigene Zeile, und
+    /// ein Tippen auf deren Uhrzeit oder Akku tut dasselbe
+    func scrollToTop() {
+        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -canvas.contentInset.top), animated: true)
+    }
+
+    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+        // Die Endlage auch dann an Gäste, wenn das letzte Scrollen in die Drosselung fiel
+        sendView(force: true)
+    }
+
     func startLiveSharing() {
         guard sync.isConfigured else {
             onFlash("Erst den Server einrichten (Zahnrad in der Übersicht)")
@@ -859,7 +880,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     // MARK: Werkzeuge
 
-    func apply(color: UIColor, width: CGFloat, mode: ToolMode, viewOnly: Bool = false) {
+    func apply(color: UIColor, width: CGFloat, fine: Bool = false, mode: ToolMode, viewOnly: Bool = false) {
         // Radierer wird abgewählt, während der Pencil weg ist (etwa mit dem Finger über die Leiste): das Neuzeichnen
         // nach dem Radieren gleich erledigen. Nach dem Doppeltippen schwebt er meist noch; dann wartet es, bis er weg
         // ist (siehe redrawInkSoon)
@@ -867,10 +888,18 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         self.viewOnly = viewOnly
         inkColor = color
         inkWidth = width
+        inkFine = fine
         erasing = mode == .eraser
         lasso = mode == .lasso
         pointing = mode == .pointer
         applyTool()
+    }
+
+    /// Der Stift für Farbe und Dicke. Die Breite gilt in Seitenpunkten und wächst mit der Leinwand. Die dünnste Stufe
+    /// zeichnet der Feinstift (.monoline): fest breit, ohne Druck, und dünner, als PencilKits Stift (.pen) überhaupt
+    /// geht (etwa 0,88 Punkte der Leinwand). Die anderen Stufen zeichnet der Stift mit Druck wie bisher
+    private func inkingTool() -> PKInkingTool {
+        PKInkingTool(inkFine ? .monoline : .pen, color: inkColor, width: inkWidth * max(k, 0.5))
     }
 
     private func applyTool() {
@@ -881,7 +910,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         if lasso && !viewOnly {
             if !(canvas.tool is PKLassoTool) { canvas.tool = PKLassoTool() }
         } else {
-            canvas.tool = PKInkingTool(.pen, color: inkColor, width: inkWidth * max(k, 0.5))
+            canvas.tool = inkingTool()
         }
         // Nur-Sehen-Modus (am iPhone Standard): nichts zeichnet, ein Finger scrollt
         canvas.drawingGestureRecognizer.isEnabled = !erasing && !pointing && !viewOnly
@@ -1910,7 +1939,7 @@ extension CanvasController {
     }
 }
 
-// MARK: Vorschau auf das Ziel eines Links: Radierer 1,5 s still auf einem Link, der an eine Stelle im PDF führt
+// MARK: Vorschau auf das Ziel eines Links: Radierer 0,8 s still auf einem Link (an eine Stelle im PDF oder ins Internet)
 
 extension CanvasController {
     /// Neues PDF (Seiten geändert, Rückgängig, anderes Gerät): Die gelesenen Links gehören zum alten
@@ -1962,11 +1991,11 @@ extension CanvasController {
     /// radiert er gleich wie immer. `p` in Scroll-Koordinaten der Leinwand, `viewPoint` in der Ansicht
     private func beginLinkHold(at p: CGPoint, viewPoint: CGPoint) -> Bool {
         cancelLinkHold()
-        guard let target = linkTarget(at: p) else { return false }
+        guard let goal = linkGoal(at: p) else { return false }
         let ring = DispatchWorkItem { [weak self] in self?.linkHoldRing() }
         let done = DispatchWorkItem { [weak self] in self?.linkHoldElapsed() }
         let z = canvas.zoomScale
-        linkHold = LinkHold(target: target, viewPoint: viewPoint, drawingPoint: CGPoint(x: p.x / z, y: p.y / z),
+        linkHold = LinkHold(goal: goal, viewPoint: viewPoint, drawingPoint: CGPoint(x: p.x / z, y: p.y / z),
                             timers: [ring, done])
         DispatchQueue.main.asyncAfter(deadline: .now() + LinkPreview.ringDelay, execute: ring)
         DispatchQueue.main.asyncAfter(deadline: .now() + LinkPreview.holdDuration, execute: done)
@@ -1988,7 +2017,7 @@ extension CanvasController {
 
     /// Ziel des Links unter dem Radierer (`p` in Scroll-Koordinaten der Leinwand). Er zählt, sobald der Kreis des
     /// Radierers ihn berührt
-    private func linkTarget(at p: CGPoint) -> LinkTarget? {
+    private func linkGoal(at p: CGPoint) -> LinkGoal? {
         guard doc.kind == .pdf, k > 0, linkPreview == nil else { return nil }
         guard let spots = linkSpots else {
             loadLinksIfNeeded()
@@ -1999,20 +2028,21 @@ extension CanvasController {
         let i = layout.page(at: point.y)
         guard spots.indices.contains(i), !spots[i].isEmpty, layout.frames.indices.contains(i) else { return nil }
         let frame = layout.frames[i]
-        return LinkPreview.target(at: CGPoint(x: point.x - frame.minX, y: point.y - frame.minY), in: spots[i],
-                                  tolerance: Self.eraserRadius / s)
+        return LinkPreview.goal(at: CGPoint(x: point.x - frame.minX, y: point.y - frame.minY), in: spots[i],
+                                tolerance: Self.eraserRadius / s)
     }
 
-    /// Der Kreis erscheint; zugleich werden die Bilder der Vorschau im Hintergrund gezeichnet
+    /// Der Kreis erscheint; zugleich werden die Bilder der Vorschau einer Stelle im PDF im Hintergrund gezeichnet. Eine
+    /// Seite im Internet lädt erst, wenn ihr Fenster kommt: Kurzes Innehalten auf einem Link soll nichts aufrufen
     private func linkHoldRing() {
         guard var hold = linkHold else { return }
         showHoldRing(duration: LinkPreview.holdDuration - LinkPreview.ringDelay)
-        hold.images = renderLinkPreview(hold.target)
+        if case .place(let target) = hold.goal { hold.images = renderLinkPreview(target) }
         linkHold = hold
     }
 
-    /// Lange genug still: kurz tippen und die Vorschau zeigen, sobald ihre Bilder fertig sind. Bis zum Abheben radiert
-    /// der Radierer dann nichts mehr
+    /// Lange genug still: kurz tippen und die Vorschau zeigen, eine Stelle im PDF sobald ihre Bilder fertig sind, eine
+    /// Seite im Internet gleich (sie lädt in ihrem Fenster). Bis zum Abheben radiert der Radierer dann nichts mehr
     private func linkHoldElapsed() {
         guard let hold = linkHold else { return }
         linkHold = nil
@@ -2021,17 +2051,27 @@ extension CanvasController {
         if #available(iOS 17.5, *), let feedback = holdFeedback as? UICanvasFeedbackGenerator {
             feedback.pathCompleted(at: hold.viewPoint)
         }
-        let images = hold.images ?? renderLinkPreview(hold.target)
         let anchor = eraserCursor.isHidden ? hold.viewPoint : eraserCursor.center
+        linkPresentation?.cancel()
+        linkPresentation = nil
+        let target: LinkTarget
+        switch hold.goal {
+        case .web(let url):
+            // Gleich: Die Seite lädt in ihrem Fenster
+            presentWebPreview(url, at: anchor)
+            return
+        case .place(let place):
+            target = place
+        }
+        let images = hold.images ?? renderLinkPreview(target)
         // Öffnet sich inzwischen etwas anderes (eine Antwort, Teilen …) oder schließt sich, was offen war: keine Vorschau
         let host = topPresenter
-        linkPresentation?.cancel()
         linkPresentation = Task { [weak self, weak host] in
             let content = await withTaskCancellationHandler { await images.value } onCancel: { images.cancel() }
             guard let content, !Task.isCancelled, let self, !self.detached, let host, self.topPresenter === host
             else { return }
             self.linkPresentation = nil
-            self.presentLinkPreview(content, target: hold.target, at: anchor)
+            self.presentLinkPreview(content, target: target, at: anchor)
         }
     }
 
@@ -2073,22 +2113,35 @@ extension CanvasController {
         let ink = canvas.drawing.strokes.filter { $0.renderBounds.intersects(area) }
         let job = LinkPreviewJob(slices: slices, frames: frames, pdf: pdf,
                                  ink: PKDrawing(strokes: ink).transformed(using: toPage).strokes,
-                                 pixelWidth: (LinkPreviewController.width(in: self) * traitCollection.displayScale).rounded())
+                                 pixelWidth: (LinkPreviewController.pageWidth(in: self) * traitCollection.displayScale).rounded())
         return Task.detached(priority: .userInitiated) { job.render() }
     }
 
-    /// Zeigt die Vorschau: am iPad als Popover am Radierer (darüber oder darunter), am iPhone als halbhohes Blatt.
-    /// Antippen daneben schließt sie
+    /// Zeigt die Vorschau einer Stelle im PDF (Zielseite und die nächste, mit Tinte)
     private func presentLinkPreview(_ content: LinkPreviewImages, target: LinkTarget, at point: CGPoint) {
-        guard !content.images.isEmpty, linkPreview == nil, view.window != nil else { return }
+        guard !content.images.isEmpty else { return }
         let preview = LinkPreviewController(content: content, targetY: (target.y ?? 0) - (content.slices.first?.top ?? 0))
+        presentPreview(preview, size: LinkPreviewController.preferredSize(for: content, in: self),
+                       background: LinkPreviewController.background, at: point)
+    }
+
+    /// Fenster mit der Seite im Internet, an derselben Stelle wie die Vorschau einer Stelle im PDF
+    private func presentWebPreview(_ url: URL, at point: CGPoint) {
+        presentPreview(WebPreviewController(url: url), size: WebPreviewController.preferredSize(in: self),
+                       background: LinkPreviewController.background, at: point)
+    }
+
+    /// Am iPad als Popover am Radierer (darüber oder darunter), am iPhone als halbhohes Blatt. Antippen daneben schließt
+    /// es. Ist schon eine Vorschau offen oder die Leinwand nicht zu sehen: nichts
+    private func presentPreview(_ preview: UIViewController, size: CGSize, background: UIColor, at point: CGPoint) {
+        guard linkPreview == nil, view.window != nil else { return }
         preview.modalPresentationStyle = .popover
-        preview.preferredContentSize = LinkPreviewController.preferredSize(for: content, in: self)
+        preview.preferredContentSize = size
         if let pop = preview.popoverPresentationController {
             pop.sourceView = view
             pop.sourceRect = CGRect(x: point.x - 14, y: point.y - 14, width: 28, height: 28)
             pop.permittedArrowDirections = [.up, .down]
-            pop.backgroundColor = LinkPreviewController.background
+            pop.backgroundColor = background
             let sheet = pop.adaptiveSheetPresentationController
             sheet.detents = [.medium(), .large()]
             sheet.prefersGrabberVisible = true
@@ -2274,7 +2327,7 @@ extension CanvasController: UIGestureRecognizerDelegate {
     /// Ersetzt die Zeichnung nicht: Kein Rückgängig geht verloren, kein Strich unterwegs
     private func endLassoSelection() {
         guard canvas.tool is PKLassoTool else { return }
-        canvas.tool = PKInkingTool(.pen, color: inkColor, width: inkWidth * max(k, 0.5))
+        canvas.tool = inkingTool()
         applyTool()
         canvas.endEditing(true)
     }
@@ -2382,6 +2435,7 @@ extension CanvasController {
     /// - `debug/state`: nur den Stand
     /// Danach steht der Stand der Fragen im Protokoll („Asks-Debug: …“)
     /// - `debug/link…`: Vorschau auf das Ziel eines Links (siehe `debugLink`, Protokoll „Link-Debug: …“)
+    /// - `debug/pen`: die fünf Stiftbreiten, wie PencilKit sie hier zeichnet (Protokoll „Link-Debug: Stift …“)
     func debugCommand(_ url: URL) {
         let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         func value(_ name: String) -> String? { items.first { $0.name == name }?.value }
@@ -2398,6 +2452,55 @@ extension CanvasController {
         switch url.path {
         case "/link":
             return debugLink(items)
+        case "/wire":
+            // Striche wie aus dem Browser (nur Punkte, kein PencilKit-Original), je Breite des Browsers eine waagrechte
+            // Linie auf Seite 1, eingefügt wie fremde Striche. &x=, &y= (Seitenpunkte) für den Anfang; &scale=S hängt
+            // die Zweitskala als zehnten Wert an (der Browser schickt nur neun); &ink=monoline statt des Stifts.
+            // Zum Nachmessen, wie dick PencilKit solche Striche zeichnet (Mathias 19.11.: dünnster unsichtbar)
+            guard k > 0, let frame = layout.frames.first else { return NSLog("Link-Debug: Draht: keine Seite") }
+            let x0 = Double(frame.minX) + (value("x").flatMap { Double($0) } ?? 100)
+            let y0 = Double(frame.minY) + (value("y").flatMap { Double($0) } ?? 600)
+            let second = value("scale").flatMap { Double($0) }
+            let ink = value("ink") == "monoline" ? PKInk.InkType.monoline : PKInk.InkType.pen
+            let widths: [Double] = [1.8, 2.5, 3.2, 4.2, 6.5]
+            for (i, w) in widths.enumerated() {
+                let points = (0...20).map { j -> [Double] in
+                    var p = [x0 + Double(j) * 15, y0 + Double(i) * 24, Double(j) * 0.02, w, w, 1, 1, 0, 1.571]
+                    if let second { p.append(second) }
+                    return p
+                }
+                let wire = WireStroke(ink: ink.rawValue, c: [0.1, 0.1, 0.11, 1], p: points)
+                guard let data = try? JSONEncoder().encode(wire), let json = String(data: data, encoding: .utf8) else {
+                    continue
+                }
+                pending.added.append((id: "draht-\(Int(x0))-\(Int(y0))-\(i)", data: json))
+            }
+            applyPending()
+            return NSLog("Link-Debug: Draht: 5 Linien %@ bei x %.0f, y %.0f (Seite), Zweitskala %@, k %.3f, Breiten %@",
+                         ink == .monoline ? "Feinstift" : "Stift", x0 - Double(frame.minX), y0 - Double(frame.minY),
+                         second.map { String($0) } ?? "keine", Double(k),
+                         widths.map { String($0) }.joined(separator: " "))
+        case "/top":
+            // Wie ein Tippen auf Uhrzeit oder Akku der eigenen Zeile am iPad
+            scrollToTop()
+            return NSLog("Link-Debug: nach oben, Ziel y %.0f", Double(-canvas.contentInset.top))
+        case "/pen":
+            // Wie dick die fünf Stufen hier eingestellt werden: PencilKit begrenzt die Breite je Tinte
+            let pen = PKInkingTool.InkType.pen.validWidthRange
+            let fine = PKInkingTool.InkType.monoline.validWidthRange
+            let scale = max(k, 0.5)
+            let widths = ToolState.widths.indices.map { i -> String in
+                let w = ToolState.widths[i]
+                let tool = PKInkingTool(i == ToolState.fineIndex ? .monoline : .pen, color: .black, width: w * scale)
+                let name = i == ToolState.fineIndex ? "fein" : "stift"
+                return String(format: "%@ %.2f→%.2f", name, Double(w), Double(tool.width / scale))
+            }
+            let current = (canvas.tool as? PKInkingTool).map {
+                String(format: "%@ %.2f", $0.inkType == .monoline ? "fein" : "stift", Double($0.width))
+            } ?? "kein Stift"
+            return NSLog("Link-Debug: Stift: k %.3f, Stift %.3f…%.2f, Feinstift %.3f…%.2f, Breiten %@, jetzt %@",
+                         Double(k), Double(pen.lowerBound), Double(pen.upperBound), Double(fine.lowerBound),
+                         Double(fine.upperBound), widths.joined(separator: " "), current)
         case "/ask":
             guard k > 0, let n = value("page").flatMap({ Int($0) }), layout.frames.indices.contains(n) else {
                 return log("ask: keine solche Seite")
@@ -2481,6 +2584,11 @@ extension CanvasController {
             if let preview = linkPreview { Self.dismissStack(from: preview, animated: false) }
             return log("geschlossen")
         }
+        if has("safari") {
+            // Was „In Safari öffnen“ jetzt öffnen würde, ohne Safari zu starten
+            guard let web = linkPreview as? WebPreviewController else { return log("kein Webfenster") }
+            return log("Safari bekäme \(web.safariTarget.absoluteString)")
+        }
         if let n = value("scroll").flatMap({ Int($0) }) { scrollToPage(n) }
         guard let spots = linkSpots else {
             loadLinksIfNeeded()
@@ -2492,8 +2600,12 @@ extension CanvasController {
         }
         let summary = spots.enumerated().filter { !$0.element.isEmpty }.prefix(12).map { i, links -> String in
             let list = links.map { l -> String in
-                let y = l.target.y.map { "@\(Int($0))" } ?? "@oben"
-                return "(\(Int(l.rect.minX)),\(Int(l.rect.minY)) \(Int(l.rect.width))x\(Int(l.rect.height)))→S\(l.target.page)\(y)"
+                let goal: String
+                switch l.goal {
+                case .place(let target): goal = "S\(target.page)@" + (target.y.map { "\(Int($0))" } ?? "oben")
+                case .web(let url): goal = url.absoluteString
+                }
+                return "(\(Int(l.rect.minX)),\(Int(l.rect.minY)) \(Int(l.rect.width))x\(Int(l.rect.height)))→" + goal
             }
             return "S\(i): " + list.joined(separator: " ")
         }
@@ -2510,14 +2622,22 @@ extension CanvasController {
         let p = CGPoint(x: (frame.minX + spot.rect.midX) * s, y: (frame.minY + spot.rect.midY) * s)
         let v = canvas.convert(p, to: view)
         guard let hold = value("hold").flatMap({ Double($0) }) else {
-            let images = renderLinkPreview(spot.target)
+            let target: LinkTarget
+            switch spot.goal {
+            case .web(let url):
+                presentWebPreview(url, at: v)
+                return log("Webseite \(LinkPreview.secure(url).absoluteString), Fenster \(linkPreview != nil)")
+            case .place(let place):
+                target = place
+            }
+            let images = renderLinkPreview(target)
             Task { [weak self] in
                 guard let content = await images.value, let self else { return }
-                self.presentLinkPreview(content, target: spot.target, at: v)
-                let y = spot.target.y.map { "\(Int($0))" } ?? "oben"
+                self.presentLinkPreview(content, target: target, at: v)
+                let y = target.y.map { "\(Int($0))" } ?? "oben"
                 let parts = content.slices.map { "S\($0.page) \(Int($0.top))–\(Int($0.bottom))" }.joined(separator: ", ")
                 let sizes = content.images.map { "\(Int($0.size.width))x\(Int($0.size.height))" }.joined(separator: ", ")
-                log("Vorschau: Seite \(spot.target.page), y \(y), Stücke \(parts), Bilder \(sizes), "
+                log("Vorschau: Seite \(target.page), y \(y), Stücke \(parts), Bilder \(sizes), "
                     + "Fenster \(self.linkPreview != nil)")
             }
             return
@@ -2577,20 +2697,26 @@ extension CanvasController {
         }
     }
 
-    /// Rote Rahmen um die Links, grüne Striche an ihren Zielen (in den Seiten, unter der Tinte)
+    /// Rote Rahmen um die Links in das Dokument, orange um die ins Internet, grüne Striche an den Zielen (in den Seiten,
+    /// unter der Tinte)
     private func toggleLinkOverlay(_ spots: [[LinkSpot]]) {
         if let old = pagesView.layer.sublayers?.first(where: { $0.name == "link-debug" }) {
             old.removeFromSuperlayer()
             return
         }
-        let links = UIBezierPath(), targets = UIBezierPath()
+        let links = UIBezierPath(), webLinks = UIBezierPath(), targets = UIBezierPath()
         for (i, list) in spots.enumerated() where layout.frames.indices.contains(i) {
             let frame = layout.frames[i]
             for spot in list {
-                links.append(UIBezierPath(rect: spot.rect.offsetBy(dx: frame.minX, dy: frame.minY)))
-                guard layout.frames.indices.contains(spot.target.page) else { continue }
-                let f = layout.frames[spot.target.page]
-                let y = f.minY + (spot.target.y ?? 0)
+                let box = UIBezierPath(rect: spot.rect.offsetBy(dx: frame.minX, dy: frame.minY))
+                guard case .place(let target) = spot.goal else {
+                    webLinks.append(box)
+                    continue
+                }
+                links.append(box)
+                guard layout.frames.indices.contains(target.page) else { continue }
+                let f = layout.frames[target.page]
+                let y = f.minY + (target.y ?? 0)
                 targets.move(to: CGPoint(x: f.minX, y: y))
                 targets.addLine(to: CGPoint(x: f.minX + 80, y: y))
             }
@@ -2603,12 +2729,18 @@ extension CanvasController {
         red.fillColor = nil
         red.strokeColor = UIColor.red.cgColor
         red.lineWidth = 1
+        let orange = CAShapeLayer()
+        orange.path = webLinks.cgPath
+        orange.fillColor = nil
+        orange.strokeColor = UIColor.systemOrange.cgColor
+        orange.lineWidth = 1.5
         let green = CAShapeLayer()
         green.path = targets.cgPath
         green.fillColor = nil
         green.strokeColor = UIColor.systemGreen.cgColor
         green.lineWidth = 3
         overlay.addSublayer(red)
+        overlay.addSublayer(orange)
         overlay.addSublayer(green)
         pagesView.layer.addSublayer(overlay)
     }

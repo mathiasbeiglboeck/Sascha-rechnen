@@ -15,7 +15,7 @@ const html = `<!doctype html><html lang="de"><meta charset="utf-8"><style>
 <div class="page"><h1>Links aus dem Browser</h1>
   <p><a href="#ziel-a">0: Ziel A (Seite 2, Mitte)</a></p>
   <p><a href="#ziel-b">1: Ziel B (Seite 3, oben)</a></p>
-  <p><a href="https://example.com/">2: example.com (Internet, keine Vorschau)</a></p>
+  <p><a href="https://example.com/">2: example.com (Internet, Webseite)</a></p>
   ${filler(20)}</div>
 <div class="page"><h2>Seite 2</h2>${filler(14)}<h3 class="ziel" id="ziel-a">Ziel A</h3>${filler(12)}</div>
 <div class="page"><h3 class="ziel" id="ziel-b">Ziel B</h3>${filler(20)}
