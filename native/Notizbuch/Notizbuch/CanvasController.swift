@@ -24,7 +24,9 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private let sync: SyncEngine
     let canvas = InkCanvasView()
     private let pagesView = UIView()
-    private(set) var pdf: CGPDFDocument?
+    private(set) var pdf: CGPDFDocument? {
+        didSet { if pdf !== oldValue { linksChanged() } }
+    }
     private var pageCount: Int
     private(set) var layout = PageLayout.notebook(pages: 1)
     /// Bildschirmpunkte pro Seitenpunkt bei Zoom 1 (Seite füllt die Breite)
@@ -73,6 +75,36 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private var lastErasePoint: CGPoint?
     /// Radius des Radierers in Bildschirmpunkten
     private static let eraserRadius: CGFloat = 8
+    /// Links im PDF, die an eine Stelle im Dokument führen, je Seite (nil: noch nicht gelesen)
+    private var linkSpots: [[LinkSpot]]?
+    private var linkScan: Task<Void, Never>?
+    /// Zählt die PDFs dieser Leinwand: Was das Lesen eines älteren findet, gilt nicht mehr
+    private var linkGeneration = 0
+    /// Der Radierer setzte auf einem Link auf und wartet, ob er still bleibt
+    private var linkHold: LinkHold?
+    /// In dieser Berührung kam die Vorschau: Bis zum Abheben radiert der Radierer nichts mehr
+    private var linkPreviewTouch = false
+    /// Die Vorschau erscheint, sobald ihre Bilder fertig sind. Eine neue Berührung des Radierers, ein anderes Werkzeug,
+    /// ein neues PDF oder ein inzwischen geöffnetes Fenster (etwa eine Antwort) bricht das ab: Sie soll nie mitten in
+    /// etwas anderem auftauchen
+    private var linkPresentation: Task<Void, Never>?
+    private weak var linkPreview: LinkPreviewController?
+    /// Kreis um den Radierer, der sich bis zur Vorschau füllt
+    private let holdRing = CAShapeLayer()
+    /// Kurzes Tippen im Pencil Pro (am iPhone im Gerät), wenn die Vorschau kommt (UICanvasFeedbackGenerator, ab iOS 17.5)
+    private var holdFeedback: AnyObject?
+
+    /// Der Radierer wartet auf einem Link, ob er still bleibt
+    private struct LinkHold {
+        let target: LinkTarget
+        /// Wo er aufsetzte: in der Ansicht (für den Spielraum) und in der Zeichnung (ohne Zoom, zum Radieren: Der Zoom
+        /// kann sich während des Wartens noch ändern, etwa wenn er nach dem Aufziehen zurückfedert)
+        let viewPoint: CGPoint
+        let drawingPoint: CGPoint
+        let timers: [DispatchWorkItem]
+        /// Bilder der Vorschau: Sie werden ab dem Erscheinen des Kreises im Hintergrund gezeichnet
+        var images: Task<LinkPreviewImages?, Never>?
+    }
 
     private var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
 
@@ -127,6 +159,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         eraserGesture.addTarget(self, action: #selector(handleErase(_:)))
         eraserGesture.isEnabled = false
         if isPad { eraserGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)] }
+        // Eine Vorschau eines Links, die noch auf ihre Bilder wartet, käme sonst mitten in diese neue Berührung
+        eraserGesture.onTouchDown = { [weak self] in self?.cancelLinkPresentation() }
         canvas.addGestureRecognizer(eraserGesture)
 
         // Zeigestift: leuchtende Linien über allem, verblassen nach etwa zehn Sekunden
@@ -174,6 +208,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         eraserCursor.isUserInteractionEnabled = false
         eraserCursor.isHidden = true
         view.addSubview(eraserCursor)
+        setUpHoldRing()
+        if #available(iOS 17.5, *) { holdFeedback = UICanvasFeedbackGenerator(view: view) }
 
         if doc.kind == .pdf {
             pdf = CGPDFDocument(store.pdfURL(doc.id) as CFURL)
@@ -350,7 +386,15 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         canvas.undoManager?.removeAllActions()
         persistSyncStateNow()
         if sync.openController === self { sync.openController = nil }
-        answerCard?.dismiss(animated: false)
+        cancelLinkHold()
+        cancelLinkPresentation()
+        // Das Lesen der Links fängt beim Wiederkommen neu an (dann mit dem dann aktuellen PDF)
+        linkScan?.cancel()
+        linkScan = nil
+        // Karte mit der Antwort und Vorschau eines Links (am iPhone vielleicht über der Karte): von unten her schließen,
+        // das nimmt alles darüber mit
+        let base: UIViewController? = answerCard ?? linkPreview
+        if let base { Self.dismissStack(from: base, animated: false) }
         let sync = self.sync, id = doc.id
         Task { await sync.syncClosed(id) }
     }
@@ -850,6 +894,13 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         if !isPad { canvas.panGestureRecognizer.minimumNumberOfTouches = viewOnly ? 1 : 2 }
         if !erasing { eraserCursor.isHidden = true }
         setPencilKitHover(enabled: !(erasing && !viewOnly))
+        if erasing && !viewOnly {
+            // Links des PDFs schon lesen, bevor der Radierer auf einem aufsetzt
+            loadLinksIfNeeded()
+        } else {
+            cancelLinkHold()
+            cancelLinkPresentation()
+        }
     }
 
     /// PencilKits eigene Schwebe-Gesten, solange der Radierer sie abgeschaltet hat
@@ -984,10 +1035,16 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             if g.isPencil { lockScrolling() }
             eraseStart = canvas.drawing
             lastErasePoint = nil
-            erase(at: p)
+            linkPreviewTouch = false
+            // Auf einem Link im PDF: erst abwarten, ob der Radierer still bleibt (dann Vorschau statt radieren)
+            if !beginLinkHold(at: p, viewPoint: g.location(in: view)) { erase(at: p) }
         case .changed:
-            erase(at: p)
+            eraseMoved(to: p, viewPoint: g.location(in: view))
         case .ended, .cancelled, .failed:
+            // Vor der Vorschau abgehoben: wie ein Antippen radieren. Abgebrochen (zweiter Finger, anderes Werkzeug):
+            // nichts
+            if linkHold != nil { endLinkHold(erasingTo: g.state == .ended ? p : nil) }
+            linkPreviewTouch = false
             if eraseStart == nil, g.state == .ended {
                 // Kurzes Antippen mit dem Finger (die Geste begann gar nicht erst): einmal radieren
                 toolUsedSinceSave = true
@@ -1308,9 +1365,14 @@ extension CanvasController {
 
     /// Über dem zeigen, was gerade offen ist (etwa der Karte mit der Antwort am iPhone): Sonst zeigt UIKit nichts
     func presentOnTop(_ controller: UIViewController) {
+        topPresenter.present(controller, animated: true)
+    }
+
+    /// Das Oberste, was gerade gezeigt wird (ohne das, was sich schon schließt), sonst die Leinwand
+    private var topPresenter: UIViewController {
         var host: UIViewController = self
         while let next = host.presentedViewController, !next.isBeingDismissed { host = next }
-        host.present(controller, animated: true)
+        return host
     }
 
     func share(_ kind: ShareKind, from sourceRect: CGRect) {
@@ -1848,6 +1910,236 @@ extension CanvasController {
     }
 }
 
+// MARK: Vorschau auf das Ziel eines Links: Radierer 1,5 s still auf einem Link, der an eine Stelle im PDF führt
+
+extension CanvasController {
+    /// Neues PDF (Seiten geändert, Rückgängig, anderes Gerät): Die gelesenen Links gehören zum alten
+    private func linksChanged() {
+        // Wartete der Radierer gerade auf einem Link: Der Rest dieser Berührung radiert nichts (der Pencil steht still,
+        // und sein Link gehört zum alten PDF)
+        if linkHold != nil { linkPreviewTouch = true }
+        cancelLinkHold()
+        cancelLinkPresentation()
+        linkSpots = nil
+        linkScan?.cancel()
+        linkScan = nil
+        linkGeneration += 1
+        // Erst nach dem, was gerade läuft: Wer das PDF tauscht, rechnet gleich danach die IDs der Striche neu, und auf
+        // die soll das Lesen warten
+        guard erasing && !viewOnly else { return }
+        DispatchQueue.main.async { [weak self] in self?.loadLinksIfNeeded() }
+    }
+
+    /// Liest die Links des PDFs einmal im Hintergrund. Abgleich und Schreiben gehen vor: Das Lesen wartet, bis die IDs
+    /// der Striche vorberechnet sind (darauf wartet der erste Abgleich), und läuft mit niedriger Priorität
+    private func loadLinksIfNeeded() {
+        // Nicht nach dem Verlassen: SwiftUI aktualisiert die Leinwand beim Schließen vielleicht noch einmal
+        guard !detached, doc.kind == .pdf, pdf != nil, k > 0, linkSpots == nil, linkScan == nil else { return }
+        let generation = linkGeneration
+        let url = store.pdfURL(doc.id)
+        let warmup = idWarmup
+        // Auch die äußere Aufgabe mit niedriger Priorität: Wer auf eine Aufgabe wartet, hebt sonst deren Priorität an
+        linkScan = Task(priority: .utility) { [weak self] in
+            if let warmup { await warmup.value }
+            guard !Task.isCancelled else { return }
+            #if DEBUG
+            let start = CACurrentMediaTime()
+            #endif
+            let scan = Task.detached(priority: .utility) { LinkPreview.scan(url) }
+            let spots = await withTaskCancellationHandler { await scan.value } onCancel: { scan.cancel() }
+            guard !Task.isCancelled, let self, self.linkGeneration == generation else { return }
+            self.linkSpots = spots
+            self.linkScan = nil
+            #if DEBUG
+            let links = spots.reduce(0) { $0 + $1.count }, ms = Int((CACurrentMediaTime() - start) * 1000)
+            NSLog("Link-Debug: %@", "\(links) Links auf \(spots.count) Seiten gelesen in \(ms) ms")
+            #endif
+        }
+    }
+
+    /// Setzt der Radierer auf einem Link auf, der an eine Stelle im Dokument führt, wartet er, ob er still bleibt: nach
+    /// `ringDelay` erscheint der Kreis, nach `holdDuration` die Vorschau. Ist dort kein solcher Link: false, dann
+    /// radiert er gleich wie immer. `p` in Scroll-Koordinaten der Leinwand, `viewPoint` in der Ansicht
+    private func beginLinkHold(at p: CGPoint, viewPoint: CGPoint) -> Bool {
+        cancelLinkHold()
+        guard let target = linkTarget(at: p) else { return false }
+        let ring = DispatchWorkItem { [weak self] in self?.linkHoldRing() }
+        let done = DispatchWorkItem { [weak self] in self?.linkHoldElapsed() }
+        let z = canvas.zoomScale
+        linkHold = LinkHold(target: target, viewPoint: viewPoint, drawingPoint: CGPoint(x: p.x / z, y: p.y / z),
+                            timers: [ring, done])
+        DispatchQueue.main.asyncAfter(deadline: .now() + LinkPreview.ringDelay, execute: ring)
+        DispatchQueue.main.asyncAfter(deadline: .now() + LinkPreview.holdDuration, execute: done)
+        return true
+    }
+
+    /// Der Radierer bewegt sich (`p` in Scroll-Koordinaten der Leinwand, `v` in der Ansicht): radieren. Wartet er noch
+    /// auf einem Link, erst wenn er den Spielraum verlässt, dann ab der Stelle, wo er aufsetzte. Nach der Vorschau
+    /// radiert diese Berührung nichts mehr
+    private func eraseMoved(to p: CGPoint, viewPoint v: CGPoint) {
+        guard !linkPreviewTouch else { return }
+        if let hold = linkHold {
+            guard hypot(v.x - hold.viewPoint.x, v.y - hold.viewPoint.y) > LinkPreview.holdSlop else { return }
+            endLinkHold(erasingTo: p)
+        } else {
+            erase(at: p)
+        }
+    }
+
+    /// Ziel des Links unter dem Radierer (`p` in Scroll-Koordinaten der Leinwand). Er zählt, sobald der Kreis des
+    /// Radierers ihn berührt
+    private func linkTarget(at p: CGPoint) -> LinkTarget? {
+        guard doc.kind == .pdf, k > 0, linkPreview == nil else { return nil }
+        guard let spots = linkSpots else {
+            loadLinksIfNeeded()
+            return nil
+        }
+        let s = k * canvas.zoomScale
+        let point = CGPoint(x: p.x / s, y: p.y / s)
+        let i = layout.page(at: point.y)
+        guard spots.indices.contains(i), !spots[i].isEmpty, layout.frames.indices.contains(i) else { return nil }
+        let frame = layout.frames[i]
+        return LinkPreview.target(at: CGPoint(x: point.x - frame.minX, y: point.y - frame.minY), in: spots[i],
+                                  tolerance: Self.eraserRadius / s)
+    }
+
+    /// Der Kreis erscheint; zugleich werden die Bilder der Vorschau im Hintergrund gezeichnet
+    private func linkHoldRing() {
+        guard var hold = linkHold else { return }
+        showHoldRing(duration: LinkPreview.holdDuration - LinkPreview.ringDelay)
+        hold.images = renderLinkPreview(hold.target)
+        linkHold = hold
+    }
+
+    /// Lange genug still: kurz tippen und die Vorschau zeigen, sobald ihre Bilder fertig sind. Bis zum Abheben radiert
+    /// der Radierer dann nichts mehr
+    private func linkHoldElapsed() {
+        guard let hold = linkHold else { return }
+        linkHold = nil
+        linkPreviewTouch = true
+        hideHoldRing()
+        if #available(iOS 17.5, *), let feedback = holdFeedback as? UICanvasFeedbackGenerator {
+            feedback.pathCompleted(at: hold.viewPoint)
+        }
+        let images = hold.images ?? renderLinkPreview(hold.target)
+        let anchor = eraserCursor.isHidden ? hold.viewPoint : eraserCursor.center
+        // Öffnet sich inzwischen etwas anderes (eine Antwort, Teilen …) oder schließt sich, was offen war: keine Vorschau
+        let host = topPresenter
+        linkPresentation?.cancel()
+        linkPresentation = Task { [weak self, weak host] in
+            let content = await withTaskCancellationHandler { await images.value } onCancel: { images.cancel() }
+            guard let content, !Task.isCancelled, let self, !self.detached, let host, self.topPresenter === host
+            else { return }
+            self.linkPresentation = nil
+            self.presentLinkPreview(content, target: hold.target, at: anchor)
+        }
+    }
+
+    /// Eine Vorschau, deren Bilder noch nicht fertig sind, erscheint nicht mehr
+    private func cancelLinkPresentation() {
+        linkPresentation?.cancel()
+        linkPresentation = nil
+    }
+
+    /// Der Radierer wartet nicht mehr: Kreis weg, Bilder der Vorschau verwerfen
+    private func cancelLinkHold() {
+        guard let hold = linkHold else { return }
+        linkHold = nil
+        for timer in hold.timers { timer.cancel() }
+        hold.images?.cancel()
+        hideHoldRing()
+    }
+
+    /// Die Berührung radiert doch (bewegt, oder vor der Vorschau abgehoben): von der Stelle, wo der Radierer aufsetzte,
+    /// bis `end` (Scroll-Koordinaten). Ohne `end` (abgebrochen) radiert sie nichts
+    private func endLinkHold(erasingTo end: CGPoint?) {
+        guard let hold = linkHold else { return }
+        cancelLinkHold()
+        guard let end else { return }
+        let z = canvas.zoomScale
+        erase(at: CGPoint(x: hold.drawingPoint.x * z, y: hold.drawingPoint.y * z))
+        erase(at: end)
+    }
+
+    /// Bilder der Zielseite und der nächsten samt Tinte (siehe LinkPreview.slices), im Hintergrund gezeichnet.
+    /// Umgerechnet werden nur die Striche darauf; Abbrechen der Aufgabe lässt die restlichen Bilder weg
+    private func renderLinkPreview(_ target: LinkTarget) -> Task<LinkPreviewImages?, Never> {
+        let frames = layout.frames
+        let slices = LinkPreview.slices(for: target, frames: frames)
+        let area = slices.reduce(CGRect.null) { area, slice in
+            let f = frames[slice.page]
+            return area.union(CGRect(x: f.minX, y: f.minY + slice.top, width: f.width, height: slice.bottom - slice.top))
+        }.applying(CGAffineTransform(scaleX: k, y: k))
+        let ink = canvas.drawing.strokes.filter { $0.renderBounds.intersects(area) }
+        let job = LinkPreviewJob(slices: slices, frames: frames, pdf: pdf,
+                                 ink: PKDrawing(strokes: ink).transformed(using: toPage).strokes,
+                                 pixelWidth: (LinkPreviewController.width(in: self) * traitCollection.displayScale).rounded())
+        return Task.detached(priority: .userInitiated) { job.render() }
+    }
+
+    /// Zeigt die Vorschau: am iPad als Popover am Radierer (darüber oder darunter), am iPhone als halbhohes Blatt.
+    /// Antippen daneben schließt sie
+    private func presentLinkPreview(_ content: LinkPreviewImages, target: LinkTarget, at point: CGPoint) {
+        guard !content.images.isEmpty, linkPreview == nil, view.window != nil else { return }
+        let preview = LinkPreviewController(content: content, targetY: (target.y ?? 0) - (content.slices.first?.top ?? 0))
+        preview.modalPresentationStyle = .popover
+        preview.preferredContentSize = LinkPreviewController.preferredSize(for: content, in: self)
+        if let pop = preview.popoverPresentationController {
+            pop.sourceView = view
+            pop.sourceRect = CGRect(x: point.x - 14, y: point.y - 14, width: 28, height: 28)
+            pop.permittedArrowDirections = [.up, .down]
+            pop.backgroundColor = LinkPreviewController.background
+            let sheet = pop.adaptiveSheetPresentationController
+            sheet.detents = [.medium(), .large()]
+            sheet.prefersGrabberVisible = true
+        }
+        linkPreview = preview
+        presentOnTop(preview)
+    }
+
+    /// Schließt `base` samt allem, was darüber gezeigt wird (`base.dismiss` schlösse nur das Oberste darüber). Ist
+    /// `base` nicht mehr gezeigt, passiert nichts
+    static func dismissStack(from base: UIViewController, animated: Bool) {
+        guard let host = base.presentingViewController, host.presentedViewController === base else { return }
+        host.dismiss(animated: animated)
+    }
+
+    private func setUpHoldRing() {
+        let r = Self.eraserRadius
+        holdRing.path = UIBezierPath(arcCenter: CGPoint(x: r, y: r), radius: r + 5, startAngle: -.pi / 2,
+                                     endAngle: 1.5 * .pi, clockwise: true).cgPath
+        holdRing.fillColor = nil
+        holdRing.strokeColor = UIColor.systemBlue.cgColor
+        holdRing.lineWidth = 2.5
+        holdRing.lineCap = .round
+        holdRing.strokeEnd = 0
+        holdRing.isHidden = true
+        eraserCursor.layer.addSublayer(holdRing)
+    }
+
+    private func showHoldRing(duration: TimeInterval) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        holdRing.isHidden = false
+        holdRing.strokeEnd = 1
+        CATransaction.commit()
+        let fill = CABasicAnimation(keyPath: "strokeEnd")
+        fill.fromValue = 0
+        fill.toValue = 1
+        fill.duration = duration
+        holdRing.add(fill, forKey: "fill")
+    }
+
+    private func hideHoldRing() {
+        holdRing.removeAnimation(forKey: "fill")
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        holdRing.isHidden = true
+        holdRing.strokeEnd = 0
+        CATransaction.commit()
+    }
+}
+
 // MARK: Claude fragen: Frage mit dem Lasso markieren, Antwort an ihrer Markierung lesen
 
 extension CanvasController: UIGestureRecognizerDelegate {
@@ -2009,7 +2301,8 @@ extension CanvasController: UIGestureRecognizerDelegate {
         }
         // Die Frage der offenen Karte ist weg (gelöscht, auch auf einem anderen Gerät)
         if let card = answerCard, sync.asks.ask(doc.id, card.model.askID)?.isVisible != true {
-            card.dismiss(animated: true)
+            // Samt einer Vorschau eines Links, die am iPhone darüber liegen kann
+            Self.dismissStack(from: card, animated: true)
         }
     }
 
@@ -2088,6 +2381,7 @@ extension CanvasController {
     /// - `debug/pages?delete=N`, `?insert=N`, `?undo`, `?done`: Seiten ändern, Rückgängig, Rückgängig verwerfen
     /// - `debug/state`: nur den Stand
     /// Danach steht der Stand der Fragen im Protokoll („Asks-Debug: …“)
+    /// - `debug/link…`: Vorschau auf das Ziel eines Links (siehe `debugLink`, Protokoll „Link-Debug: …“)
     func debugCommand(_ url: URL) {
         let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         func value(_ name: String) -> String? { items.first { $0.name == name }?.value }
@@ -2102,6 +2396,8 @@ extension CanvasController {
             }
         }
         switch url.path {
+        case "/link":
+            return debugLink(items)
         case "/ask":
             guard k > 0, let n = value("page").flatMap({ Int($0) }), layout.frames.indices.contains(n) else {
                 return log("ask: keine solche Seite")
@@ -2169,6 +2465,152 @@ extension CanvasController {
             log("Stand: pv \(self.currentPagesVersion), \(self.layout.frames.count) Seiten, "
                 + "\(self.askOverlay.subviews.count) Markierungen: " + state.joined(separator: "; "))
         }
+    }
+
+    /// - `debug/link`: alle Links des PDFs ins Protokoll; `&show` zeichnet sie rot auf die Seiten und ihre Ziele grün
+    ///   (noch einmal `&show` nimmt das weg); `&scroll=N` springt vorher zu Seite N (ab 0)
+    /// - `debug/link?page=N&index=K`: Vorschau des K-ten Links auf Seite N (beide ab 0), wie nach dem Halten
+    /// - `…&hold=S`: wie der Radierer: aufsetzen, S Sekunden still halten, abheben; `&ink` legt vorher einen Probestrich
+    ///   über den Link (wird er radiert oder nicht?); `&move=D` bewegt ihn nach 0,3 s um D Bildschirmpunkte nach rechts
+    /// - `debug/link?close`: Vorschau schließen (wie Antippen daneben)
+    private func debugLink(_ items: [URLQueryItem]) {
+        func value(_ name: String) -> String? { items.first { $0.name == name }?.value }
+        func has(_ name: String) -> Bool { items.contains { $0.name == name } }
+        let log: (String) -> Void = { NSLog("Link-Debug: %@", $0) }
+        if has("close") {
+            if let preview = linkPreview { Self.dismissStack(from: preview, animated: false) }
+            return log("geschlossen")
+        }
+        if let n = value("scroll").flatMap({ Int($0) }) { scrollToPage(n) }
+        guard let spots = linkSpots else {
+            loadLinksIfNeeded()
+            guard linkScan != nil else { return log("kein PDF") }
+            // Sobald die Links gelesen sind, noch einmal (ohne noch einmal zu springen)
+            let rest = items.filter { $0.name != "scroll" }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.debugLink(rest) }
+            return log("Links werden gelesen …")
+        }
+        let summary = spots.enumerated().filter { !$0.element.isEmpty }.prefix(12).map { i, links -> String in
+            let list = links.map { l -> String in
+                let y = l.target.y.map { "@\(Int($0))" } ?? "@oben"
+                return "(\(Int(l.rect.minX)),\(Int(l.rect.minY)) \(Int(l.rect.width))x\(Int(l.rect.height)))→S\(l.target.page)\(y)"
+            }
+            return "S\(i): " + list.joined(separator: " ")
+        }
+        log("\(spots.reduce(0) { $0 + $1.count }) Links auf \(spots.count) Seiten: " + summary.joined(separator: "; "))
+        if has("show") { toggleLinkOverlay(spots) }
+        guard let page = value("page").flatMap({ Int($0) }) else { return }
+        let index = value("index").flatMap { Int($0) } ?? 0
+        guard k > 0, spots.indices.contains(page), spots[page].indices.contains(index),
+              layout.frames.indices.contains(page) else { return log("kein solcher Link") }
+        let spot = spots[page][index]
+        let frame = layout.frames[page]
+        let s = k * canvas.zoomScale
+        // Mitte des Links: in der Leinwand (Scroll-Koordinaten) und in der Ansicht
+        let p = CGPoint(x: (frame.minX + spot.rect.midX) * s, y: (frame.minY + spot.rect.midY) * s)
+        let v = canvas.convert(p, to: view)
+        guard let hold = value("hold").flatMap({ Double($0) }) else {
+            let images = renderLinkPreview(spot.target)
+            Task { [weak self] in
+                guard let content = await images.value, let self else { return }
+                self.presentLinkPreview(content, target: spot.target, at: v)
+                let y = spot.target.y.map { "\(Int($0))" } ?? "oben"
+                let parts = content.slices.map { "S\($0.page) \(Int($0.top))–\(Int($0.bottom))" }.joined(separator: ", ")
+                let sizes = content.images.map { "\(Int($0.size.width))x\(Int($0.size.height))" }.joined(separator: ", ")
+                log("Vorschau: Seite \(spot.target.page), y \(y), Stücke \(parts), Bilder \(sizes), "
+                    + "Fenster \(self.linkPreview != nil)")
+            }
+            return
+        }
+        if has("ink") {
+            // Probestrich quer über den Link
+            let toCanvas = CGAffineTransform(scaleX: k, y: k)
+            let y = frame.minY + spot.rect.midY
+            let points = (0...20).map { i -> PKStrokePoint in
+                let x = frame.minX + spot.rect.minX - 6 + (spot.rect.width + 12) * CGFloat(i) / 20
+                return PKStrokePoint(location: CGPoint(x: x, y: y).applying(toCanvas), timeOffset: Double(i) * 0.01,
+                                     size: CGSize(width: 3 * k, height: 3 * k), opacity: 1, force: 1, azimuth: 0,
+                                     altitude: .pi / 2)
+            }
+            canvas.drawing.strokes.append(PKStroke(ink: PKInk(.pen, color: .red),
+                                                   path: PKStrokePath(controlPoints: points, creationDate: Date())))
+        }
+        // Wie der Radierer in handleErase: aufsetzen …
+        let before = canvas.drawing.strokes.count
+        usingTool = true
+        eraseStart = canvas.drawing
+        lastErasePoint = nil
+        linkPreviewTouch = false
+        cancelLinkPresentation()
+        moveCursor(to: v)
+        let waits = beginLinkHold(at: p, viewPoint: v)
+        if !waits { erase(at: p) }
+        log("aufgesetzt auf Seite \(page) Link \(index), wartet: \(waits)")
+        // … vielleicht bewegen …
+        let move = value("move").flatMap { Double($0) }.map { CGFloat($0) }
+        let v2 = CGPoint(x: v.x + (move ?? 0), y: v.y)
+        let end = move == nil ? p : canvas.convert(v2, from: view)
+        if let move {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self else { return }
+                self.moveCursor(to: v2)
+                self.eraseMoved(to: end, viewPoint: v2)
+                log("bewegt um \(move) Punkte, wartet noch: \(self.linkHold != nil)")
+            }
+        }
+        // … abheben
+        DispatchQueue.main.asyncAfter(deadline: .now() + hold) { [weak self] in
+            guard let self else { return }
+            if self.linkHold != nil { self.endLinkHold(erasingTo: end) }
+            let previewed = self.linkPreviewTouch
+            self.linkPreviewTouch = false
+            self.usingTool = false
+            self.lastToolEnd = Date()
+            self.eraseStart = nil
+            self.lastErasePoint = nil
+            self.eraserCursor.isHidden = true
+            self.applyPendingWhenIdle()
+            log("abgehoben nach \(hold) s: Vorschau \(previewed), Striche \(before) → \(self.canvas.drawing.strokes.count)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                log("Fenster offen: \(self?.linkPreview != nil)")
+            }
+        }
+    }
+
+    /// Rote Rahmen um die Links, grüne Striche an ihren Zielen (in den Seiten, unter der Tinte)
+    private func toggleLinkOverlay(_ spots: [[LinkSpot]]) {
+        if let old = pagesView.layer.sublayers?.first(where: { $0.name == "link-debug" }) {
+            old.removeFromSuperlayer()
+            return
+        }
+        let links = UIBezierPath(), targets = UIBezierPath()
+        for (i, list) in spots.enumerated() where layout.frames.indices.contains(i) {
+            let frame = layout.frames[i]
+            for spot in list {
+                links.append(UIBezierPath(rect: spot.rect.offsetBy(dx: frame.minX, dy: frame.minY)))
+                guard layout.frames.indices.contains(spot.target.page) else { continue }
+                let f = layout.frames[spot.target.page]
+                let y = f.minY + (spot.target.y ?? 0)
+                targets.move(to: CGPoint(x: f.minX, y: y))
+                targets.addLine(to: CGPoint(x: f.minX + 80, y: y))
+            }
+        }
+        let overlay = CALayer()
+        overlay.name = "link-debug"
+        overlay.frame = pagesView.bounds
+        let red = CAShapeLayer()
+        red.path = links.cgPath
+        red.fillColor = nil
+        red.strokeColor = UIColor.red.cgColor
+        red.lineWidth = 1
+        let green = CAShapeLayer()
+        green.path = targets.cgPath
+        green.fillColor = nil
+        green.strokeColor = UIColor.systemGreen.cgColor
+        green.lineWidth = 3
+        overlay.addSublayer(red)
+        overlay.addSublayer(green)
+        pagesView.layer.addSublayer(overlay)
     }
 }
 #endif

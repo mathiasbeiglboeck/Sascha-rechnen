@@ -149,7 +149,21 @@ struct EditorView: View {
         #if DEBUG
         // Nur für Tests im Simulator: notizbuch://debug/… (CanvasController.debugCommand)
         .onOpenURL { url in
-            if url.scheme == "notizbuch", url.host == "debug" { tools.canvas?.debugCommand(url) }
+            guard url.scheme == "notizbuch", url.host == "debug" else { return }
+            // debug/tool?mode=pen|eraser|lasso|pointer&edit: Werkzeug wie in der Leiste wählen (edit: wie „Bearbeiten“)
+            if url.path == "/tool" {
+                let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+                switch items.first(where: { $0.name == "mode" })?.value {
+                case "pen"?: tools.mode = .pen
+                case "eraser"?: tools.mode = .eraser
+                case "lasso"?: tools.mode = .lasso
+                case "pointer"?: tools.mode = .pointer
+                default: break
+                }
+                if items.contains(where: { $0.name == "edit" }) { tools.viewOnly = false }
+                return
+            }
+            tools.canvas?.debugCommand(url)
         }
         #endif
     }

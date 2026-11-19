@@ -143,7 +143,15 @@ final class PointerGesture: SingleTouchGesture {
 }
 
 /// Radierer: löscht jeden Strich, den der Kreis berührt
-final class EraserGesture: SingleTouchGesture {}
+final class EraserGesture: SingleTouchGesture {
+    /// Sobald der Pencil oder ein Finger aufsetzt, noch bevor die Geste beginnt (ein kurzes Antippen mit dem Finger
+    /// beginnt nie, es endet gleich)
+    var onTouchDown: (() -> Void)?
+
+    override func trackingBegan(_ touch: UITouch, _ event: UIEvent) {
+        onTouchDown?()
+    }
+}
 
 /// Beobachtet das Lasso, ohne je selbst zu erkennen. PencilKit verrät nicht, was es ausgewählt hat; für „Claude
 /// fragen“ merkt sich die App deshalb den Weg des Lassos, in den Koordinaten von `space` (die Seiten: Seitenpunkte,
