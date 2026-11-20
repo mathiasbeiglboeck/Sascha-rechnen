@@ -63,6 +63,18 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private let lassoTracker = LassoTracker()
     /// Der zuletzt gezogene Weg des Lassos (Seitenpunkte)
     private var lassoPath: LassoPath?
+    /// ∞ mit dem Lasso: die Zeichnung beim Aufsetzen des laufenden Wegs (ein Wert, kostet nichts) und `k` dazu. Liegen
+    /// Striche danach verschoben, hat der Weg eine Auswahl verschoben (strokesMoved)
+    private var lassoStart: (drawing: PKDrawing, k: CGFloat)?
+    /// Gezogene Wege des Lassos (ohne Antippen), und wann zuletzt einer endete (auch Antippen)
+    private var lassoPaths = 0
+    private var lastLassoEnd = Date.distantPast
+    /// Der Weg des letzten ∞ (gezählt wie lassoPaths): Nur seine Entscheidung gibt PencilKits Menü wieder frei
+    private var lastInfinity = 0
+    /// ∞, über die noch nicht entschieden ist (ihr Weg), und die Zeichnung beim ersten Aufsetzen danach: Was erst ein
+    /// späterer Weg verschiebt, geht nicht auf ihr Konto
+    private var infinitiesWaiting = Set<Int>()
+    private var infinityNext: [Int: (drawing: PKDrawing, k: CGFloat)] = [:]
     /// Die Markierungen der Fragen an Claude, über der Tinte
     private let askOverlay = AskOverlay()
     private let askTap = MarkTapGesture()
@@ -107,6 +119,17 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         let timers: [DispatchWorkItem]
         /// Bilder der Vorschau einer Stelle im PDF: Sie werden ab dem Erscheinen des Kreises im Hintergrund gezeichnet
         var images: Task<LinkPreviewImages?, Never>?
+    }
+
+    /// Ein ∞ mit dem Lasso, dessen Weg PencilKit vielleicht noch übernimmt (siehe infinityDrawn)
+    private struct PendingInfinity: @unchecked Sendable {
+        let match: InfinityMatch
+        /// Die Zeichnung beim Aufsetzen und ihr `k`
+        let before: PKDrawing
+        let k: CGFloat
+        /// Gezogene Wege des Lassos bis einschließlich diesem
+        let path: Int
+        let ended: Date
     }
 
     private var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
@@ -184,6 +207,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         lassoTracker.delaysTouchesBegan = false
         lassoTracker.delaysTouchesEnded = false
         lassoTracker.space = pagesView
+        lassoTracker.onBegan = { [weak self] in self?.lassoBegan() }
         lassoTracker.onEnded = { [weak self] in self?.lassoEnded($0) }
         lassoTracker.isEnabled = false
         if isPad { lassoTracker.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)] }
@@ -600,7 +624,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     /// schreibt gerade), zählen schon mit: Sonst hielte der Abgleich sie für hier gelöscht.
     private func strokeSnapshot() -> StrokeSnapshot {
         let start = CACurrentMediaTime()
-        var snapshot = StrokeSnapshot(canvas.drawing.strokes, toPage: toPage, pruning: .canvas)
+        var snapshot = StrokeSnapshot(canvas.drawing.strokes, toPage: toPage, pruning: .canvas,
+                                      aliases: sync.aliases(doc.id))
         if !pending.isEmpty {
             snapshot.alsoPresent = Set(pending.added.map { $0.id })
             snapshot.alsoGone = pending.removed
@@ -625,7 +650,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             guard let self, self.warmups == number else { return }
             self.idWarmup = nil
             // Ohne Aufräumen: Ist die Leinwand inzwischen zu, gehört der Speicher vielleicht schon einer anderen
-            done?(StrokeIDCache.shared.ids(for: strokes, toPage: toPage, pruning: .never))
+            done?(StrokeIDCache.shared.ids(for: strokes, toPage: toPage, pruning: .never,
+                                           aliases: self.sync.aliases(self.doc.id)))
             self.applyPendingWhenIdle()
             self.syncCycle()
         }
@@ -844,7 +870,20 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         let start = CACurrentMediaTime()
         let changes = pending
         pending = RemoteChanges()
-        guard let result = StrokeCodec.apply(changes, to: canvas.drawing, scale: k, pruning: .canvas) else { return }
+        // Aliase für Striche aus dem Browser (siehe StrokeCodec.apply): gleich im Sync-Stand, auch wenn sich nichts
+        // einfügt
+        var rekeyed = false
+        let applied = sync.withAliases(doc.id) { aliases in
+            StrokeCodec.apply(changes, to: canvas.drawing, scale: k, pruning: .canvas, aliases: &aliases,
+                              rekeyed: &rekeyed)
+        }
+        // Ein geholter Strich war schon da und gilt nun unter der ID des Servers: Der nächste Abgleich erfasst die
+        // Leinwand neu und löscht so die Fassung unter der alten ID am Server
+        if rekeyed {
+            localChanged = true
+            syncSoon()
+        }
+        guard let result = applied else { return }
         setDrawing(result.drawing)
         // Auf einer leeren Leinwand zeigt PencilKit den ersten Strich von außen sonst nicht an
         if result.wasEmpty { redrawInkSoon() }
@@ -930,7 +969,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         eraserGesture.isEnabled = erasing && !viewOnly
         pointerGesture.isEnabled = pointing && !viewOnly
         lassoTracker.isEnabled = lasso && !viewOnly
-        if !lassoTracker.isEnabled { lassoPath = nil }
+        if !lassoTracker.isEnabled {
+            lassoPath = nil
+            lassoStart = nil
+        }
         if !isPad { canvas.panGestureRecognizer.minimumNumberOfTouches = viewOnly ? 1 : 2 }
         if !erasing { eraserCursor.isHidden = true }
         setPencilKitHover(enabled: !(erasing && !viewOnly))
@@ -2220,14 +2262,38 @@ extension CanvasController: UIGestureRecognizerDelegate {
         }
     }
 
+    /// Ein Weg des Lassos beginnt (auch Antippen): die Zeichnung merken, für ein ∞. Für ein ∞, über das noch nicht
+    /// entschieden ist, ist das zugleich der Stand nach seinem Weg
+    private func lassoBegan() {
+        let start = (drawing: canvas.drawing, k: k)
+        lassoStart = start
+        for path in infinitiesWaiting where infinityNext[path] == nil { infinityNext[path] = start }
+    }
+
     /// Weg des Lassos, sobald er fertig ist. Antippen (Menü öffnen, Auswahl aufheben) zählt nicht, dann bleibt der
     /// vorige Weg. Verschieben der Auswahl (eine Linie ohne Fläche) und Winziges löschen ihn: Er passte nicht mehr.
-    /// Gemessen auf dem Bildschirm, also gleich in jeder Zoomstufe
+    /// Ein ∞ fragt Claude gleich (infinityDrawn). Gemessen auf dem Bildschirm, also gleich in jeder Zoomstufe
     private func lassoEnded(_ raw: [CGPoint]) {
+        lastLassoEnd = Date()
+        let start = lassoStart
+        lassoStart = nil
         guard k > 0 else { return }
         let s = k * canvas.zoomScale
         let points = LassoGeometry.simplified(raw, minStep: 2 / s)
         guard points.count >= 8 else { return }
+        lassoPaths += 1
+        // ∞: vor der Flächenprüfung, denn die beiden Schleifen eines ∞ heben sich dort auf
+        if let match = InfinityGesture.detect(raw, scale: s) {
+            lassoPath = nil
+            lastInfinity = lassoPaths
+            infinitiesWaiting.insert(lassoPaths)
+            let before = start ?? (drawing: canvas.drawing, k: k)
+            infinityDrawn(PendingInfinity(match: match, before: before.drawing, k: before.k, path: lassoPaths,
+                                          ended: Date()))
+            return
+        }
+        // Ein anderer Weg nach einem ∞: PencilKits Menü wieder wie sonst
+        canvas.menuBlockedUntil = .distantPast
         guard LassoGeometry.area(points) * s * s >= 400 else {
             lassoPath = nil
             return
@@ -2328,6 +2394,157 @@ extension CanvasController: UIGestureRecognizerDelegate {
                 }
                 asks.add(id, ask)
                 flash(effort == "thorough" ? "Frage an Claude geschickt (gründlich)" : "Frage an Claude geschickt", 2)
+            } catch {
+                flash("Frage konnte nicht vorbereitet werden: \(error.localizedDescription)", 3)
+            }
+        }
+    }
+
+    // MARK: ∞ mit dem Lasso: Claude erklärt die Stelle (schnell)
+
+    /// Gleich nach dem ∞: aufleuchten und kurz tippen (Pencil Pro, iPhone), PencilKits Menü sperren. Ob der Weg eine
+    /// Auswahl verschoben hat, zeigt sich erst, wenn PencilKit fertig ist (wie bei Strichen bis 0,5 s nach dem Ende des
+    /// Werkzeugs, siehe toolBusy); erst dann fällt seine Auswahl weg und geht die Frage hinaus
+    private func infinityDrawn(_ pending: PendingInfinity) {
+        let glow = pending.match.bounds.insetBy(dx: -4, dy: -4)
+        askOverlay.flash(glow)
+        if #available(iOS 17.5, *), let feedback = holdFeedback as? UICanvasFeedbackGenerator {
+            feedback.pathCompleted(at: view.convert(CGPoint(x: glow.midX, y: glow.midY), from: pagesView))
+        }
+        // Bis zur Entscheidung (höchstens gut 2 s): Antippen der Auswahl öffnet kein Menü
+        canvas.menuBlockedUntil = Date().addingTimeInterval(3)
+        // Ohne weak: Auch wenn der Tab inzwischen wechselt, geht die Frage nach Aufleuchten und Tippen nicht verloren
+        // (die Leinwand bleibt dafür höchstens gut 2 s länger da)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.infinitySettled(pending) }
+    }
+
+    /// PencilKit ist fertig. Hat der Weg Striche verschoben (er begann in einer Auswahl), nur ein Hinweis. Sonst fällt
+    /// PencilKits Auswahl weg, außer ein neuer Weg des Lassos hat inzwischen begonnen (der bleibt ungestört), und die
+    /// Frage geht hinaus. Gespiegelt und an Abläufen geprüft in test/unendlich/entscheidung.js (mit strokesMoved)
+    private func infinitySettled(_ pending: PendingInfinity) {
+        let late = Date().timeIntervalSince(pending.ended) >= 2
+        // Liegt der Pencil (am iPhone der Finger) noch, zeigt erst das Abheben, ob es ein neuer Weg ist oder nur ein
+        // Antippen der Auswahl (das kein Menü öffnen soll). Liegt er nach 2 s noch, gilt er als neuer Weg
+        let newPath = lassoPaths != pending.path || (late && lassoTracker.isTracking)
+        // Eben noch ein Weg oder Antippen, oder PencilKit meldet sein Werkzeug noch: warten, höchstens 2 s nach dem ∞
+        if !newPath, !late,
+           lassoTracker.isTracking || toolBusy || Date().timeIntervalSince(lastLassoEnd) < 0.5 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.infinitySettled(pending) }
+            return
+        }
+        // Verschoben hat das ∞ nur, was beim nächsten Aufsetzen schon anders lag: Was ein späterer Weg verschiebt,
+        // meldet dessen eigenes ∞
+        infinitiesWaiting.remove(pending.path)
+        let after = infinityNext.removeValue(forKey: pending.path) ?? (drawing: canvas.drawing, k: k)
+        // Wartet ein neueres ∞ noch, bleibt sein Menü gesperrt
+        let newest = pending.path == lastInfinity
+        let match = pending.match
+        if Self.strokesMoved(before: pending.before, kBefore: pending.k, now: after.drawing, k: after.k) {
+            if newest { canvas.menuBlockedUntil = .distantPast }
+            Log.ink.info("Lasso-∞ verschob Striche: keine Frage")
+            // Kamen inzwischen fremde Striche, gibt es kein Rückgängig mehr (applyPending)
+            let back = canvas.undoManager?.canUndo == true ? "Rückgängig" : "zurückschieben"
+            onFlashTimed("∞ hat die Auswahl verschoben – \(back), dann die Auswahl aufheben", 3)
+            return
+        }
+        Log.ink.info("Lasso-∞: \(match.summary, privacy: .public)")
+        if newPath {
+            if newest { canvas.menuBlockedUntil = .distantPast }
+        } else {
+            // Ein Antippen gleich danach öffnet noch kein Menü
+            canvas.menuBlockedUntil = Date().addingTimeInterval(0.3)
+            endLassoSelection()
+        }
+        askMeaning(match)
+    }
+
+    /// Hat ein Weg des Lassos Striche verschoben (er begann in einer Auswahl)? Dann fehlt ein Strich von vorher, und
+    /// ein gleicher (gleich groß, gleich viele Punkte) kam an anderer Stelle dazu. Nur gelöscht (Radierer, Rückgängig,
+    /// ein anderes Gerät) oder nur dazugekommen zählt nicht. Über alle Striche: Eine verschobene Auswahl kann weit weg
+    /// vom ∞ liegen. Zeichnungen in Leinwandpunkten, je mit ihrem Maßstab `k`
+    private static func strokesMoved(before: PKDrawing, kBefore: CGFloat, now: PKDrawing, k: CGFloat) -> Bool {
+        let old = strokePrints(before, k: kBefore), new = strokePrints(now, k: k)
+        var gone = Set<[CGFloat]>()
+        for (p, n) in old where (new[p] ?? 0) < n { gone.insert(p.shape) }
+        guard !gone.isEmpty else { return false }
+        return new.contains { p, n in (old[p] ?? 0) < n && gone.contains(p.shape) }
+    }
+
+    /// Abdruck eines Strichs für strokesMoved: Lage und Größe in ¼ Seitenpunkten, Zahl der Punkte. Gerundet, aber nie
+    /// in Int umgewandelt (ein Strich ohne Punkte hat keine endliche Lage)
+    private struct StrokePrint: Hashable {
+        let x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat
+        let points: Int
+        /// Ohne die Lage: bleibt gleich, wenn der Strich nur verschoben wurde
+        var shape: [CGFloat] { [w, h, CGFloat(points)] }
+    }
+
+    /// Wie oft jeder Abdruck vorkommt (StrokePrint), in Seitenpunkten wie inkPrint
+    private static func strokePrints(_ drawing: PKDrawing, k: CGFloat) -> [StrokePrint: Int] {
+        guard k > 0 else { return [:] }
+        func q(_ v: CGFloat) -> CGFloat { (v / k * 4).rounded() }
+        var prints: [StrokePrint: Int] = [:]
+        for stroke in drawing.strokes {
+            let b = stroke.renderBounds
+            prints[StrokePrint(x: q(b.minX), y: q(b.minY), w: q(b.width), h: q(b.height), points: stroke.path.count),
+                   default: 0] += 1
+        }
+        return prints
+    }
+
+    /// „Was bedeutet das?“ zur Stelle unter dem ∞: eine schnelle Frage wie mit „Claude fragen“. Die Frage steht
+    /// gedruckt im Bild der Stelle (Server und Helfer reichen nur die Bilder weiter), und das ist ein JPEG: Mit einem
+    /// Scan als Hintergrund würde ein PNG zu groß für den Server
+    private func askMeaning(_ match: InfinityMatch) {
+        guard k > 0, !layout.frames.isEmpty else { return }
+        guard sync.isConfigured else {
+            onFlashTimed("Erst den Server einrichten (Zahnrad in der Übersicht)", 2.5)
+            return
+        }
+        let page = layout.page(at: match.bounds.midY)
+        let frame = layout.frames[page]
+        guard let spot = InfinityGesture.spot(match.bounds, frame: frame) else {
+            onFlashTimed("Das ∞ liegt nicht auf einer Seite", 2)
+            return
+        }
+        let toCanvas = CGAffineTransform(scaleX: k, y: k)
+        let strokes = canvas.drawing.strokes
+        let spotArea = spot.offsetBy(dx: frame.minX, dy: frame.minY).applying(toCanvas)
+        // Im Notizbuch muss unter dem ∞ etwas geschrieben sein; im PDF steht dort meist Gedrucktes
+        guard pdf != nil || strokes.contains(where: { $0.renderBounds.intersects(spotArea) }) else {
+            onFlashTimed("Unter dem ∞ steht nichts", 2)
+            return
+        }
+        let context = InfinityGesture.context(around: spot, pageSize: frame.size)
+        // Auf dem Bild der ganzen Seite ist die Stelle umrandet wie sonst die Frage
+        let outline = [CGPoint(x: spot.minX - 2, y: spot.minY - 2), CGPoint(x: spot.maxX + 2, y: spot.minY - 2),
+                       CGPoint(x: spot.maxX + 2, y: spot.maxY + 2), CGPoint(x: spot.minX - 2, y: spot.maxY + 2)]
+        // Für die Bilder nur die Striche dieser Seite (nicht die ganze Zeichnung umrechnen)
+        let pageArea = frame.applying(toCanvas)
+        let export = PageExport(frames: layout.frames, pdf: pdf,
+                                ink: PKDrawing(strokes: strokes.filter { $0.renderBounds.intersects(pageArea) })
+                                    .transformed(using: toPage))
+        let ask = Ask(id: UUID().uuidString, status: "local",
+                      anchor: AskAnchor(page: page, x: Double(spot.minX), y: Double(spot.minY),
+                                        w: Double(spot.width), h: Double(spot.height)),
+                      pv: currentPagesVersion, effort: "quick", created: Date().timeIntervalSince1970,
+                      from: isPad ? "iPad" : "iPhone")
+        let folder = sync.asks.imageFolder(doc.id, ask.id)
+        let asks = sync.asks, id = doc.id
+        // Hinweise auch, wenn diese Leinwand inzwischen zu ist (Tab gewechselt)
+        let flash = onFlashTimed
+        Task {
+            do {
+                try await PageExport.run {
+                    let question = export.meaningJPEG(page: page, spot: spot, context: context,
+                                                      caption: InfinityGesture.question)
+                    let pageImage = export.askPageJPEG(page: page, lasso: outline)
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                    try question.write(to: folder.appendingPathComponent("question.jpg"), options: .atomic)
+                    try pageImage.write(to: folder.appendingPathComponent("page.jpg"), options: .atomic)
+                }
+                asks.add(id, ask)
+                flash("∞ – Claude erklärt die Stelle", 2)
             } catch {
                 flash("Frage konnte nicht vorbereitet werden: \(error.localizedDescription)", 3)
             }
@@ -2440,6 +2657,8 @@ extension CanvasController: UIGestureRecognizerDelegate {
 extension CanvasController {
     /// Befehle über Links, etwa `xcrun simctl openurl booted "notizbuch://debug/ask?page=1"`:
     /// - `debug/ask?page=N&effort=quick|thorough`: Frage zu Seite N wie mit dem Lasso (steht dort nichts, erst Probeschrift)
+    /// - `debug/infinity?page=N&x=X&y=Y&w=W&rot=R`: ∞ mit dem Lasso auf Seite N (ab 0 wie bei ask), Mitte X, Y und
+    ///   Breite W in Seitenpunkten (Vorgabe 200, 200, 80), um R Grad geneigt; Protokoll „Lasso-∞: …“
     /// - `debug/card?ask=<id>|first|last`: Karte der Frage zeigen
     /// - `debug/delete?ask=<id>|first|last`: Markierung löschen
     /// - `debug/pages?delete=N`, `?insert=N`, `?undo`, `?done`: Seiten ändern, Rückgängig, Rückgängig verwerfen
@@ -2491,6 +2710,147 @@ extension CanvasController {
                          ink == .monoline ? "Feinstift" : "Stift", x0 - Double(frame.minX), y0 - Double(frame.minY),
                          second.map { String($0) } ?? "keine", Double(k),
                          widths.map { String($0) }.joined(separator: " "))
+        case "/browserids":
+            // Zum Prüfen im Simulator: zehn Browser-Striche (Maus und Stift, fünf Breiten), eingefügt wie fremde Striche. Kennt die
+            // App sie unter der ID des Browsers (Leinwand, Datei, nach Neustart), ein anderes Gerät nach dem Hochladen
+            // mit Vermerk, kommt nach Verlust des Sync-Stands nichts doppelt, und löscht der Browser sie alle? Trifft
+            // der Speicher die beim Einfügen gemerkten Prüfsummen? Nur ohne Server: Sonst gingen die Striche hinauf
+            guard !sync.isConfigured else { return NSLog("Link-Debug: Browser-IDs: nur ohne Server") }
+            guard k > 0, let frame = layout.frames.first else { return NSLog("Link-Debug: Browser-IDs: keine Seite") }
+            let say = { (s: String) in NSLog("Link-Debug: Browser-IDs: %@", s) }
+            let wires = DebugMeasure.browserLike(origin: CGPoint(x: frame.minX, y: frame.minY + 420), straight: false)
+            let wired = DebugMeasure.changes(wires)
+            let wanted = Set(wired.map { $0.id })
+            let before = canvas.drawing.strokes.count
+            let aliasesBefore = sync.aliases(doc.id).count
+            var add = RemoteChanges()
+            add.added = wired
+            pending.merge(add)
+            applyPending()
+            say(DebugMeasure.cacheHits(Array(canvas.drawing.strokes.dropFirst(before)), toPage: toPage,
+                                       aliases: sync.aliases(doc.id)))
+            DebugMeasure.pinKeys(wired, k: k).forEach { say($0) }
+            let onCanvas = Set(StrokeIDCache.shared.ids(for: canvas.drawing.strokes, toPage: toPage,
+                                                        aliases: sync.aliases(doc.id)))
+            say(String(format: "eingefügt %ld, Aliase %ld → %ld, unter Browser-ID auf der Leinwand %ld/%ld",
+                       canvas.drawing.strokes.count - before, aliasesBefore, sync.aliases(doc.id).count,
+                       wired.filter { onCanvas.contains($0.id) }.count, wired.count))
+            // Wie in einer geschlossenen Datei (deliver, Faktor 1), dann gespeichert und geladen
+            var fileAliases: [String: String] = [:]
+            var fileRekeyed = false
+            let file = StrokeCodec.apply(add, to: PKDrawing(), aliases: &fileAliases, rekeyed: &fileRekeyed)?.drawing
+                ?? PKDrawing()
+            let inFile = Set(StrokeIDCache.shared.ids(for: file.strokes, aliases: fileAliases))
+            let reloaded = Set(DebugMeasure.freshIDs(DebugMeasure.roundTrip(file).strokes, toPage: .identity,
+                                                     aliases: fileAliases))
+            say(String(format: "Datei: unter Browser-ID %ld/%ld, nach Speichern und Laden %ld/%ld",
+                       wired.filter { inFile.contains($0.id) }.count, wired.count,
+                       wired.filter { reloaded.contains($0.id) }.count, wired.count))
+            // Neustart: Zeichnung und Sync-Stand auf die Platte, dann von dort (IDs ohne Zwischenspeicher)
+            saveNow()
+            persistSyncStateNow()
+            store.waitForWrites()
+            let stored = (try? Data(contentsOf: store.folder(doc.id).appendingPathComponent("sync.json")))
+                .flatMap { try? JSONDecoder().decode(DocSyncState.self, from: $0) }
+            let diskAliases = stored?.aliases ?? [:]
+            let diskDrawing = (try? Data(contentsOf: store.drawingURL(doc.id))).flatMap { try? PKDrawing(data: $0) }
+                ?? PKDrawing()
+            let restarted = Set(DebugMeasure.freshIDs(diskDrawing.transformed(using: CGAffineTransform(scaleX: k, y: k)).strokes,
+                                                      toPage: toPage, aliases: diskAliases))
+            say(String(format: "Neustart (Datei und sync.json, ohne Zwischenspeicher): Aliase auf der Platte %ld, "
+                       + "unter Browser-ID %ld/%ld", diskAliases.count,
+                       wired.filter { restarted.contains($0.id) }.count, wired.count))
+            // Ein anderes Gerät mit derselben App, nachdem diese App die Striche (etwa nach einem Grabstein) hochgeladen hat
+            let ids = StrokeIDCache.shared.ids(for: canvas.drawing.strokes, toPage: toPage, aliases: sync.aliases(doc.id))
+            var flagged: [(id: String, data: String)] = []
+            var unflagged: [(id: String, data: String)] = []
+            var viewerDev = 0.0
+            for (id, stroke) in zip(ids, canvas.drawing.strokes) where wanted.contains(id) {
+                let data = DebugMeasure.upload(stroke, toPage: toPage, alias: true)
+                flagged.append((id: id, data: data))
+                unflagged.append((id: id, data: DebugMeasure.upload(stroke, toPage: toPage, alias: false)))
+                if let wire = wires.first(where: { DebugMeasure.wireID($0) == id }) {
+                    viewerDev = max(viewerDev, DebugMeasure.viewerWidthDeviation(data, wire))
+                }
+            }
+            say(String(format: "mit Vermerk hochgeladen %ld: anderes Gerät kennt sie (Datei) %ld, (Leinwand k 0,523) %ld; "
+                       + "ohne Vermerk %ld; Breite im Viewer weicht höchstens %.4f ab", flagged.count,
+                       DebugMeasure.otherDevice(flagged, scale: 1), DebugMeasure.otherDevice(flagged, scale: 0.523),
+                       DebugMeasure.otherDevice(unflagged, scale: 1), viewerDev))
+            // Sync-Stand verloren: dieselben Striche kommen noch einmal, die Aliase fehlen
+            let keep = sync.aliases(doc.id)
+            sync.withAliases(doc.id) { $0 = [:] }
+            let beforeAgain = canvas.drawing.strokes.count
+            pending.merge(add)
+            applyPending()
+            say(String(format: "Verlust: noch einmal geliefert, eingefügt %ld (erwartet 0), Aliase wieder %ld/%ld",
+                       canvas.drawing.strokes.count - beforeAgain, sync.aliases(doc.id).count, keep.count))
+            // Die übrigen Aliase des Dokuments wieder dazu: Die Messung soll keine verlieren
+            sync.withAliases(doc.id) { $0.merge(keep) { current, _ in current } }
+            // Der Browser löscht alle zehn
+            var gone = RemoteChanges()
+            gone.removed = wanted
+            pending.merge(gone)
+            applyPending()
+            return say(String(format: "Browser löscht: übrig %ld (erwartet 0), Aliase %ld",
+                              canvas.drawing.strokes.count - before, sync.aliases(doc.id).count))
+        case "/browserwidth":
+            // Zum Prüfen im Simulator: zehn waagrechte schwarze Linien wie aus dem Browser (Maus, Stift mit Druck 0,6), eingefügt
+            // wie fremde Striche. Dicke als Bild (PKDrawing.image) und auf der Leinwand (Bild der Ansicht nach einer
+            // Sekunde, minus vorher). &y= Seitenpunkte der ersten Linie (Vorgabe 120); &clear löscht sie wie der Browser
+            // (danach ausführen). Nur ohne Server: Sonst gingen die Linien hinauf, in den Browser und auf alle Geräte
+            guard !sync.isConfigured else { return NSLog("Link-Debug: Browser-Dicke: nur ohne Server") }
+            guard k > 0, let frame = layout.frames.first else { return NSLog("Link-Debug: Browser-Dicke: keine Seite") }
+            let y0 = Double(frame.minY) + (value("y").flatMap { Double($0) } ?? 120)
+            let wires = DebugMeasure.browserLike(origin: CGPoint(x: frame.minX, y: CGFloat(y0)), straight: true,
+                                                 color: [0, 0, 0, 1])
+            let wired = DebugMeasure.changes(wires)
+            if has("clear") {
+                var gone = RemoteChanges()
+                gone.removed = Set(wired.map { $0.id })
+                let before = canvas.drawing.strokes.count
+                pending.merge(gone)
+                applyPending()
+                return NSLog("Link-Debug: Browser-Dicke: gelöscht %ld (erwartet 10), Aliase %ld",
+                             before - canvas.drawing.strokes.count, sync.aliases(doc.id).count)
+            }
+            let baseline = DebugMeasure.snapshot(canvas)
+            let count = canvas.drawing.strokes.count
+            var add = RemoteChanges()
+            add.added = wired
+            pending.merge(add)
+            applyPending()
+            NSLog("Link-Debug: Browser-Dicke: %@", DebugMeasure.cacheHits(Array(canvas.drawing.strokes.dropFirst(count)),
+                                                                    toPage: toPage, aliases: sync.aliases(doc.id)))
+            let ids = StrokeIDCache.shared.ids(for: canvas.drawing.strokes, toPage: toPage, aliases: sync.aliases(doc.id))
+            let image = wires.map { wire -> String in
+                guard let j = ids.firstIndex(of: DebugMeasure.wireID(wire)) else { return "?" }
+                var s = canvas.drawing.strokes[j]
+                s.transform = StrokeCodec.pageTransform(s, toPage)
+                return String(format: "%.2f→%.2f", wire.p[0][3], DebugMeasure.imageThickness(s, y: wire.p[0][1], x0: wire.p[0][0]))
+            }
+            NSLog("Link-Debug: Browser-Dicke Bild (Breite im Browser→Dicke, Seitenpunkte): Maus %@ | Stift %@",
+                  image[0..<5].joined(separator: " "), image[5...].joined(separator: " "))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                guard let self else { return }
+                let after = DebugMeasure.snapshot(self.canvas)
+                let factor = self.k * self.canvas.zoomScale
+                let offset = self.canvas.bounds.origin
+                let measured = wires.map { wire -> String in
+                    let t = DebugMeasure.canvasThickness(before: baseline, after: after, factor: factor, offset: offset,
+                                                         y: wire.p[0][1], x0: wire.p[0][0])
+                    return String(format: "%.2f→%.2f", wire.p[0][3], t)
+                }
+                NSLog("Link-Debug: Browser-Dicke Leinwand (k %.3f, Zoom %.2f): Maus %@ | Stift %@", Double(self.k),
+                      Double(self.canvas.zoomScale), measured[0..<5].joined(separator: " "),
+                      measured[5...].joined(separator: " "))
+            }
+            return NSLog("Link-Debug: Browser-Dicke: 10 Linien ab y %.0f (Seite), x %.0f bis %.0f, k %.3f, IDs erkannt %ld/10",
+                         y0 - Double(frame.minY), 100.0, 400.0, Double(k), image.filter { $0 != "?" }.count)
+        case "/idtime":
+            // Zum Prüfen im Simulator: Was kosten die Aliase beim Erfassen der IDs? &n= Striche (Vorgabe 20000)
+            let n = value("n").flatMap { Int($0) } ?? 20000
+            return NSLog("Link-Debug: IDs Zeit: %@", DebugMeasure.idTiming(n: n))
         case "/top":
             // Wie ein Tippen auf Uhrzeit oder Akku der eigenen Zeile am iPad
             scrollToTop()
@@ -2544,6 +2904,24 @@ extension CanvasController {
             lassoPath = LassoPath(points: corners, bounds: box, inkPrint: inkPrint(near: box))
             askClaude(effort: value("effort") ?? "quick", from: SelectionMenuContext(space: nil, sourcePoint: .zero))
             log("ask: Seite \(n), \(onPage.count) Striche")
+        case "/infinity":
+            guard k > 0, let n = value("page").flatMap({ Int($0) }), layout.frames.indices.contains(n) else {
+                return log("infinity: keine solche Seite")
+            }
+            let frame = layout.frames[n]
+            let cx = frame.minX + CGFloat(value("x").flatMap { Double($0) } ?? 200)
+            let cy = frame.minY + CGFloat(value("y").flatMap { Double($0) } ?? 200)
+            let half = CGFloat(value("w").flatMap { Double($0) } ?? 80) / 2
+            let rot = CGFloat(value("rot").flatMap { Double($0) } ?? 0) * .pi / 180
+            // Liegende Acht (Gerono), in der Mitte begonnen, wie mit dem Pencil gezogen (Seitenpunkte)
+            let path = (0...240).map { i -> CGPoint in
+                let t = CGFloat(i) / 240 * 2 * .pi
+                let x = half * sin(t), y = half * sin(t) * cos(t)
+                return CGPoint(x: cx + x * cos(rot) - y * sin(rot), y: cy + x * sin(rot) + y * cos(rot))
+            }
+            lassoBegan()
+            lassoEnded(path)
+            log("infinity: Seite \(n), Mitte \(Int(cx - frame.minX)), \(Int(cy - frame.minY)), Breite \(Int(2 * half))")
         case "/card":
             guard let id = pick() else { return log("card: keine Frage") }
             showAnswer(id)

@@ -99,6 +99,28 @@ final class AskOverlay: UIView {
         updateHighlight()
     }
 
+    /// Leuchtet 0,8 s an `rect` auf (Seitenpunkte, alle Seiten untereinander): Ein ∞ mit dem Lasso ist erkannt
+    func flash(_ rect: CGRect) {
+        guard scale > 0 else { return }
+        let box = CGRect(x: rect.minX * scale, y: rect.minY * scale,
+                         width: rect.width * scale, height: rect.height * scale).insetBy(dx: -8, dy: -8)
+        let glow = CAShapeLayer()
+        glow.path = UIBezierPath(roundedRect: box, cornerRadius: 10).cgPath
+        glow.fillColor = UIColor.systemBlue.withAlphaComponent(0.22).cgColor
+        glow.strokeColor = UIColor.systemBlue.cgColor
+        glow.lineWidth = 2
+        glow.opacity = 0
+        layer.addSublayer(glow)
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { glow.removeFromSuperlayer() }
+        let fade = CAKeyframeAnimation(keyPath: "opacity")
+        fade.values = [0, 1, 1, 0]
+        fade.keyTimes = [0, 0.15, 0.55, 1]
+        fade.duration = 0.8
+        glow.add(fade, forKey: "flash")
+        CATransaction.commit()
+    }
+
     private func updateHighlight() {
         guard let id = highlighted, let r = rects[id], scale > 0 else {
             highlight.isHidden = true

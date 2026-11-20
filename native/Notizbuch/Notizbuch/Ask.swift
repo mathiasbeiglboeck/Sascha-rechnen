@@ -390,7 +390,7 @@ final class AskStore: ObservableObject {
             guard uploadError == nil, let ask = self.ask(doc, id), ask.status == "local", ask.deleting != true,
                   ask.hidden != true else { continue }
             let folder = imageFolder(doc, ask.id)
-            guard let question = try? Data(contentsOf: folder.appendingPathComponent("question.png")),
+            guard let question = questionImage(in: folder),
                   let page = try? Data(contentsOf: folder.appendingPathComponent("page.jpg")) else {
                 fail(doc, ask.id, "Die Bilder der Frage fehlen. Bitte noch einmal fragen.")
                 continue
@@ -458,6 +458,15 @@ final class AskStore: ObservableObject {
             apply(doc, list)
         }
         return uploadError
+    }
+
+    /// Das Bild der Frage: question.png (mit dem Lasso markiert: nur die Striche) oder question.jpg (∞: die Stelle samt
+    /// Hintergrund der Seite)
+    private func questionImage(in folder: URL) -> Data? {
+        for name in ["question.png", "question.jpg"] {
+            if let data = try? Data(contentsOf: folder.appendingPathComponent(name)) { return data }
+        }
+        return nil
     }
 
     /// Eine neue Frage hinauf; ist ihr Dokument noch nicht am Server, erst die Bibliothek abgleichen

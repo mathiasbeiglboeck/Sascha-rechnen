@@ -19,7 +19,8 @@ html,body { margin:0; background:var(--bg); color:var(--text); font-family:var(-
   background:var(--glass); -webkit-backdrop-filter:blur(18px) saturate(1.6); backdrop-filter:blur(18px) saturate(1.6);
   box-shadow:0 2px 10px rgba(0,0,0,.09), 0 0 0 .5px rgba(0,0,0,.08);
   -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent; }
-#title { font-size:13px; font-weight:600; max-width:190px; padding:0 4px;
+/* Der Titel gibt der sechsten Farbe ihren Platz (27 px): Die Leiste bricht nicht öfter um als mit fünf */
+#title { font-size:13px; font-weight:600; max-width:163px; padding:0 4px;
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .sep { flex:none; width:1px; height:18px; background:rgba(35,48,42,.15); }
 #tools button { -webkit-appearance:none; appearance:none; margin:0; }
@@ -47,7 +48,7 @@ html,body { margin:0; background:var(--bg); color:var(--text); font-family:var(-
 /* Schmaler (iPad mini, geteilter Bildschirm): enger, damit es in einer Zeile bleibt */
 @media (max-width:820px) {
   #tools { gap:2px 4px; }
-  #title { max-width:110px; }
+  #title { max-width:83px; }
   #tools button.icon { width:28px; }
 }
 /* Handy: oben Name und Status, darunter die Werkzeuge */
@@ -63,6 +64,13 @@ html,body { margin:0; background:var(--bg); color:var(--text); font-family:var(-
   .w { width:19px; }
   #tools button.icon { width:26px; }
 }
+/* Handy hochkant: noch enger, damit die sechs Farben, Dicken und Werkzeuge in einer Zeile bleiben (ab 360 breit,
+   mit „Einfügen“ ab 390) */
+@media (max-width:440px) {
+  #tools { gap:2px; padding:4px 6px; }
+  .dot { width:21px; height:21px; }
+  .w { width:17px; }
+}
 #pages { max-width:1100px; margin:0 auto; padding:6px 0 40px; }
 .page { position:relative; background:#fff; margin:0 auto 6px; }
 .page canvas { position:absolute; inset:0; width:100%; height:100%; }
@@ -73,6 +81,25 @@ body { --ptr:#ff1f8f; }
 /* Wie am iPad: das Zeigestift-Symbol in der eigenen Zeigefarbe */
 #tools #pointer { color:var(--ptr); }
 .page canvas.ink { touch-action:pan-y; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+/* Telefon (kein Pencil): wie in der App am iPhone zuerst „Nur sehen“, ein Finger scrollt, zwei zoomen. Nach „Bearbeiten“
+   zeichnet ein Finger und scrollt nirgends (auch nicht auf Leiste, Lücken und Auswahl); zwei Finger zoomen (Browser) und
+   scrollen (Browser oder Skript, siehe fingers). Ohne pinch-zoom im Browser gilt none, gescrollt wird dann vom Skript.
+   iPad und Computer bleiben bei pan-y */
+body.phone .page canvas.ink { touch-action:manipulation; }
+body.phone.editing, body.phone.editing .page canvas.ink, body.phone.editing #sel { touch-action:none; touch-action:pinch-zoom; }
+#tools #edit, #tools #view { display:none; }
+body.phone #tools #edit { display:inline-flex; }
+body.phone.editing #tools #edit { display:none; }
+body.phone.editing #tools #view { display:inline-grid; }
+body.phone:not(.editing) #colors, body.phone:not(.editing) #widths, body.phone:not(.editing) #pointer,
+body.phone:not(.editing) #eraser, body.phone:not(.editing) #lasso, body.phone:not(.editing) #paste,
+body.phone:not(.editing) #undo, body.phone:not(.editing) .sep, body.phone:not(.editing) .br { display:none; }
+@media (max-width:700px) { #tools #edit, #tools #view { order:-1; } }
+/* Telefon quer (ab 821 breit): Auch das Auge passt noch in die eine Zeile, der Titel gibt den Platz dafür her */
+@media (min-width:821px) { body.phone.editing #title { max-width:127px; } }
+#tools #edit { font:500 12.5px var(--f); height:26px; padding:0 9px 0 7px; border:0; border-radius:13px;
+  background:var(--sel); color:var(--text); align-items:center; gap:4px; cursor:pointer; }
+#edit svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
 body.drawing .page canvas.ink { cursor:crosshair; }
 body.erasing .page canvas.ink { cursor:none; }
 #eraser-cursor { position:fixed; z-index:6; pointer-events:none; border:1.5px solid rgba(0,0,0,.55); border-radius:50%;
@@ -114,6 +141,12 @@ body.lassoing .page canvas.ink { cursor:crosshair; }
   <i class="sep"></i>
   <button id="follow" class="on" title="Mitscrollen, wo gerade geschrieben wird">Folgen</button>
   <span id="status">verbinde …</span>
+  <button id="edit" title="Mit dem Finger zeichnen; zwei Finger scrollen und zoomen">
+    <svg viewBox="0 0 24 24"><path d="M4.5 19.5l1-4.2L15.8 5a1.9 1.9 0 0 1 2.7 0l.5.5a1.9 1.9 0 0 1 0 2.7L8.7 18.5z"/><path d="M14 6.8l3.2 3.2"/></svg>Bearbeiten
+  </button>
+  <button id="view" class="icon" title="Nur sehen: ein Finger scrollt" aria-label="Nur sehen">
+    <svg viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/></svg>
+  </button>
   <i class="br"></i>
 </div></div>
 <div id="pages"></div>
@@ -129,13 +162,21 @@ body.lassoing .page canvas.ink { cursor:crosshair; }
 "use strict";
 const W = 768, GAP = 6, A4H = W * 297 / 210, GRID = W / 30;
 const base = location.pathname.replace(/\/$/, "");
-// Dieselben Farben in derselben Reihenfolge wie am iPad: schwarz, blau, rot, grün, orange
-const COLORS = [[0.1,0.1,0.11],[0.12,0.27,0.64],[0.8,0.17,0.15],[0.13,0.52,0.29],[0.92,0.52,0.1]];
+// Dieselben Farben in derselben Reihenfolge wie in der App: Schwarz, Grau, Blau, Rot, Grün, Orange. Blau bis Orange sind
+// dort Display P3, hier dieselben Farben in sRGB, wie die App sie für ihre Striche sendet (auf drei Stellen gerundet)
+const COLORS = [[0.1,0.1,0.11],[0.66,0.66,0.68],[0.021,0.275,0.56],[0.46,0.008,0],[0.012,0.398,0.322],[0.96,0.607,0.145]];
 // PencilKit zeichnet dünne Striche am iPhone fast unsichtbar: unter etwa 3 Seitenpunkten werden sie blass
 // Die beiden dünnsten wirken am iPhone (PencilKit, kleiner Maßstab) blass, am iPad und im Browser normal
 const WIDTHS = [1.8, 2.5, 3.2, 4.2, 6.5];
-const ERASER_PX = 8;      // Radius am Bildschirm, wie in der App
-let color = 2, width = 2, follow = true, erasing = false, lassoing = false, pointing = false;
+const ERASER_PX = 8;      // Radius am Bildschirm, wie in der App: auch mit zwei Fingern gezoomt gleich groß
+const zoom = () => window.visualViewport?.scale || 1;
+let color = 3, width = 2, follow = true, erasing = false, lassoing = false, pointing = false; // Gäste beginnen mit Rot
+// Telefon: Finger ist der Hauptzeiger, und der Bildschirm ist schmaler als jedes iPad (iPad mini: 744). Dort zeichnet wie in
+// der App am iPhone nach „Bearbeiten“ der Finger (CanvasController: drawingPolicy .anyInput, Scrollen ab zwei Fingern)
+const PHONE = matchMedia("(pointer: coarse)").matches && Math.min(screen.width, screen.height) < 600;
+let editing = false;      // nur am Telefon: false = „Nur sehen“
+const fingerDraws = () => PHONE && editing;
+document.body.classList.toggle("phone", PHONE);
 let sel = null;    // Lasso-Auswahl {ids: Set, bbox}
 let drag = null;   // {ids, dx, dy} während des Verschiebens
 let clip = null;   // kopierte Striche (wire-Objekte)
@@ -177,12 +218,25 @@ function tools() {
   document.body.classList.toggle("lassoing", lassoing);
   document.getElementById("pointer").classList.toggle("on", pointing);
   document.body.classList.toggle("pointing", pointing);
+  document.body.classList.toggle("editing", editing);
   if (!lassoing) select(null);
 }
 document.getElementById("eraser").onclick = () => { erasing = !erasing; lassoing = pointing = false; tools(); };
 document.getElementById("lasso").onclick = () => { lassoing = !lassoing; erasing = pointing = false; tools(); };
 document.getElementById("pointer").onclick = () => { pointing = !pointing; erasing = lassoing = false; tools(); };
+// „Bearbeiten“ und das Auge stehen an derselben Stelle: Wer gleich noch einmal tippt (Doppeltippen), schaltet nicht zurück
+let switched = -Infinity;
+function setEditing(on) {
+  if (performance.now() - switched < 500) return;
+  switched = performance.now();
+  editing = on;
+  if (!on) select(null); // Wie in der App: Im Nur-Sehen-Modus gibt es keine Auswahl, die sich verschieben ließe
+  tools();
+}
+document.getElementById("edit").onclick = () => setEditing(true);
+document.getElementById("view").onclick = () => setEditing(false);
 addEventListener("keydown", (e) => {
+  if (PHONE && !editing) return; // Nur sehen: auch mit Tastatur nichts ändern
   if (e.metaKey || e.ctrlKey || e.altKey) {
     const k = e.key.toLowerCase();
     if (k === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
@@ -200,13 +254,16 @@ addEventListener("keydown", (e) => {
 const cursorEl = document.getElementById("eraser-cursor");
 addEventListener("pointermove", (e) => {
   if (!erasing || e.pointerType === "touch") return;
-  const d = ERASER_PX * 2;
+  const d = ERASER_PX * 2 / zoom();
   cursorEl.style.width = cursorEl.style.height = d + "px";
   cursorEl.style.left = e.clientX + "px"; cursorEl.style.top = e.clientY + "px";
   cursorEl.classList.toggle("show", !!e.target.closest?.(".page"));
 });
 tools();
 document.getElementById("follow").onclick = (e) => { follow = !follow; e.target.classList.toggle("on", follow); };
+// Beginnt hier ein Strich (Radieren, Lasso, Verschieben), hält es das sanfte Mitscrollen an, falls das noch läuft
+let followAt = -Infinity;
+const holdStill = () => { if (performance.now() - followAt < 1500) scrollTo(scrollX, scrollY); };
 function undo() {
   const step = history.pop();
   if (!step) return;
@@ -418,7 +475,7 @@ function hits(st, x, y, r) {
   return false;
 }
 function eraseAt(x, y, erased) {
-  const r = ERASER_PX / scale;
+  const r = ERASER_PX / scale / zoom();
   for (const id of [...order]) {
     const st = strokes.get(id);
     if (!st || !hits(st, x, y, r)) continue;
@@ -532,30 +589,96 @@ document.getElementById("sel-bar").onclick = (e) => {
   else if (act === "cut") { copySel(); deleteSel(); }
   else if (act === "delete") deleteSel();
 };
-// Auswahl ziehen
-let dragStart = null, dragFrame = 0;
+// ---------- Finger ----------
+// Wie in der App (SingleTouchGesture): Ein Finger zeichnet (am Telefon nach „Bearbeiten“) oder zieht die Auswahl. Setzt
+// irgendwo ein zweiter auf, auch auf der Leiste, wird gescrollt oder gezoomt, und was der erste begonnen hat, fällt weg,
+// ohne dass etwas gesendet wird. Zoomen (und in manchen Browsern auch Scrollen) übernimmt der Browser (touch-action:
+// pinch-zoom); er bricht die Finger dann mit pointercancel ab. Kommen ihre Bewegungen weiter hier an, scrollt das Skript
+const fingers = new Map(); // pointerId -> [x, y] aller Finger, die gerade aufliegen
+let fingerAbort = null;    // bricht ab, was der erste Finger begonnen hat
+let pan = null;            // Scrollen mit zwei Fingern: {mid, x, y} beim Aufsetzen
+let panTo = null, panFrame = 0; // Ziel, gescrollt wird einmal je Frame (sonst sähe der zweite Finger schon die neue Lage)
+const others = new Set();  // Stift und Maus, die gerade aufliegen: Solange fängt am Telefon kein Finger (Handballen) etwas an
+// Lage im sichtbaren Ausschnitt: Gezoomt zählen scrollX und scrollTo in Safari ab ihm, clientX aber ab dem Layout-Viewport
+const at = (e) => { const v = window.visualViewport; return v ? [e.pageX - v.pageLeft, e.pageY - v.pageTop] : [e.clientX, e.clientY]; };
+function fingerMid() {
+  let x = 0, y = 0;
+  for (const [a, b] of fingers.values()) { x += a; y += b; }
+  return [x / fingers.size, y / fingers.size];
+}
+const panFrom = () => ({ mid: fingerMid(), x: panFrame ? panTo[0] : scrollX, y: panFrame ? panTo[1] : scrollY });
+// Telefon nach „Bearbeiten“: Antippen (ein Punkt, die Auswahl) soll weder klicken noch per Doppeltippen zoomen
+const noTapZoom = (e) => { if (fingerDraws() && !e.touches.length) e.preventDefault(); };
+addEventListener("pointerdown", (e) => {
+  if (e.pointerType !== "touch") { others.add(e.pointerId); return; }
+  if (e.isPrimary) fingers.clear(); // erster Finger einer neuen Berührung
+  fingers.set(e.pointerId, at(e));
+  if (fingers.size < 2) return;
+  const began = fingerAbort;
+  fingerAbort = null;
+  began?.();
+  // Sonst (am iPad, oder am Telefon im Nur-Sehen-Modus) scrollt und zoomt der Browser selbst
+  if (began || pan || fingerDraws()) pan = panFrom();
+}, true);
+addEventListener("pointermove", (e) => {
+  if (!e.buttons) others.delete(e.pointerId); // ohne Taste liegt nichts auf, auch wenn das Loslassen fehlte (Kontextmenü)
+  if (!fingers.has(e.pointerId)) return;
+  fingers.set(e.pointerId, at(e));
+  if (!pan) return;
+  // Vom Anfang aus gerechnet: Schritte einzeln liefen mit dem Runden des Browsers davon
+  const [mx, my] = fingerMid();
+  panTo = [pan.x + pan.mid[0] - mx, pan.y + pan.mid[1] - my];
+  if (!panFrame) panFrame = requestAnimationFrame(() => { panFrame = 0; scrollTo(...panTo); });
+}, true);
+for (const type of ["pointerup", "pointercancel"]) {
+  addEventListener(type, (e) => {
+    others.delete(e.pointerId);
+    if (!fingers.delete(e.pointerId)) return;
+    // Ein Finger weniger: Die Mitte springt, also von hier aus weiterrechnen. Ein Finger allein scrollt nicht
+    pan = pan && fingers.size > 1 ? panFrom() : null;
+  }, true);
+}
+
+// Auswahl ziehen, nur mit dem Zeiger, der damit begann. Ein zweiter Finger scrollt stattdessen (siehe fingers); am iPad
+// zieht ein Finger aber wie bisher auch, während ein anderer nur aufliegt (Daumen am Rand)
+let dragStart = null, dragFrame = 0, dragId = null;
 selEl.addEventListener("pointerdown", (e) => {
-  if (!sel || !ws || ws.readyState !== 1) return;
-  e.preventDefault(); selEl.setPointerCapture(e.pointerId);
-  dragStart = [e.clientX, e.clientY];
+  const finger = e.pointerType === "touch";
+  if (!sel || dragStart || (finger && fingers.size > 1 && (PHONE || pan)) || (PHONE && !editing) || !ws || ws.readyState !== 1) return;
+  e.preventDefault(); selEl.setPointerCapture(e.pointerId); holdStill();
+  dragStart = [e.clientX, e.clientY]; dragId = e.pointerId;
   drag = { ids: sel.ids, dx: 0, dy: 0 };
+  if (finger) fingerAbort = abortDrag;
 });
 selEl.addEventListener("pointermove", (e) => {
-  if (!dragStart) return;
+  if (!dragStart || e.pointerId !== dragId) return;
   drag.dx = (e.clientX - dragStart[0]) / scale; drag.dy = (e.clientY - dragStart[1]) / scale;
   placeSel();
   cancelAnimationFrame(dragFrame);
   dragFrame = requestAnimationFrame(() => {
+    if (!sel) return;
     const b = sel.bbox, m = 40 + Math.abs(drag ? drag.dy : 0);
     redrawRange(b.y0 - m, b.y1 + m);
   });
 });
-const endDrag = async () => {
+// Ein zweiter Finger kam dazu, oder der Browser hat den Finger abgebrochen: Die Auswahl bleibt, wo sie war, nichts wird gesendet
+function abortDrag() {
+  if (fingerAbort === abortDrag) fingerAbort = null;
   if (!dragStart) return;
+  const m = 40 + Math.abs(drag.dy);
+  dragStart = null; drag = null;
+  placeSel();
+  if (sel) redrawRange(sel.bbox.y0 - m, sel.bbox.y1 + m);
+}
+const endDrag = async (e) => {
+  if (!dragStart || e.pointerId !== dragId) return;
+  if (e.type === "pointercancel" && e.pointerType === "touch") return abortDrag();
+  if (fingerAbort === abortDrag) fingerAbort = null;
   dragStart = null;
-  const { dx, dy } = drag, ids = [...drag.ids];
+  const { dx, dy } = drag, ids = [...drag.ids].filter((id) => strokes.has(id)); // ohne inzwischen anderswo gelöschte
   drag = null;
-  if (Math.hypot(dx, dy) < 0.5) { placeSel(); redrawRange(sel.bbox.y0 - 40, sel.bbox.y1 + 40); return; }
+  if (!sel) return; // inzwischen anderswo gelöscht
+  if (Math.hypot(dx, dy) < 0.5 || !ids.length) { placeSel(); redrawRange(sel.bbox.y0 - 40, sel.bbox.y1 + 40); return; }
   const wires = ids.map(id => shifted(strokes.get(id).wire, dx, dy));
   const b = sel.bbox;
   const newIds = await replaceStrokes(ids, wires);
@@ -564,6 +687,7 @@ const endDrag = async () => {
 };
 selEl.addEventListener("pointerup", endDrag);
 selEl.addEventListener("pointercancel", endDrag);
+selEl.addEventListener("touchend", (e) => { if (!e.target.closest("#sel-bar")) noTapZoom(e); }, { passive: false });
 
 // ---------- Mitzeichnen ----------
 // Mit dem Stift (Pencil) wird die Linie bei mehr Druck etwas breiter, mit der Maus bleibt sie gleich
@@ -571,8 +695,17 @@ function penWidth(w, e) {
   if (e.pointerType !== "pen" || !e.pressure) return w;
   return Math.round(w * (0.95 + 0.5 * Math.min(e.pressure, 1)) * 100) / 100;
 }
+// Ein Finger beginnt Radierer, Lasso und Zeigestift wie in der App (SingleTouchGesture) erst nach 4 Punkten Bewegung oder
+// 70 ms: Kommt bis dahin ein zweiter Finger dazu, ist nichts radiert, keine Auswahl aufgehoben und niemandem etwas gezeigt
+function wait(st, e, go) {
+  st.at = [e.clientX, e.clientY];
+  st.go = () => { if (!st.at) return; clearTimeout(st.timer); st.at = null; go(); };
+  st.timer = setTimeout(st.go, 70);
+}
+const waiting = (st, e) => !!st.at && Math.hypot(e.clientX - st.at[0], e.clientY - st.at[1]) < 4;
 function attachDrawing(el) {
   let cur = null, t0 = 0, rub = null, loop = null, ptr = null;
+  let finger = null; // pointerId des Fingers, mit dem das Laufende begann: Andere Zeiger zählen dann nicht
   const pt = (e) => {
     const r = el.ink.getBoundingClientRect();
     const x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale + frames[el.index].y;
@@ -581,26 +714,61 @@ function attachDrawing(el) {
   // iPad-Safari: Der Pencil würde sonst wie ein Finger scrollen und den Strich abbrechen.
   // Nur Stift-Berührungen werden hier abgefangen, Finger scrollen weiter (auch die Handfläche).
   const stylus = (e) => [...e.changedTouches].some(t => t.touchType === "stylus");
+  // Telefon nach „Bearbeiten“: Ein Strich vom linken oder rechten Rand weg wischt in Safari sonst zur vorigen (nächsten) Seite
+  const atEdge = (e) => [...e.changedTouches].some((t) => {
+    const x = at(t)[0], w = window.visualViewport ? visualViewport.width : innerWidth, m = 24 / zoom(); // 24 Punkte
+    return x < m || x > w - m;
+  });
   for (const type of ["touchstart", "touchmove"]) {
-    el.ink.addEventListener(type, (e) => { if (stylus(e)) e.preventDefault(); }, { passive: false });
+    el.ink.addEventListener(type, (e) => {
+      if (stylus(e) || (type === "touchstart" && fingerDraws() && atEdge(e))) e.preventDefault();
+    }, { passive: false });
   }
+  el.ink.addEventListener("touchend", noTapZoom, { passive: false });
+  // Ein zweiter Finger kam dazu, oder der Browser hat den Finger abgebrochen (pointercancel, etwa weil er zoomt): Was der
+  // Finger begonnen hat, war der Anfang einer Geste zum Scrollen oder Zoomen. Ein Strich wird nie gesendet, ein Lasso nie
+  // fertig (die Auswahl davor bleibt), ein Zeigestift endet; schon Radiertes bleibt radiert und lässt sich zurücknehmen
+  const abort = () => {
+    if (fingerAbort === abort) fingerAbort = null;
+    finger = null;
+    if (ptr) end();
+    if (loop) {
+      clearTimeout(loop.timer);
+      if (loop.prev) select(new Set([...loop.prev].filter((id) => strokes.has(id))));
+      loop = null; lassoPath.setAttribute("d", "");
+    }
+    if (rub) { clearTimeout(rub.timer); if (rub.erased.length) history.push({ added: [], erased: rub.erased }); rub = null; }
+    if (cur) {
+      const drawn = cur.drawn;
+      cur = null; document.body.classList.remove("drawing");
+      if (drawn) drawInk(el.index); // nie gesendet: nur wegwischen
+    }
+  };
   el.ink.addEventListener("pointerdown", (e) => {
-    if (e.pointerType === "touch" || !ws || ws.readyState !== 1) return; // Finger scrollt
-    e.preventDefault(); el.ink.setPointerCapture(e.pointerId);
+    const isFinger = e.pointerType === "touch";
+    // Am Telefon im Nur-Sehen-Modus tut hier nichts etwas. Ein Finger scrollt, außer am Telefon nach „Bearbeiten“;
+    // der zweite Finger einer Geste tut nie etwas (siehe fingers), ebenso ein Finger, solange Stift oder Maus aufliegen
+    if ((PHONE && !editing) || (isFinger && (!PHONE || fingers.size > 1 || others.size)) || !ws || ws.readyState !== 1) return;
+    e.preventDefault(); el.ink.setPointerCapture(e.pointerId); holdStill();
+    finger = isFinger ? e.pointerId : null;
+    if (isFinger) fingerAbort = abort;
     if (pointing) {
-      ptr = { id: CLIENT + "-" + (++pointerCount), unsent: [pt(e)], last: 0, flush: 0 };
-      pointerAdd(ptr.id, CLIENT, ptr.unsent, false, myColor);
-      sendPointer(ptr, false);
+      const p = ptr = { id: CLIENT + "-" + (++pointerCount), unsent: [pt(e)], last: 0, flush: 0 };
+      const show = () => { pointerAdd(p.id, CLIENT, p.unsent, false, myColor); sendPointer(p, false); };
+      if (isFinger) wait(p, e, show); else show();
       return;
     }
     if (lassoing) {
-      select(null);
-      loop = { poly: [pt(e)], screen: [[e.clientX, e.clientY]] };
+      // Die bisherige Auswahl verschwindet erst, wenn das Lasso wirklich beginnt
+      const l = loop = { poly: [pt(e)], screen: [[e.clientX, e.clientY]] };
+      const go = () => { l.prev = sel && sel.ids; select(null); };
+      if (isFinger) wait(l, e, go); else go();
       return;
     }
     if (erasing) {
-      rub = { erased: [], last: pt(e) };
-      eraseAt(...rub.last, rub.erased);
+      const r = rub = { erased: [], last: pt(e) };
+      const go = () => eraseAt(...r.last, r.erased);
+      if (isFinger) wait(r, e, go); else go();
       return;
     }
     document.body.classList.add("drawing");
@@ -609,7 +777,10 @@ function attachDrawing(el) {
     cur = { el, w, pen: e.pointerType === "pen", pts: [[...pt(e), 0, penWidth(w, e), w, 1, 1, 0, 1.571]] };
   });
   el.ink.addEventListener("pointermove", (e) => {
+    if (finger !== null && e.pointerId !== finger) return;
     if (ptr) {
+      if (waiting(ptr, e)) return;
+      ptr.go?.();
       const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
       const pts = (evs.length ? evs : [e]).map(pt);
       pointerAdd(ptr.id, CLIENT, pts, false, myColor);
@@ -625,13 +796,17 @@ function attachDrawing(el) {
     }
     if (loop) {
       loop.poly.push(pt(e)); loop.screen.push([e.clientX, e.clientY]);
+      if (waiting(loop, e)) return;
+      loop.go?.();
       lassoPath.setAttribute("d", "M" + loop.screen.map(p => p.join(" ")).join(" L") + " Z");
       return;
     }
     if (rub) {
+      if (waiting(rub, e)) return;
+      rub.go?.();
       // Zwischenschritte, damit schnelle Bewegungen keine Striche überspringen
       const [x, y] = pt(e), [lx, ly] = rub.last;
-      const step = Math.max(1, ERASER_PX / scale / 2), n = Math.ceil(Math.hypot(x - lx, y - ly) / step);
+      const step = Math.max(1, ERASER_PX / scale / zoom() / 2), n = Math.ceil(Math.hypot(x - lx, y - ly) / step);
       for (let i = 1; i <= n; i++) eraseAt(lx + (x - lx) * i / n, ly + (y - ly) * i / n, rub.erased);
       rub.last = [x, y];
       return;
@@ -645,12 +820,26 @@ function attachDrawing(el) {
       cur.pts.push([x, y, t, cur.pen ? penWidth(cur.w, ev) : cur.w, cur.w, 1, 1, 0, 1.571]);
     }
     const ctx = el.ink.getContext("2d");
+    cur.drawn = true;
     drawWire(ctx, { c: [...COLORS[color], 1], p: cur.pts.slice(-3) }, el.ink.width / W, frames[el.index].y);
   });
-  const end = async () => {
-    if (ptr) { clearTimeout(ptr.flush); pointerAdd(ptr.id, CLIENT, [], true, myColor); sendPointer(ptr, true); ptr = null; return; }
-    if (loop) { const poly = loop.poly; loop = null; finishLasso(poly); return; }
+  const end = async (e) => {
+    if (finger !== null && e && e.pointerId !== finger) return;
+    // Der Browser hat den Finger abgebrochen: wie bei einem zweiten Finger fällt weg, was er begonnen hat
+    if (finger !== null && e?.type === "pointercancel") return abort();
+    if (fingerAbort === abort) fingerAbort = null;
+    finger = null;
+    // Ein Finger, der noch wartete: kurz angetippt zählt (ein Punkt, einmal radieren, Auswahl aufheben), abgebrochen nicht
+    const tap = e?.type === "pointerup";
+    if (ptr) {
+      if (ptr.at && !tap) { clearTimeout(ptr.timer); ptr = null; return; }
+      ptr.go?.();
+      clearTimeout(ptr.flush); pointerAdd(ptr.id, CLIENT, [], true, myColor); sendPointer(ptr, true); ptr = null; return;
+    }
+    if (loop) { loop.go?.(); const poly = loop.poly; loop = null; finishLasso(poly); return; }
     if (rub) {
+      if (tap) rub.go?.();
+      clearTimeout(rub.timer);
       if (rub.erased.length) history.push({ added: [], erased: rub.erased });
       rub = null;
       return;
@@ -790,8 +979,10 @@ function connect() {
       // Der Server hat uns angenommen: Beim nächsten Abbruch wieder nach drei Sekunden versuchen
       retries = 0; httpOk = false;
       setMyColor(msg.color);
-    } else if (msg.type === "view" && follow) {
+    } else if (msg.type === "view" && follow && !fingers.size && !others.size) {
+      // Nicht, solange hier Finger, Stift oder Maus aufliegen: Die Seite liefe sonst unter dem Strich weg
       const target = (msg.y0 * scale) + document.getElementById("pages").offsetTop - document.getElementById("bar").offsetHeight;
+      followAt = performance.now();
       scrollTo({ top: Math.max(0, target), behavior: "smooth" });
     } else if (msg.type === "pointer") {
       pointerAdd(msg.id, msg.from, msg.pts || [], !!msg.end, msg.color);

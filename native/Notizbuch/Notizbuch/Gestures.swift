@@ -159,10 +159,15 @@ final class EraserGesture: SingleTouchGesture {
 /// nichts und lässt sich nicht verhindern. Die Leinwand stellt sie so ein, dass sie keine Berührung verzögert
 final class LassoTracker: UIGestureRecognizer {
     weak var space: UIView?
+    /// Ein Weg beginnt (Finger oder Pencil setzt auf, auch zum Antippen)
+    var onBegan: (() -> Void)?
     /// Der ganze Weg, sobald der Finger oder Pencil abhebt
     var onEnded: (([CGPoint]) -> Void)?
     private var tracked: UITouch?
     private var points: [CGPoint] = []
+
+    /// Wird gerade ein Weg gezogen?
+    var isTracking: Bool { tracked != nil }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         // Ein zweiter Finger (am iPhone: scrollen): Dieser Weg zählt nicht
@@ -174,6 +179,7 @@ final class LassoTracker: UIGestureRecognizer {
         }
         tracked = t
         points = [t.location(in: space ?? view)]
+        onBegan?()
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {

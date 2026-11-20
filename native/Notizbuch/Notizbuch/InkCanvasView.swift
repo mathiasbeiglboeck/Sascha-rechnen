@@ -36,6 +36,8 @@ final class InkCanvasView: PKCanvasView {
     var editingAllowed = true
     /// Weitere Einträge vorn im Menü einer Lasso-Auswahl („Claude fragen“); setzt CanvasController
     var selectionMenuItems: ((SelectionMenuContext) -> [UIMenuElement])?
+    /// Bis dahin kein Menü: Gleich nach einem ∞ mit dem Lasso fragt CanvasController Claude selbst
+    var menuBlockedUntil = Date.distantPast
 
     override init(frame: CGRect) {
         _ = Self.menuHook
@@ -90,6 +92,8 @@ final class InkCanvasView: PKCanvasView {
             #endif
             // Außerhalb des Lasso-Modus gehört ein langer Finger zum Scrollen: kein Menü
             guard lasso else { return UIMenu(children: []) }
+            // Gleich nach einem ∞ auch nicht (PencilKit hat seines oben trotzdem gebaut, sein Zustand ist wie sonst)
+            if let ink = canvas as? InkCanvasView, Date() < ink.menuBlockedUntil { return UIMenu(children: []) }
             // Ohne Menü von PencilKit zeigt UIKit die vorgeschlagenen Einträge: dieselben Regeln für diese
             let base = result?.children ?? ((suggested as? [UIMenuElement]) ?? [])
             let removed = filtered(base)
