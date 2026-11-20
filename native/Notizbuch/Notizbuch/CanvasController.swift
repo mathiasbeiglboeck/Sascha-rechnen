@@ -895,11 +895,22 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         applyTool()
     }
 
-    /// Der Stift für Farbe und Dicke. Die Breite gilt in Seitenpunkten und wächst mit der Leinwand. Die dünnste Stufe
-    /// zeichnet der Feinstift (.monoline): fest breit, ohne Druck, und dünner, als PencilKits Stift (.pen) überhaupt
-    /// geht (etwa 0,88 Punkte der Leinwand). Die anderen Stufen zeichnet der Stift mit Druck wie bisher
+    /// Der Stift für Farbe und Dicke (siehe makeInkingTool)
     private func inkingTool() -> PKInkingTool {
-        PKInkingTool(inkFine ? .monoline : .pen, color: inkColor, width: inkWidth * max(k, 0.5))
+        Self.makeInkingTool(fine: inkFine, color: inkColor, width: inkWidth, k: k)
+    }
+
+    /// Die Breite gilt in Seitenpunkten und wächst mit der Leinwand. Die dünnste Stufe zeichnet der Feinstift
+    /// (.monoline): fest breit, ohne Druck, und dünner, als PencilKits Stift (.pen) überhaupt geht (etwa 0,88 Punkte
+    /// der Leinwand). Die anderen Stufen zeichnet der Stift mit Druck wie bisher. Den Stift hält PencilKit selbst in
+    /// seiner Spanne, den Feinstift nicht (im Simulator blieb dessen Breite auch am iPhone unter der Untergrenze): Er
+    /// bleibt darum hier auf mindestens 0,5 Punkten der Leinwand. Am 13-Zoll-iPad liegt er ohnehin darüber; an iPad mini
+    /// und iPhone wird er so etwas dicker als 0,45 Seitenpunkte, statt ins Ungewisse dünner
+    static func makeInkingTool(fine: Bool, color: UIColor, width: CGFloat, k: CGFloat) -> PKInkingTool {
+        let scaled = width * max(k, 0.5)
+        guard fine else { return PKInkingTool(.pen, color: color, width: scaled) }
+        return PKInkingTool(.monoline, color: color,
+                            width: max(scaled, PKInkingTool.InkType.monoline.validWidthRange.lowerBound))
     }
 
     private func applyTool() {
@@ -2491,7 +2502,7 @@ extension CanvasController {
             let scale = max(k, 0.5)
             let widths = ToolState.widths.indices.map { i -> String in
                 let w = ToolState.widths[i]
-                let tool = PKInkingTool(i == ToolState.fineIndex ? .monoline : .pen, color: .black, width: w * scale)
+                let tool = Self.makeInkingTool(fine: i == ToolState.fineIndex, color: .black, width: w, k: k)
                 let name = i == ToolState.fineIndex ? "fein" : "stift"
                 return String(format: "%@ %.2f→%.2f", name, Double(w), Double(tool.width / scale))
             }

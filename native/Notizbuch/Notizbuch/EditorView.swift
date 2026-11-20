@@ -29,7 +29,7 @@ final class ToolState: ObservableObject {
     /// dickste passt auch quer am 13-Zoll-iPad noch unter die Obergrenze (14,3 × 1376/768 = 25,6), so wird sie hochkant
     /// und quer gleich dick. Fester Druck macht die dicken Stufen deutlich dicker
     static let widths: [CGFloat] = [0.45, 0.65, 3.15, 7.3, 14.3]
-    /// Die dünnste Stufe zeichnet der Feinstift (siehe CanvasController.inkingTool)
+    /// Die dünnste Stufe zeichnet der Feinstift (siehe CanvasController.makeInkingTool)
     static let fineIndex = 0
     /// Durchmesser der Punkte, die in der Leiste für die Dicken stehen: gleiche Schritte wie die Wurzel der Dicke
     static let widthDots: [CGFloat] = [3, 6.5, 10, 13.5, 17]
@@ -165,13 +165,16 @@ struct EditorView: View {
         // gleicht weiter ab und bekommt fremde Striche direkt (ein Vollbild würde sie wie beim Schließen abmelden)
         .overlay {
             if tools.overviewShown, let canvas = tools.canvas {
-                PageOverview(controller: canvas) { tools.overviewShown = false }
-                    // Auch über der Übersicht die eigene Zeile statt der Statusleiste: Kommt diese beim Öffnen wieder,
-                    // ändert sich der sichere Bereich, und Leiste und Leinwand darunter springen
-                    .safeAreaInset(edge: .top, spacing: 0) {
-                        if ownStatusLine { StatusLine(tabs: tabs, showTabs: false) }
-                    }
-                    .transition(.opacity)
+                // Auch über der Übersicht die eigene Zeile statt der Statusleiste: Kommt diese beim Öffnen wieder,
+                // ändert sich der sichere Bereich, und Leiste und Leinwand darunter springen. Die Zeile steht über der
+                // Übersicht, nicht als safeAreaInset: Dessen Rand übergeht die Titelzeile der NavigationStack, sie lag
+                // dann unter Uhrzeit und WLAN (Runde 7)
+                VStack(spacing: 0) {
+                    if ownStatusLine { StatusLine(tabs: tabs, showTabs: false) }
+                    PageOverview(controller: canvas) { tools.overviewShown = false }
+                }
+                .background(Color(white: 0.92).ignoresSafeArea())
+                .transition(.opacity)
             }
         }
         .animation(.easeOut(duration: 0.15), value: tools.overviewShown)
