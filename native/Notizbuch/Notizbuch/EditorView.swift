@@ -25,10 +25,11 @@ final class ToolState: ObservableObject {
     /// (gemessen 19.11. an seiner Seite mit den Stufen von 120) und geht nur von etwa 0,88 bis 25,66 Punkte der
     /// Leinwand. Daraus zurückgerechnet, damit die Striche geometrisch gleichmäßig werden, je etwa 1,7-mal so dick wie
     /// der vorige: gezeichnet ≈ 0,45 · 0,83 · 1,39 · 2,32 · 3,88 (≈ 0,12 · 0,23 · 0,38 · 0,63 · 1,06 mm). Die dünnste
-    /// ist der Feinstift mit fester Breite (.monoline, ohne Druck), die zweite der Stift an seiner Untergrenze. Die
-    /// dickste passt auch quer am 13-Zoll-iPad noch unter die Obergrenze (14,3 × 1376/768 = 25,6), so wird sie hochkant
-    /// und quer gleich dick. Fester Druck macht die dicken Stufen deutlich dicker
-    static let widths: [CGFloat] = [0.45, 0.65, 3.15, 7.3, 14.3]
+    /// ist der Feinstift mit fester Breite (.monoline, ohne Druck), die zweite der Stift an seiner Untergrenze. Seit
+    /// 20.11. ist der Feinstift 0,25 (≈ 0,07 mm): Mit 0,45 unterschied er sich für Mathias kaum von der zweiten Stufe.
+    /// Die dickste passt auch quer am 13-Zoll-iPad noch unter die Obergrenze (14,3 × 1376/768 = 25,6), so wird sie
+    /// hochkant und quer gleich dick. Fester Druck macht die dicken Stufen deutlich dicker
+    static let widths: [CGFloat] = [0.25, 0.65, 3.15, 7.3, 14.3]
     /// Die dünnste Stufe zeichnet der Feinstift (siehe CanvasController.makeInkingTool)
     static let fineIndex = 0
     /// Durchmesser der Punkte, die in der Leiste für die Dicken stehen: gleiche Schritte wie die Wurzel der Dicke

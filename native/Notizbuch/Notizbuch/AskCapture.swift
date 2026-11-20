@@ -110,4 +110,39 @@ extension PageExport {
             ctx.strokePath()
         }
     }
+
+    /// Bild der Stelle unter einem ∞ (statt der Frage): oben die feste Frage `caption` gedruckt, darunter der
+    /// Ausschnitt `r` der Seite `i` (Seitenpunkte relativ zur Seite) samt Hintergrund, die Stelle `spot` pink
+    /// umrandet. 2 bis 4 Pixel je Seitenpunkt wie questionPNG, aber als JPEG wie das Bild der Seite: Mit einem Scan
+    /// oder Foto als Hintergrund würde ein PNG zu groß für den Server
+    func meaningJPEG(page i: Int, spot: CGRect, context r: CGRect, caption: String) -> Data {
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byWordWrapping
+        let attributes: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: 12, weight: .semibold),
+                                                         .foregroundColor: UIColor.black, .paragraphStyle: style]
+        let textWidth = max(r.width - 16, 40)
+        let text = (caption as NSString).boundingRect(with: CGSize(width: textWidth, height: .greatestFiniteMagnitude),
+                                                      options: .usesLineFragmentOrigin, attributes: attributes,
+                                                      context: nil)
+        let band = text.height.rounded(.up) + 12
+        let size = CGSize(width: r.width, height: r.height + band)
+        let long = max(size.width, size.height, 1)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = min(min(max(1600 / long, 2), 4), 4096 / long)
+        format.opaque = true
+        format.preferredRange = .standard
+        return UIGraphicsImageRenderer(size: size, format: format).jpegData(withCompressionQuality: 0.85) { c in
+            let ctx = c.cgContext
+            UIColor(white: 0.93, alpha: 1).setFill()
+            c.fill(CGRect(x: 0, y: 0, width: size.width, height: band))
+            (caption as NSString).draw(with: CGRect(x: 8, y: 6, width: textWidth, height: band - 8),
+                                       options: .usesLineFragmentOrigin, attributes: attributes, context: nil)
+            ctx.translateBy(x: -r.minX, y: band - r.minY)
+            drawRegion(i, region: r, in: ctx, inkScale: format.scale)
+            ctx.setStrokeColor(UIColor(red: 1, green: 0.12, blue: 0.56, alpha: 1).cgColor)
+            ctx.setLineWidth(2)
+            ctx.setLineJoin(.round)
+            ctx.stroke(spot.insetBy(dx: -2, dy: -2))
+        }
+    }
 }

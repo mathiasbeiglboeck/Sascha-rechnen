@@ -68,6 +68,29 @@ struct PageExport: @unchecked Sendable {
         }
     }
 
+    /// Zeichnet nur den Ausschnitt `region` von Seite `i` (Seitenpunkte relativ zur Seite, wie bei `drawPage`):
+    /// Hintergrund und die Tinte, die ihn berührt. Außerhalb bleibt der Kontext, wie er ist
+    func drawRegion(_ i: Int, region: CGRect, in ctx: CGContext, inkScale: CGFloat) {
+        let frame = frames[i]
+        ctx.saveGState()
+        ctx.clip(to: region)
+        ctx.setFillColor(UIColor.white.cgColor)
+        ctx.fill(region)
+        if let page = pdf?.page(at: i + 1) {
+            PageView.drawPDF(page, in: ctx, size: frame.size)
+        } else {
+            PageView.drawGrid(in: ctx, rect: region, lineWidth: 0.5)
+        }
+        let area = region.offsetBy(dx: frame.minX, dy: frame.minY)
+        let own = strokes(on: i).filter { $0.renderBounds.intersects(area) }
+        if !own.isEmpty {
+            UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
+                PKDrawing(strokes: own).image(from: area, scale: inkScale).draw(in: region)
+            }
+        }
+        ctx.restoreGState()
+    }
+
     /// Breite der Seite im PDF: Notizbuchseiten als A4, PDF-Seiten in Originalgröße
     private func outputWidth(_ i: Int) -> CGFloat {
         guard let page = pdf?.page(at: i + 1) else { return 595.28 }

@@ -39,6 +39,9 @@ struct DocSyncState: Codable {
     var ids: [String] = []
     /// meta.modified (Sekunden seit 1970) beim letzten Abgleich
     var syncedModified: Double = 0
+    /// Striche, die die App unter einer anderen eigenen Prüfsumme kennt als der Server (aus dem Browser): eigene
+    /// Prüfsumme → ID des Servers (siehe StrokeCodec.apply). Fehlt in älteren Dateien und ohne solche Striche
+    var aliases: [String: String]?
 }
 
 /// Stand einer Zeichnung für den Abgleich
@@ -52,9 +55,10 @@ struct StrokeSnapshot {
     /// Gelten als entfernt, obwohl sie noch in `strokes` sind: fremde Löschungen, die noch warten
     var alsoGone: Set<String> = []
 
-    /// IDs über den Zwischenspeicher: Nur neue Striche werden gehasht
-    init(_ strokes: [PKStroke], toPage: CGAffineTransform, pruning: StrokeIDCache.Pruning = .never) {
-        let ids = StrokeIDCache.shared.ids(for: strokes, toPage: toPage, pruning: pruning)
+    /// IDs über den Zwischenspeicher: Nur neue Striche werden gehasht. `aliases`: die des Dokuments (SyncEngine.aliases)
+    init(_ strokes: [PKStroke], toPage: CGAffineTransform, pruning: StrokeIDCache.Pruning = .never,
+         aliases: [String: String]) {
+        let ids = StrokeIDCache.shared.ids(for: strokes, toPage: toPage, pruning: pruning, aliases: aliases)
         self.strokes = zip(ids, strokes).map { (id: $0.0, stroke: $0.1) }
         self.toPage = toPage
     }
@@ -104,14 +108,20 @@ final class SyncEngine: ObservableObject {
         /// IDs der Striche, die beim letzten Abgleich auf beiden Seiten vorhanden waren
         var confirmed: Set<String>
         var syncedModified: Double
+        /// Eigene Prüfsumme → ID des Servers (siehe DocSyncState.aliases)
+        var aliases: [String: String]
 
         init(_ s: DocSyncState) {
             seq = s.seq
             confirmed = Set(s.ids)
             syncedModified = s.syncedModified
+            aliases = s.aliases ?? [:]
         }
 
-        var stored: DocSyncState { DocSyncState(seq: seq, ids: Array(confirmed), syncedModified: syncedModified) }
+        var stored: DocSyncState {
+            DocSyncState(seq: seq, ids: Array(confirmed), syncedModified: syncedModified,
+                         aliases: aliases.isEmpty ? nil : aliases)
+        }
     }
     /// Der laufende Abgleich der Bibliothek (nil = keiner)
     private var libraryTask: Task<Void, Never>?
@@ -186,6 +196,9 @@ final class SyncEngine: ObservableObject {
     /// Wie oft fremde Striche ankamen, je Dokument (nur im Speicher): Schritt 2 erkennt daran, was erst während seiner
     /// Abfrage ankam
     private var foreignArrivals: [UUID: Int] = [:]
+    /// Geschlossene Dokumente, in denen ein geholter Strich schon da war und nun unter der ID des Servers gilt (siehe
+    /// StrokeCodec.apply): Ein zweiter Durchgang von `syncClosed` löscht die Fassung unter der alten ID am Server
+    private var rekeyedClosed = Set<UUID>()
 
     /// Höchste Änderungsnummer der Striche je Dokument laut letzter Abfrage der Bibliothek
     private var remoteSeqs: [UUID: Int] = [:]
@@ -281,6 +294,23 @@ final class SyncEngine: ObservableObject {
     /// Höchste Änderungsnummer des Servers, die dieses Gerät für das Dokument schon geholt hat
     func knownSeq(_ id: UUID) -> Int { state(id).seq }
 
+    /// Aliase des Dokuments (eigene Prüfsumme → ID des Servers, siehe StrokeCodec.apply). Jede Berechnung seiner IDs
+    /// nimmt sie mit; geladen werden sie mit dem Sync-Stand, also auch nach einem Neustart vor dem ersten Hashen
+    func aliases(_ id: UUID) -> [String: String] { state(id).aliases }
+
+    /// Für StrokeCodec.apply auf der Leinwand: ändert die Aliase an Ort und Stelle (über eine Kopie kostete jedes
+    /// Einfügen mit neuem Alias alle Einträge). Auf die Platte kommen sie mit dem Sync-Stand, also mit der Zeichnung
+    func withAliases<T>(_ id: UUID, _ body: (inout [String: String]) -> T) -> T {
+        let s = state(id)
+        return body(&s.aliases)
+    }
+
+    /// Auf der offenen Leinwand gilt ein geholter Strich nun unter der ID des Servers (siehe StrokeCodec.apply): Wie bei
+    /// geschlossenen Dokumenten (deliver) gilt die Datei bis zu einem gelungenen Durchgang von `syncClosed` als nicht
+    /// abgeglichen. Schließt die Leinwand, bevor ihr nächster Abgleich die Fassung unter der alten ID am Server löscht,
+    /// und scheitert auch der Durchgang beim Schließen, holt Schritt 4 ihn nach, auch nach einem Neustart
+    func noteRekeyed(_ id: UUID) { state(id).syncedModified = 0 }
+
     /// Schreibt den Sync-Stand auf die Platte, nach allen schon angestoßenen Zeichnungen.
     /// Nur aufrufen, wenn die Zeichnung (auf der Platte oder unterwegs dorthin) alles enthält, was der Stand als
     /// vorhanden kennt. Sonst hielte der nächste Abgleich nach einem Absturz fremde Striche für gelöscht und
@@ -359,7 +389,8 @@ final class SyncEngine: ObservableObject {
         if resend.contains(id) {
             // Nach einem Grabstein zurück (siehe Schritt 3): Nichts gilt mehr als am Server vorhanden, also geht alles
             // noch einmal hinauf. Erst hier, wo sicher kein anderer Abgleich des Dokuments läuft. Ein leerer Stand passt
-            // immer zur Zeichnung, darf also gleich auf die Platte
+            // immer zur Zeichnung, darf also gleich auf die Platte. Die Aliase bleiben: Sie gehören zur Zeichnung, ihre
+            // Striche gehen unter der ID des Servers wieder hinauf
             let s = self.state(id)
             s.seq = 0
             s.confirmed = []
@@ -419,6 +450,10 @@ final class SyncEngine: ObservableObject {
             }
         }
         let generation = bulks[id]?.generation
+        // IDs aus einem Alias: Solche Striche gehen mit Vermerk hinauf, damit andere Geräte sie prüfen (ihre eigene
+        // Prüfsumme weicht ab, siehe StrokeCodec.apply). Stand von jetzt, also wie beim Erfassen der Zeichnung; nur
+        // wenn etwas hinaufgeht (ein bloßes Holen, etwa nach jedem Hinweis des Servers, braucht sie nicht)
+        let aliasIDs = adds.isEmpty || state.aliases.isEmpty ? Set<String>() : Set(state.aliases.values)
         /// Was vom großen Hochladen ab `next` noch fehlt (für den nächsten Abgleich, falls dieser nicht fertig wird)
         func noteWaiting(from next: Int) {
             guard adds.count > Self.chunkSize, let generation, bulks[id]?.generation == generation else { return }
@@ -445,7 +480,8 @@ final class SyncEngine: ObservableObject {
                 let add = part.map { a -> [String: String] in
                     var stroke = a.stroke
                     stroke.transform = StrokeCodec.pageTransform(a.stroke, toPage)
-                    return ["id": a.id, "data": StrokeCodec.data(stroke)]
+                    let alias = !aliasIDs.isEmpty && aliasIDs.contains(String(a.id.prefix(while: { $0 != "#" })))
+                    return ["id": a.id, "data": StrokeCodec.data(stroke, alias: alias)]
                 }
                 let since = state.seq
                 let body = try JSONSerialization.data(withJSONObject: ["since": since, "add": add, "remove": gone])
@@ -455,6 +491,12 @@ final class SyncEngine: ObservableObject {
                 // Gehen ohnehin gleich alle noch einmal hinauf, ist nichts zu vermerken
                 if response.seq < since, !resend.contains(id), !lostAtServer.contains(id) { lostAtServer.insert(id) }
                 state.confirmed.subtract(gone)
+                // Hier Gelöschtes braucht seinen Alias nicht mehr (kommt der Strich zurück, etwa mit Rückgängig, geht er
+                // unter seiner eigenen Prüfsumme hinauf)
+                if !state.aliases.isEmpty, !gone.isEmpty {
+                    let removed = Set(gone)
+                    state.aliases = state.aliases.filter { !removed.contains($0.value) }
+                }
                 for a in part { state.confirmed.insert(a.id) }
                 // Das eigene Echo (was diese Anfrage gerade hochgeladen oder gelöscht hat) nicht zurück an die
                 // Leinwand geben: Hat sich die Zeichnung inzwischen geändert (z. B. Seiten eingefügt, Striche
@@ -529,7 +571,17 @@ final class SyncEngine: ObservableObject {
         }
         guard let doc = store.documents.first(where: { $0.id == id }) else { return }
         let drawing = store.loadDrawing(doc)
-        if let merged = StrokeCodec.apply(changes, to: drawing, pruning: openController == nil ? .closed : .never)?.drawing {
+        let state = self.state(id)
+        var rekeyed = false
+        let applied = StrokeCodec.apply(changes, to: drawing, pruning: openController == nil ? .closed : .never,
+                                        aliases: &state.aliases, rekeyed: &rekeyed)
+        if rekeyed {
+            rekeyedClosed.insert(id)
+            // Bis ein Durchgang mit den neuen IDs gelingt, gilt die Datei als nicht abgeglichen: Schritt 4 holt ihn
+            // nach, auch nach einem Fehler oder Neustart (der Stand geht gleich mit auf die Platte)
+            state.syncedModified = 0
+        }
+        if let merged = applied?.drawing {
             let target = pageTargets[id]
             let pages = PageLayout.pagesNeeded(for: merged, kind: doc.kind, current: target ?? doc.pageCount)
             if let target, pages <= target { pageTargets[id] = nil }
@@ -550,17 +602,26 @@ final class SyncEngine: ObservableObject {
         guard !busy.contains(id), closedPasses[id, default: 0] == passes, openController?.doc.id != id,
               let doc = store.documents.first(where: { $0.id == id }) else { return }
         let opened = openings[id, default: 0]
+        // Was vorher neu zugeordnet wurde (siehe `rekeyedClosed`), erfasst dieser Durchgang schon unter der neuen ID
+        rekeyedClosed.remove(id)
         let snapshot = StrokeSnapshot(store.loadDrawing(doc).strokes, toPage: .identity,
-                                      pruning: openController == nil ? .closed : .never)
+                                      pruning: openController == nil ? .closed : .never, aliases: state(id).aliases)
         guard await syncStrokes(id, snapshot: snapshot) else { return }
         // Währenddessen wieder geöffnet: Das Geholte wartet auf der Leinwand, nicht in der Datei. Den Stand sichert
         // dann die Leinwand, sobald ihre Zeichnung gespeichert ist (sonst wäre er der Datei voraus). War es offen und
         // ist schon wieder zu, fehlt hier, was dort dazukam: Dann gilt der Abgleich nicht als vollständig, und der
         // nächste holt es nach
         guard openController?.doc.id != id, openings[id, default: 0] == opened else { return }
-        state(id).syncedModified = store.documents.first(where: { $0.id == id })?.modified.timeIntervalSince1970 ?? 0
+        // Ein geholter Strich war schon da (siehe `rekeyedClosed`): gleich noch ein Durchgang mit den neuen IDs. Bis
+        // einer gelingt, gilt der Abgleich nicht als vollständig (siehe `deliver`)
+        let rekeyed = rekeyedClosed.remove(id) != nil
+        if !rekeyed {
+            state(id).syncedModified = store.documents.first(where: { $0.id == id })?.modified
+                .timeIntervalSince1970 ?? 0
+        }
         closedPasses[id, default: 0] += 1
         persistState(id)
+        if rekeyed { await syncClosed(id) }
     }
 
     // MARK: Bibliothek
@@ -982,7 +1043,10 @@ final class SyncEngine: ObservableObject {
         }
         let meta = Meta(anchor: ask.anchor, pv: ask.pv, effort: ask.effort, created: ask.created, from: ask.from ?? "")
         part("meta", try JSONEncoder().encode(meta))
-        part("question", filename: "question.png", type: "image/png", question)
+        // Die Frage als PNG (Lasso) oder JPEG (∞); der Server erkennt die Art ohnehin an den ersten Bytes
+        let jpeg = question.starts(with: [0xFF, 0xD8, 0xFF])
+        part("question", filename: jpeg ? "question.jpg" : "question.png", type: jpeg ? "image/jpeg" : "image/png",
+             question)
         part("page", filename: "page.jpg", type: "image/jpeg", page)
         body.append(Data("--\(boundary)--\r\n".utf8))
         let data = try await request("PUT", Self.askPath(doc) + "/" + ask.id, body: body,
