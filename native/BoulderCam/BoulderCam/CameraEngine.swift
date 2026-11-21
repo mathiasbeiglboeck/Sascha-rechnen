@@ -27,7 +27,7 @@ final class CameraEngine: NSObject, ObservableObject,
 
     let session = AVCaptureSession()
     let previewLayer = AVCaptureVideoPreviewLayer()
-    let displayLayer = AVSampleBufferDisplayLayer()
+    let displayLayer: AVSampleBufferDisplayLayer
     private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private var toastToken = 0
     private var wantBack = false
@@ -61,7 +61,9 @@ final class CameraEngine: NSObject, ObservableObject,
     private var lastPublish = 0.0
 
     override init() {
-        renderer = displayLayer.sampleBufferRenderer
+        let layer = AVSampleBufferDisplayLayer()
+        displayLayer = layer
+        renderer = layer.sampleBufferRenderer
         var tb: CMTimebase?
         CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault,
                                         sourceClock: CMClockGetHostTimeClock(), timebaseOut: &tb)

@@ -37,7 +37,7 @@ final class VideoEncoder {
     func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
         var props: CFDictionary?
         if forceKeyframe {
-            props = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary
+            props = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
             forceKeyframe = false
         }
         let output = self.output
