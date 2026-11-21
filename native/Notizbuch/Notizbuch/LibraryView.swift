@@ -149,7 +149,8 @@ struct LibraryView: View {
                     }
                 }
                 ToolbarItem(placement: .topBarLeading) {
-                    if currentFolder == nil {
+                    // Nur am iPad (dort schreibt Sascha mit dem Stift)
+                    if currentFolder == nil && UIDevice.current.userInterfaceIdiom == .pad {
                         Button { showLernen = true } label: { Label("Lernwörter üben", systemImage: "character.book.closed") }
                     }
                 }
