@@ -56,12 +56,24 @@ struct LernView: View {
             model.drawing = PKDrawing(strokes: [stroke])
             abgeben()
         }
+        // Vorab lesen prüfen: zeichne = Probestrich ohne „Fertig“ (nach 0,7 s liest der Mac vorab), fertig = „Fertig“
+        if has("zeichne") {
+            let n = model.drawing.strokes.count
+            let pts = (0...20).map { i -> PKStrokePoint in
+                PKStrokePoint(location: CGPoint(x: 120 + Double(n) * 60 + Double(i) * 2, y: 120 + Double(i) * 4), timeOffset: Double(i) * 0.02,
+                              size: CGSize(width: 5, height: 5), opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2)
+            }
+            let stroke = PKStroke(ink: PKInk(.pen, color: .black), path: PKStrokePath(controlPoints: pts, creationDate: Date()))
+            model.drawing = PKDrawing(strokes: model.drawing.strokes + [stroke])
+        }
+        if has("fertig") { abgeben() }
         if has("ja"), case .bestaetigen(let a) = model.phase { model.bestaetigt(a) }
         if has("nein") { model.nichtBestaetigt() }
         if has("weiter") { model.weiter() }
         if has("nochmal") { model.nochmalVersuchen() }
         if let v = items.first(where: { $0.name == "selbst" })?.value { model.selbstGeprueft(richtig: v == "1") }
         if has("ende") { model.beenden() }
+        NSLog("Lern-Debug: vorab=%d", model.vorabAnzahl)
         NSLog("Lern-Debug: phase=%@ wort=%@ versuch=%d index=%d/%d sterne=%.1f dran=%d woerter=%d log=%d status=%@ stimme=%@",
               String(describing: model.phase), model.aktuell?.wort ?? "-", model.versuch, model.index, model.queue.count,
               model.sterne, model.anzahlDran, model.aktiveWoerter.count, model.log.count, model.status ?? "-",
@@ -142,6 +154,7 @@ struct LernView: View {
             }
 
             LernCanvas(drawing: $model.drawing, radierer: radierer, aktiv: model.phase == .schreiben)
+                .onChange(of: model.drawing) { _, _ in model.zeichnungGeaendert() }
                 .frame(height: 300)
                 .background(Linien())
                 .clipShape(RoundedRectangle(cornerRadius: 16))

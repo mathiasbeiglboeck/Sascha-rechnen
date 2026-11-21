@@ -386,6 +386,7 @@ final class LernModel: ObservableObject {
     }
 
     private func neuesWort() {
+        vorabVerwerfen()
         tippTask?.cancel()
         tippTask = nil
         versuch = 1
@@ -404,10 +405,21 @@ final class LernModel: ObservableObject {
         guard let w = aktuell else { return }
         phase = .lesen
         leseTask?.cancel()
+        vorabTimer?.cancel()
+        // Schon beim Absetzen vorgelesen, und seither nichts geändert: dessen Antwort nehmen (meist schon da)
+        let key = drawing.dataRepresentation()
+        let vorher = vorab?.key == key ? vorab?.task : nil
+        if vorher == nil { vorab?.task.cancel() }
+        vorab = nil
         leseTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let antwort = try await self.lies(image: image, wort: w, versuch: self.versuch)
+                let antwort: LernAntwort
+                if let vorher {
+                    antwort = try await withTaskCancellationHandler { try await vorher.value } onCancel: { vorher.cancel() }
+                } else {
+                    antwort = try await self.lies(image: image, wort: w, versuch: self.versuch)
+                }
                 guard !Task.isCancelled, self.phase == .lesen else { return }
                 self.phase = .bestaetigen(antwort)
                 self.holeTipp(antwort, bild: image, wort: w)
@@ -421,6 +433,56 @@ final class LernModel: ObservableObject {
                 self.sprecher.sprich(["So schreibt man es. Vergleiche selbst."], langsam: false)
             }
         }
+    }
+
+    // MARK: Vorab lesen
+    //
+    // Setzt Sascha den Stift eine Weile ab (vorabPause), liest der Mac schon, was dasteht. Tippt er dann auf „Fertig“,
+    // ohne noch etwas zu ändern, ist die Antwort meist schon da. Schreibt er weiter, wird der Versuch verworfen (der Mac
+    // bricht ab). Höchstens vorabMax Versuche je Wort und Versuch: Jeder kostet eine kleine Anfrage an Claude
+
+    static let vorabPause: Duration = .milliseconds(700)
+    static let vorabMax = 3
+
+    private struct Vorab {
+        let key: Data
+        let task: Task<LernAntwort, Error>
+    }
+    private var vorab: Vorab?
+    private var vorabTimer: Task<Void, Never>?
+    /// Vorab-Versuche zum aktuellen Wort und Versuch
+    @Published private(set) var vorabAnzahl = 0
+
+    /// Die Schrift hat sich geändert (Strich fertig, radiert, gelöscht)
+    func zeichnungGeaendert() {
+        vorabTimer?.cancel()
+        vorabTimer = nil
+        let key = drawing.dataRepresentation()
+        if let v = vorab, v.key != key {
+            v.task.cancel() // löscht die Frage am Server, der Mac bricht ab
+            vorab = nil
+        }
+        guard phase == .schreiben, !drawing.strokes.isEmpty, vorab == nil, vorabAnzahl < Self.vorabMax,
+              let w = aktuell else { return }
+        let versuch = versuch
+        vorabTimer = Task { [weak self] in
+            try? await Task.sleep(for: Self.vorabPause)
+            guard let self, !Task.isCancelled, self.phase == .schreiben, self.aktuell == w, self.vorab == nil,
+                  self.drawing.dataRepresentation() == key, let png = LernView.bild(self.drawing) else { return }
+            self.vorabAnzahl += 1
+            self.vorab = Vorab(key: key, task: Task { [weak self] in
+                guard let self else { throw CancellationError() }
+                return try await self.lies(image: png, wort: w, versuch: versuch)
+            })
+        }
+    }
+
+    private func vorabVerwerfen() {
+        vorabTimer?.cancel()
+        vorabTimer = nil
+        vorab?.task.cancel()
+        vorab = nil
+        vorabAnzahl = 0
     }
 
     /// Weicht das Gelesene ab, gleich den Tipp holen (ein älterer Helfer schickt ihn schon mit)
@@ -493,6 +555,7 @@ final class LernModel: ObservableObject {
     }
 
     func nochmalVersuchen() {
+        vorabVerwerfen()
         versuch = 2
         drawing = PKDrawing()
         phase = .schreiben
@@ -524,6 +587,7 @@ final class LernModel: ObservableObject {
     }
 
     func beenden() {
+        vorabVerwerfen()
         leseTask?.cancel()
         sprecher.stop()
         phase = .start
@@ -601,6 +665,8 @@ final class LernModel: ObservableObject {
         part("page", filename: "page.png", type: "image/png", image)
         body.append(Data("--\(boundary)--\r\n".utf8))
         let path = "/api/doc/lernwoerter/asks"
+        // Zuerst, damit auch ein Abbruch mitten im Hochladen (Vorab-Lesen verworfen) die Frage wieder löscht
+        defer { Task { [sync] in _ = try? await sync.lernRequest("DELETE", path + "/" + id) } }
         do {
             _ = try await sync.lernRequest("PUT", path + "/" + id, body: body, contentType: "multipart/form-data; boundary=\(boundary)")
         } catch let SyncError.http(code, text) where code == 404 && !text.contains("\"code\"") {
@@ -608,7 +674,6 @@ final class LernModel: ObservableObject {
         } catch let SyncError.http(_, text) where text.contains("Lernwort fehlt") {
             throw LeseFehler.alt
         }
-        defer { Task { [sync] in _ = try? await sync.lernRequest("DELETE", path + "/" + id) } }
         // Warten, bis der Mac geantwortet hat (meist wenige Sekunden), höchstens `bis` Sekunden
         let t0 = Date()
         while Date().timeIntervalSince(t0) < bis {
