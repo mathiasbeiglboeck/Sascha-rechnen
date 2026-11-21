@@ -512,6 +512,8 @@ final class LernModel: ObservableObject {
                let antwort = try? JSONDecoder().decode(LernAntwort.self, from: d) {
                 return antwort
             }
+            // Beantwortet, aber nicht als Lernwort (ein Helfer von vor den Lernwörtern antwortet mit Text)
+            if item.status == "answered" { throw LeseFehler.mac("Der Helfer am Mac ist noch nicht neu eingerichtet.") }
             if item.status == "failed" { throw LeseFehler.mac(item.note ?? "Der Mac konnte es nicht lesen.") }
             if let note = item.note, note.contains("Limit") || note.contains("abgemeldet") { throw LeseFehler.mac(note) }
         }
