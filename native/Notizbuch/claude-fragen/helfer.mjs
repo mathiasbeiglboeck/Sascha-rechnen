@@ -737,13 +737,15 @@ async function lernClaude(job, level) {
         { type: "text", text: prompt },
       ] } };
       const r = parseResult(await runClaude(bin, ["-p", "--input-format", "stream-json", "--output-format", "stream-json",
-        "--verbose", ...base("Read")], dir, level.minutes, JSON.stringify(msg) + "\n"));
+        "--verbose", ...base("Read")], dir, level.minutes, JSON.stringify(msg) + "\n", (t) => lernJSON(t) != null));
       if (r.ok || r.auth || r.setup || r.limit || r.transient || current?.cancelled) return r;
       log(job.id, "Bild in der Nachricht geht nicht, wieder mit Read:", r.error);
       lernInline = false;
     }
     if (image) return parseResult(await runClaude(bin, ["-p", lernReadPrompt(image.file), "--output-format", "json", ...base("Read")], dir, level.minutes));
-    return parseResult(await runClaude(bin, ["-p", prompt, "--output-format", "json", ...base("Read")], dir, level.minutes));
+    // Nur Text (der Tipp): Antwort aus stream-json, sobald sie da ist
+    return parseResult(await runClaude(bin, ["-p", prompt, "--output-format", "stream-json", "--verbose", ...base("Read")],
+      dir, level.minutes, null, (t) => lernJSON(t)?.hinweis != null));
   };
 
   if (lern.gelesen) {
@@ -785,7 +787,10 @@ function notifyMac(text) {
     { timeout: 30000, env: cleanEnv() }, () => {});
 }
 
-function runClaude(bin, args, cwd, minutes, input = null) {
+/// early (nur mit --output-format stream-json): Kommt eine Antwort aus reinem Text, für die early(text) gilt, ist sie
+/// fertig. Claude Code schreibt danach noch etwa 2 s lang eine Zusammenfassung (post_turn_summary), bevor „result“
+/// kommt, und braucht dann noch fast 1 s bis zum Ende; darauf wartet bei den Lernwörtern keiner (am Mac gemessen)
+function runClaude(bin, args, cwd, minutes, input = null, early = null) {
   return new Promise((resolve) => {
     fs.mkdirSync(cwd, { recursive: true });
     const child = spawn(bin, args, { cwd, env: cleanEnv(), stdio: [input == null ? "ignore" : "pipe", "pipe", "pipe"] });
@@ -795,7 +800,28 @@ function runClaude(bin, args, cwd, minutes, input = null) {
     }
     if (current) current.child = child;
     let out = "", err = "", timedOut = false;
-    child.stdout.on("data", (d) => (out += d));
+    let line = "", done = false;
+    child.stdout.on("data", (d) => {
+      out += d;
+      if (!early || done) return;
+      line += d;
+      let i;
+      while ((i = line.indexOf("\n")) >= 0) {
+        const l = line.slice(0, i);
+        line = line.slice(i + 1);
+        let m = null;
+        try { m = JSON.parse(l); } catch {}
+        const content = m?.type === "assistant" && Array.isArray(m.message?.content) ? m.message.content : null;
+        if (!content || content.some((c) => c?.type !== "text")) continue;
+        const text = content.map((c) => c.text || "").join("").trim();
+        if (!text || !early(text)) continue;
+        done = true;
+        clearTimeout(timer);
+        resolve({ code: 0, out: JSON.stringify({ type: "result", subtype: "success", is_error: false, result: text, session_id: m.session_id }), err, timedOut: false });
+        stop(child);
+        return;
+      }
+    });
     child.stderr.on("data", (d) => (err += d));
     const timer = setTimeout(() => {
       timedOut = true;

@@ -59,6 +59,14 @@ const session = resume || sid;
 fs.writeFileSync(path.join(sessions, session), "x");
 process.on("SIGTERM", () => { fs.appendFileSync(path.join(DIR, "calls.jsonl"), JSON.stringify({ killed: process.pid }) + "\n"); process.exit(143); });
 const out = (o) => { process.stdout.write(JSON.stringify(o) + "\n"); };
+// Lernwörter: mit stream-json erst die Antwort als assistant-Zeile, dann (wie Claude Code) nach mode.summaryMs eine
+// Zusammenfassung und erst danach result
+const lernOut = (t) => {
+  const done = () => process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: t, session_id: session }) + "\n", () => process.exit(0));
+  if (get("--output-format") !== "stream-json") return done();
+  out({ type: "assistant", session_id: session, message: { role: "assistant", content: [{ type: "text", text: t }] } });
+  setTimeout(() => { out({ type: "system", subtype: "post_turn_summary" }); done(); }, mode.summaryMs || 0);
+};
 const finish = () => {
   if (mode.mode === "limit") {
     // Wie Claude Code heute: Ende in Ortszeit (hier vor zwei Minuten, also gleich wieder frei)
@@ -114,13 +122,11 @@ const finish = () => {
   // Lernwörter: Lesen antwortet mit mode.gelesen (Standard „Farad“), der Hinweis mit einem festen Satz, im Codeblock
   if (prompt.includes("Buchstabe für Buchstabe")) {
     const t = mode.unleserlich ? '{"gelesen": "", "unleserlich": true}' : JSON.stringify({ gelesen: mode.gelesen ?? "Farad" });
-    process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: t, session_id: session }) + "\n", () => process.exit(0));
-    return;
+    return lernOut(t);
   }
   if (prompt.includes("Gesucht war")) {
     const t = "```json\n" + JSON.stringify({ hinweis: "Hör genau hin: Nach dem kurzen a kommt ein doppelter Mitlaut." }) + "\n```";
-    process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: t, session_id: session }) + "\n", () => process.exit(0));
-    return;
+    return lernOut(t);
   }
   // "huge": eine Antwort über der Grenze des Servers (200 000 Zeichen), die er mit 413 ablehnt
   const text = mode.mode === "rich" ? rich : mode.mode === "huge" ? "x".repeat(210000) : `Antwort (${get("--effort")}) auf ${files.join(", ")}: $x^2$`;

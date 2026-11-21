@@ -492,5 +492,16 @@ async function lernTests() {
   x = await lernAnswer(id);
   lc = calls().filter((c) => c.args).slice(n);
   ok(x && lc.length === 1 && !lc[0].stream, "danach gleich Read", lc.map((c) => c.stream));
+  // Antwort nimmt der Helfer, sobald sie da ist, nicht erst nach der Zusammenfassung (hier 4 s)
+  setMode({ mode: "ok", gelesen: "Meer", summaryMs: 4000 });
+  let t0 = Date.now();
+  id = await createLern("Meer");
+  x = await lernAnswer(id);
+  ok(x && Date.now() - t0 < 3000 && JSON.parse(x.answer).richtig === true, `Lesen ohne auf die Zusammenfassung zu warten (${Date.now() - t0} ms)`);
+  t0 = Date.now();
+  id = await createLern("Fahrrad", 1, "Farad");
+  x = await lernAnswer(id);
+  ok(x && Date.now() - t0 < 3000 && /Mitlaut/.test(JSON.parse(x.answer).hinweis), `Tipp ebenso (${Date.now() - t0} ms)`);
+  await sleep(500);
   setMode({ mode: "ok" });
 }
