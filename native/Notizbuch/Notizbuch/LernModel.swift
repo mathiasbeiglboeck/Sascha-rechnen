@@ -153,7 +153,7 @@ final class Sprecher: NSObject, ObservableObject {
     func waehle(_ v: AVSpeechSynthesisVoice?) {
         UserDefaults.standard.set(v?.identifier, forKey: Self.key)
         voice = v ?? Self.beste()
-        sprich(["Hallo Sascha! Schreib das Wort: Landstraße."], langsam: false)
+        sprich(["Landstraße"], langsam: false)
     }
 
     var automatisch: Bool { Self.gewaehlt() == nil }
@@ -186,10 +186,10 @@ final class Sprecher: NSObject, ObservableObject {
     /// Schalter am Start der Lernwörter: auch den Beispielsatz vorsprechen (Standard: nur das Wort)
     static let mitSatzKey = "lernMitSatz"
 
-    /// „Schreib das Wort: Fahrrad.“ Mit dem Schalter dazu „Ich fahre mit dem Fahrrad. – Fahrrad.“ Der Satz hilft nur
+    /// Nur das Wort („Fahrrad“). Mit dem Schalter dazu „Ich fahre mit dem Fahrrad. – Fahrrad.“ Der Satz hilft nur
     /// beim Verstehen (das/dass, Meer/mehr); geschrieben wird nur das Wort
     func diktiere(_ w: LernWort) {
-        var teile = ["Schreib das Wort: \(w.wort)."]
+        var teile = [w.wort]
         if UserDefaults.standard.bool(forKey: Self.mitSatzKey), let s = w.satz, !s.isEmpty {
             teile.append(s)
             teile.append(w.wort)
