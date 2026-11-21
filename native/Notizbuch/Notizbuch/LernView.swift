@@ -123,8 +123,9 @@ struct LernView: View {
             }
             .tint(Self.blau)
 
-            if model.versuch > 1 && model.phase == .schreiben {
-                Text("Zweiter Versuch – du schaffst das!").font(.headline).foregroundStyle(Self.blau)
+            if model.phase == .schreiben {
+                Text(model.versuch > 1 ? "Zweiter Versuch – du schaffst das!" : "Schreib nur das eine Wort.")
+                    .font(.headline).foregroundStyle(model.versuch > 1 ? Self.blau : .secondary)
             }
 
             LernCanvas(drawing: $model.drawing, radierer: radierer, aktiv: model.phase == .schreiben)

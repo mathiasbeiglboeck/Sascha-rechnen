@@ -148,8 +148,10 @@ final class Sprecher: NSObject, ObservableObject {
         }
     }
 
+    /// „Schreib das Wort: Fahrrad. – Ich fahre mit dem Fahrrad. – Fahrrad.“ Der Satz hilft nur beim Verstehen
+    /// (das/dass, Meer/mehr); geschrieben wird nur das Wort
     func diktiere(_ w: LernWort) {
-        var teile = [w.wort]
+        var teile = ["Schreib das Wort: \(w.wort)."]
         if let s = w.satz, !s.isEmpty { teile.append(s) }
         teile.append(w.wort)
         sprich(teile)
