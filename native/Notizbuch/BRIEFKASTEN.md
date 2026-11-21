@@ -70,7 +70,7 @@ curl -sS -X POST "$NOTIZBUCH_URL/api/lernen/woerter" \
 ```
 
 - Schreib jedes Wort genau so, wie es richtig geschrieben wird (Groß- und Kleinschreibung zählt: Hauptwörter groß).
-- Gib zu jedem Wort einen kurzen, kindgerechten Satz mit, in dem das Wort genau so vorkommt. Die App spricht „Wort – Satz – Wort“. Bei gleich klingenden Wörtern (das/dass, Meer/mehr, Lid/Lied) muss der Satz zeigen, welches gemeint ist.
+- Gib zu jedem Wort einen kurzen, kindgerechten Satz mit, in dem das Wort genau so vorkommt. Die App spricht „Schreib das Wort: …“ und, wenn am Start „Mit Beispielsatz vorsprechen“ an ist, danach Satz und Wort. Bei gleich klingenden Wörtern (das/dass, Meer/mehr, Lid/Lied) muss der Satz zeigen, welches gemeint ist.
 - Ein schon bekanntes Wort behält seinen Lernstand; neu mitgeschickter Satz ersetzt den alten. Entfernen: `{"remove":["Meer"]}`.
 - Alte Wörter bleiben in der Wiederholung (Lernkartei), bis sie jemand entfernt. Höchstens 500 Wörter.
 
