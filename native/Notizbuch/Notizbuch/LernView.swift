@@ -95,7 +95,7 @@ struct LernView: View {
                 Text(s).font(.callout).foregroundStyle(.orange).multilineTextAlignment(.center).padding(.horizontal)
             }
             Spacer()
-            Text("Stimme: \(model.sprecher.stimme)").font(.caption2).foregroundStyle(.tertiary)
+            Text("Stimme: \(model.sprecher.stimme) (ändern unter „Wörter“)").font(.caption2).foregroundStyle(.tertiary)
         }
         .padding(.vertical)
     }
@@ -207,8 +207,15 @@ struct LernView: View {
         case .tipp(let t):
             box {
                 Text("Fast! 💡").font(.system(size: 34, weight: .bold, design: .rounded)).foregroundStyle(.orange)
-                Text(t).font(.title3).multilineTextAlignment(.center)
-                grosserKnopf("Nochmal versuchen", farbe: Self.blau) { model.nochmalVersuchen() }
+                if let t {
+                    Text(t).font(.title3).multilineTextAlignment(.center)
+                    grosserKnopf("Nochmal versuchen", farbe: Self.blau) { model.nochmalVersuchen() }
+                } else {
+                    HStack(spacing: 12) {
+                        ProgressView()
+                        Text("Ich überlege mir einen Tipp für dich …").font(.title3)
+                    }
+                }
             }
         case .aufloesung(let h):
             box {
@@ -428,6 +435,7 @@ struct LernWoerterSheet: View {
                         Task { await model.aendern(remove: remove) }
                     }
                 }
+                StimmenSection(sprecher: model.sprecher)
                 if let s = model.status { Section { Text(s).foregroundStyle(.orange) } }
             }
             .navigationTitle("Lernwörter")
@@ -449,6 +457,31 @@ private struct Fach: View {
                     Circle().fill(i <= fach ? Color.green : Color.gray.opacity(0.25)).frame(width: 8, height: 8)
                 }
             }
+        }
+    }
+}
+
+/// Stimme wählen: automatisch oder eine der deutschen Stimmen dieses Geräts (antippen spricht eine Probe)
+private struct StimmenSection: View {
+    @ObservedObject var sprecher: Sprecher
+    var body: some View {
+        Section {
+            Button { sprecher.waehle(nil) } label: {
+                HStack { Text("Automatisch (die beste)"); Spacer(); if sprecher.automatisch { Image(systemName: "checkmark") } }
+            }
+            ForEach(Sprecher.deutsche, id: \.identifier) { v in
+                Button { sprecher.waehle(v) } label: {
+                    HStack {
+                        Text(Sprecher.titel(v))
+                        Spacer()
+                        if !sprecher.automatisch && sprecher.voice?.identifier == v.identifier { Image(systemName: "checkmark") }
+                    }
+                }
+            }
+        } header: {
+            Text("Stimme")
+        } footer: {
+            Text("Antippen zum Probehören. Schönere Stimmen am iPad laden: Settings › Accessibility › Spoken Content › Voices › German, dort „Enhanced“ oder „Premium“.")
         }
     }
 }

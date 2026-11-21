@@ -120,17 +120,52 @@ func lernNorm(_ s: String) -> String {
 @MainActor
 final class Sprecher: NSObject, ObservableObject {
     private let synth = AVSpeechSynthesizer()
-    let voice: AVSpeechSynthesisVoice?
+    @Published private(set) var voice: AVSpeechSynthesisVoice?
+    private static let key = "lernStimme"
 
     override init() {
+        super.init()
+        voice = Self.gewaehlt() ?? Self.beste()
+    }
+
+    /// Alle deutschen Stimmen auf diesem Gerät, beste Qualität zuerst
+    static var deutsche: [AVSpeechSynthesisVoice] {
+        AVSpeechSynthesisVoice.speechVoices().filter { $0.language.hasPrefix("de") }
+            .sorted { $0.quality.rawValue != $1.quality.rawValue ? $0.quality.rawValue > $1.quality.rawValue : $0.name < $1.name }
+    }
+
+    private static func gewaehlt() -> AVSpeechSynthesisVoice? {
+        UserDefaults.standard.string(forKey: key).flatMap { AVSpeechSynthesisVoice(identifier: $0) }
+    }
+
+    /// Ohne eigene Wahl: die beste österreichische, wenn sie mindestens so gut ist wie die beste deutsche
+    private static func beste() -> AVSpeechSynthesisVoice? {
         let all = AVSpeechSynthesisVoice.speechVoices()
         func best(_ lang: String) -> AVSpeechSynthesisVoice? {
             all.filter { $0.language == lang }.max { $0.quality.rawValue < $1.quality.rawValue }
         }
-        // Eine österreichische Stimme nur, wenn sie mindestens so gut ist wie die beste deutsche
         let at = best("de-AT"), de = best("de-DE")
-        if let at, (at.quality.rawValue >= (de?.quality.rawValue ?? 0)) { voice = at } else { voice = de ?? at }
-        super.init()
+        if let at, at.quality.rawValue >= (de?.quality.rawValue ?? 0) { return at }
+        return de ?? at
+    }
+
+    /// Stimme wählen (nil: automatisch) und kurz probehören
+    func waehle(_ v: AVSpeechSynthesisVoice?) {
+        UserDefaults.standard.set(v?.identifier, forKey: Self.key)
+        voice = v ?? Self.beste()
+        sprich(["Hallo Sascha! Schreib das Wort: Landstraße."], langsam: false)
+    }
+
+    var automatisch: Bool { Self.gewaehlt() == nil }
+
+    static func titel(_ v: AVSpeechSynthesisVoice) -> String {
+        let q: String
+        switch v.quality {
+        case .premium: q = " · Premium"
+        case .enhanced: q = " · Enhanced"
+        default: q = ""
+        }
+        return "\(v.name) (\(v.language))\(q)"
     }
 
     var stimme: String { voice.map { "\($0.name) (\($0.language))" } ?? "Standardstimme" }
@@ -157,6 +192,15 @@ final class Sprecher: NSObject, ObservableObject {
         sprich(teile)
     }
 
+    /// Hängt an, was gerade gesprochen wird, statt es abzubrechen
+    func sprichDanach(_ t: String) {
+        let u = AVSpeechUtterance(string: t)
+        u.voice = voice
+        u.rate = AVSpeechUtteranceDefaultSpeechRate * 0.95
+        u.preUtteranceDelay = 0.4
+        synth.speak(u)
+    }
+
     func stop() { synth.stopSpeaking(at: .immediate) }
 }
 
@@ -173,7 +217,8 @@ final class LernModel: ObservableObject {
         /// Richtig (beim ersten oder zweiten Versuch)
         case richtig(zweiter: Bool)
         /// Erster Versuch falsch: Hinweis, gleich nochmal
-        case tipp(String)
+        /// nil: der Tipp ist noch unterwegs
+        case tipp(String?)
         /// Zweiter Versuch falsch: das richtige Wort zeigen
         case aufloesung(String?)
         /// Der Mac antwortet nicht: selbst vergleichen
@@ -204,6 +249,9 @@ final class LernModel: ObservableObject {
     private var gelesen: [String] = []
     private var wiederholt: [String: Int] = [:]
     private var leseTask: Task<Void, Never>?
+    /// Der Tipp, im Hintergrund geholt, sobald das Gelesene vom Wort abweicht (Sascha prüft derweil das Gelesene)
+    private var tippTask: Task<String?, Never>?
+    private var letztesBild: Data?
 
     init(sync: SyncEngine) {
         self.sync = sync
@@ -319,6 +367,8 @@ final class LernModel: ObservableObject {
     }
 
     private func neuesWort() {
+        tippTask?.cancel()
+        tippTask = nil
         versuch = 1
         gelesen = []
         drawing = PKDrawing()
@@ -341,6 +391,7 @@ final class LernModel: ObservableObject {
                 let antwort = try await self.lies(image: image, wort: w, versuch: self.versuch)
                 guard !Task.isCancelled, self.phase == .lesen else { return }
                 self.phase = .bestaetigen(antwort)
+                self.holeTipp(antwort, bild: image, wort: w)
                 if antwort.unleserlich == true {
                     self.sprecher.sprich(["Das konnte ich nicht lesen. Schreib es bitte noch einmal, etwas größer."], langsam: false)
                 }
@@ -350,6 +401,22 @@ final class LernModel: ObservableObject {
                 self.phase = .selbst(error.localizedDescription)
                 self.sprecher.sprich(["So schreibt man es. Vergleiche selbst."], langsam: false)
             }
+        }
+    }
+
+    /// Weicht das Gelesene ab, gleich den Tipp holen (ein älterer Helfer schickt ihn schon mit)
+    private func holeTipp(_ a: LernAntwort, bild: Data, wort: LernWort) {
+        tippTask?.cancel()
+        tippTask = nil
+        guard a.unleserlich != true, !a.gelesen.isEmpty, lernNorm(a.gelesen) != lernNorm(wort.wort) else { return }
+        if let h = a.hinweis {
+            tippTask = Task { h }
+            return
+        }
+        let versuch = versuch
+        tippTask = Task { [weak self] in
+            guard let self else { return nil }
+            return try? await self.lies(image: bild, wort: wort, versuch: versuch, gelesen: a.gelesen, bis: 30).hinweis
         }
     }
 
@@ -369,18 +436,40 @@ final class LernModel: ObservableObject {
             phase = .richtig(zweiter: versuch > 1)
             sprecher.sprich([lobText], langsam: false)
         } else if versuch == 1 {
-            let tipp = a.hinweis ?? "Schau dir das Wort noch einmal genau an und hör gut hin."
-            phase = .tipp(tipp)
-            sprecher.sprich(["Fast!", tipp], langsam: false)
+            phase = .tipp(nil)
+            sprecher.sprich(["Fast!"], langsam: false)
+            zeigeTipp(index: index) { model, tipp in
+                let t = tipp ?? "Schau dir das Wort noch einmal genau an und hör gut hin."
+                model.phase = .tipp(t)
+                model.sprecher.sprich([t], langsam: false)
+            }
         } else {
             ergebnis("falsch")
-            phase = .aufloesung(a.hinweis)
-            sprecher.sprich(["Das war knifflig. So schreibt man es:", w.wort] + (a.hinweis.map { [$0] } ?? []), langsam: false)
+            phase = .aufloesung(nil)
+            sprecher.sprich(["Das war knifflig. So schreibt man es:", w.wort], langsam: false)
+            zeigeTipp(index: index) { model, tipp in
+                guard let tipp else { return }
+                model.phase = .aufloesung(tipp)
+                model.sprecher.sprichDanach(tipp)
+            }
+        }
+    }
+
+    /// Wartet auf den Tipp und zeigt ihn, solange noch dasselbe Wort mit derselben Karte dran ist
+    private func zeigeTipp(index: Int, _ show: @escaping (LernModel, String?) -> Void) {
+        let task = tippTask
+        let before = phase
+        Task { [weak self] in
+            let tipp = await task?.value
+            guard let self, self.index == index, self.phase == before else { return }
+            show(self, tipp)
         }
     }
 
     /// Sascha: „Nein, so habe ich es nicht geschrieben“: seine Schrift bleibt, er bessert aus
     func nichtBestaetigt() {
+        tippTask?.cancel()
+        tippTask = nil
         phase = .schreiben
     }
 
@@ -457,7 +546,11 @@ final class LernModel: ObservableObject {
         var wort: String
         var satz: String?
         var versuch: Int
+        /// Nur den Tipp holen: was Sascha geschrieben hat
+        var gelesen: String?
     }
+
+    private struct NurTipp: Decodable { var hinweis: String? }
 
     private struct AskList: Decodable {
         struct Item: Decodable { var id: String; var status: String; var answer: String?; var note: String? }
@@ -475,7 +568,8 @@ final class LernModel: ObservableObject {
         }
     }
 
-    private func lies(image: Data, wort: LernWort, versuch: Int) async throws -> LernAntwort {
+    private func lies(image: Data, wort: LernWort, versuch: Int, gelesen: String? = nil,
+                      bis: Double = 120) async throws -> LernAntwort {
         let id = UUID().uuidString
         let boundary = "BetterNotes-" + UUID().uuidString
         var body = Data()
@@ -489,7 +583,7 @@ final class LernModel: ObservableObject {
             body.append(Data("\r\n".utf8))
         }
         let meta = Meta(created: Date().timeIntervalSince1970, from: UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone",
-                        wort: wort.wort, satz: wort.satz, versuch: versuch)
+                        wort: wort.wort, satz: wort.satz, versuch: versuch, gelesen: gelesen)
         part("meta", try JSONEncoder().encode(meta))
         part("question", filename: "question.png", type: "image/png", image)
         part("page", filename: "page.png", type: "image/png", image)
@@ -503,16 +597,21 @@ final class LernModel: ObservableObject {
             throw LeseFehler.alt
         }
         defer { Task { [sync] in _ = try? await sync.lernRequest("DELETE", path + "/" + id) } }
-        // Warten, bis der Mac geantwortet hat (meist 5 bis 20 Sekunden), höchstens 2 Minuten
+        // Warten, bis der Mac geantwortet hat (meist wenige Sekunden), höchstens `bis` Sekunden
         let t0 = Date()
-        while Date().timeIntervalSince(t0) < 120 {
-            try await Task.sleep(for: .milliseconds(1500))
+        while Date().timeIntervalSince(t0) < bis {
+            try await Task.sleep(for: .milliseconds(700))
             guard let data = try? await sync.lernRequest("GET", path),
                   let list = try? JSONDecoder().decode(AskList.self, from: data),
                   let item = list.asks.first(where: { $0.id == id }) else { continue }
             if item.status == "answered", let a = item.answer, let d = a.data(using: .utf8),
                let antwort = try? JSONDecoder().decode(LernAntwort.self, from: d) {
                 return antwort
+            }
+            // Antwort nur mit dem Tipp
+            if gelesen != nil, item.status == "answered", let a = item.answer, let d = a.data(using: .utf8),
+               let t = try? JSONDecoder().decode(NurTipp.self, from: d) {
+                return LernAntwort(gelesen: gelesen ?? "", richtig: false, hinweis: t.hinweis)
             }
             // Beantwortet, aber nicht als Lernwort (ein Helfer von vor den Lernwörtern antwortet mit Text)
             if item.status == "answered" { throw LeseFehler.mac("Der Helfer am Mac ist noch nicht neu eingerichtet.") }

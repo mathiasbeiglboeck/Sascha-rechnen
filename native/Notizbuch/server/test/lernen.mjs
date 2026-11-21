@@ -96,7 +96,7 @@ async function main() {
   r = await api("GET", "/api/asks/open");
   ok(r.data.asks[0].id === id, "Lernwort zuerst", r.data);
   r = await api("POST", `/api/asks/${id}/claim`, { json: { lease: 300 } });
-  ok(r.status === 200 && r.data.lern?.wort === "Fahrrad" && r.data.lern.versuch === 2 && r.data.lern.satz, "claim mit Wort", r.data);
+  ok(r.status === 200 && r.data.lern?.wort === "Fahrrad" && r.data.lern.versuch === 2 && r.data.lern.satz && r.data.lern.gelesen === null, "claim mit Wort", r.data);
   const claim = r.data.claim;
   r = await api("PUT", `/api/asks/${id}/answer`, { json: { claim, markdown: JSON.stringify({ gelesen: "Farad" }) } });
   ok(r.status === 200, "beantwortet");
@@ -105,6 +105,12 @@ async function main() {
   r = await api("DELETE", `/api/doc/lernwoerter/asks/${id}`);
   ok(r.status === 200 && r.data.asks.length === 0, "aufgeräumt", r.data);
 
+  // Nur den Tipp: mit dem Gelesenen
+  const tid = uuid();
+  r = await api("PUT", `/api/doc/lernwoerter/asks/${tid}`, { body: form({ anchor, pv: 0, created: Date.now() / 1000, from: "iPad", wort: "Fahrrad", versuch: 1, gelesen: " Farad " }) });
+  r = await api("POST", `/api/asks/${tid}/claim`, { json: { lease: 300 } });
+  ok(r.status === 200 && r.data.lern?.gelesen === "Farad", "Tipp-Frage: gelesen kommt mit", r.data);
+  await api("DELETE", `/api/doc/lernwoerter/asks/${tid}`);
   await api("DELETE", `/api/doc/${doc}/asks/${normal}`);
   app.ws.close(); helper.ws.close();
   console.log(`\n${passes} ok, ${failures} FAIL`);

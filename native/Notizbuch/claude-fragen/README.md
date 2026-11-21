@@ -45,7 +45,7 @@ In `~/Library/Application Support/BetterNotes-Helfer/config.json`, danach den He
 "thorough": { "effort": "max",    "model": null, "minutes": 45 }
 ```
 
-Lernwörter (für Sascha, siehe BRIEFKASTEN.md) laufen mit eigener Stufe, schnell, weil ein Kind wartet: `"lernen": { "effort": "low", "model": null, "minutes": 3 }`. Dabei liest Claude zuerst nur das Bild und schreibt ab, was dasteht, ohne das gesuchte Wort zu kennen (sonst würde es das richtige Wort hineinlesen); erst wenn es abweicht, kommt im selben kurzen Chat das Wort dazu, und Claude gibt einen Hinweis auf die Rechtschreibregel. Ohne Internet, nur Read im Ordner des Wortes (`chats/lernwoerter/<id>`, nach 7 Tagen weg). Lernwörter kommen vor anderen Fragen dran.
+Lernwörter (für Sascha, siehe BRIEFKASTEN.md) laufen mit eigener Stufe, schnell, weil ein Kind wartet: `"lernen": { "effort": "low", "model": null, "minutes": 3 }`. Dabei bekommt Claude das Bild gleich in der Nachricht und schreibt ab, was dasteht, ohne das gesuchte Wort zu kennen (sonst würde es das richtige Wort hineinlesen). Weicht es ab, fragt die App sofort im Hintergrund nach einem Hinweis auf die Rechtschreibregel (eigene kurze Frage mit Wort und Gelesenem), während Sascha das Gelesene prüft. Ohne Internet, nur Read im Ordner des Wortes (`chats/lernwoerter/<id>`, nach 7 Tagen weg). Lernwörter kommen vor anderen Fragen dran.
 
 `effort` ist die Denkstufe von `claude --effort`, `model` ein Modell für `claude --model` (`null`: das Standardmodell), `minutes` die längste Zeit für eine Antwort.
 

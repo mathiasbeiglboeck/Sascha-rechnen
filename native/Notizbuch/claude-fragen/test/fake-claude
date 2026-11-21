@@ -35,11 +35,20 @@ let mode = { mode: "ok" };
 try { mode = JSON.parse(fs.readFileSync(path.join(DIR, "mode.json"), "utf8")); } catch {}
 const sessions = path.join(DIR, "sessions");
 fs.mkdirSync(sessions, { recursive: true });
-const prompt = get("-p") || "";
+// stream-json: die Nachricht kommt über stdin (Bild + Text), wie beim Lesen der Lernwörter
+let stdinMsg = null;
+if (get("--input-format") === "stream-json") {
+  try { stdinMsg = JSON.parse(fs.readFileSync(0, "utf8").trim().split("\n")[0]); } catch {}
+}
+const streamText = stdinMsg?.message?.content?.find?.((c) => c.type === "text")?.text;
+const streamImage = stdinMsg?.message?.content?.find?.((c) => c.type === "image");
+const pArg = get("-p");
+const prompt = (pArg && !pArg.startsWith("--") ? pArg : "") || streamText || "";
 const files = [...prompt.matchAll(/(fragen\/[^\s:]+|dokument\.pdf)/g)].map((m) => m[1]);
 const sizes = Object.fromEntries(files.map((f) => [f, fs.existsSync(f) ? fs.statSync(f).size : -1]));
-const rec = { t: Date.now(), args, cwd: process.cwd(), envKeys: Object.keys(process.env).filter((k) => /NOTIZBUCH|BETTERNOTES/i.test(k)), stdinTTY: process.stdin.isTTY || false, mode: mode.mode, sizes, pid: process.pid };
+const rec = { t: Date.now(), args, stream: !!stdinMsg, imageBytes: streamImage ? Buffer.from(streamImage.source.data, "base64").length : 0, streamPrompt: streamText || null, cwd: process.cwd(), envKeys: Object.keys(process.env).filter((k) => /NOTIZBUCH|BETTERNOTES/i.test(k)), stdinTTY: process.stdin.isTTY || false, mode: mode.mode, sizes, pid: process.pid };
 fs.appendFileSync(path.join(DIR, "calls.jsonl"), JSON.stringify(rec) + "\n");
+if (mode.noStream && stdinMsg) { process.stderr.write("Error: stream-json input not supported\n"); process.exit(1); }
 const resume = get("--resume"), sid = get("--session-id");
 if (resume && !fs.existsSync(path.join(sessions, resume))) {
   process.stderr.write(`No conversation found with session ID: ${resume}\n`);

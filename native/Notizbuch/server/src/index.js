@@ -702,7 +702,7 @@ export class Store extends DurableObject {
     return json({
       id: askId, claim, leaseUntil: now + lease, anchor: JSON.parse(row.anchor), pv: row.pv, effort: row.effort,
       created: row.created, from: info.from || null,
-      ...(row.doc === LERN_DOC ? { lern: { wort: info.wort, satz: info.satz || null, versuch: info.versuch || 1 } } : {}),
+      ...(row.doc === LERN_DOC ? { lern: { wort: info.wort, satz: info.satz || null, versuch: info.versuch || 1, gelesen: info.gelesen || null } } : {}),
       doc: {
         id: row.doc, title: meta.title || "", kind: meta.kind || "notebook", pageCount: meta.pageCount || 0,
         pagesVersion: meta.pagesVersion || 0, pdfVersion: meta.pdfVersion || 0,
@@ -1083,6 +1083,8 @@ function askInfo(doc, meta) {
     info.wort = t.wort;
     if (t.satz) info.satz = t.satz;
     info.versuch = t.versuch;
+    // Nur den Hinweis holen: das schon Gelesene (die App fragt ihn im Hintergrund, während Sascha das Gelesene prüft)
+    if (t.gelesen) info.gelesen = t.gelesen;
   }
   return info;
 }
@@ -1091,7 +1093,8 @@ function lernTarget(meta) {
   const wort = cleanWord(meta?.wort);
   if (!wort) return null;
   const satz = typeof meta.satz === "string" ? meta.satz.trim().slice(0, 300) : "";
-  return { wort, satz, versuch: Math.min(Math.max(Math.trunc(Number(meta.versuch) || 1), 1), 9) };
+  const gelesen = typeof meta.gelesen === "string" ? meta.gelesen.normalize("NFC").trim().slice(0, 80) : "";
+  return { wort, satz, gelesen, versuch: Math.min(Math.max(Math.trunc(Number(meta.versuch) || 1), 1), 9) };
 }
 
 /// Ein Lernwort: getrimmt, Unicode zusammengesetzt (ä als ein Zeichen), höchstens 60 Zeichen, keine Zeilenumbrüche
