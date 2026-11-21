@@ -58,10 +58,12 @@ struct LernView: View {
         }
         // Vorab lesen prüfen: zeichne = Probestrich ohne „Fertig“ (nach 0,7 s liest der Mac vorab), fertig = „Fertig“
         if has("zeichne") {
-            let n = model.drawing.strokes.count
-            let pts = (0...20).map { i -> PKStrokePoint in
-                PKStrokePoint(location: CGPoint(x: 120 + Double(n) * 60 + Double(i) * 2, y: 120 + Double(i) * 4), timeOffset: Double(i) * 0.02,
-                              size: CGSize(width: 5, height: 5), opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2)
+            let x0 = 120 + 60 * Double(model.drawing.strokes.count)
+            let pts: [PKStrokePoint] = (0...20).map { i in
+                let t = Double(i)
+                let p = CGPoint(x: x0 + 2 * t, y: 120 + 4 * t)
+                return PKStrokePoint(location: p, timeOffset: 0.02 * t, size: CGSize(width: 5, height: 5),
+                                     opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2)
             }
             let stroke = PKStroke(ink: PKInk(.pen, color: .black), path: PKStrokePath(controlPoints: pts, creationDate: Date()))
             model.drawing = PKDrawing(strokes: model.drawing.strokes + [stroke])
