@@ -9,6 +9,8 @@ struct LibraryView: View {
     @EnvironmentObject private var tabs: TabsModel
     @Environment(\.scenePhase) private var scenePhase
     @State private var showSettings = false
+    /// Lernwörter üben (für Sascha)
+    @State private var showLernen = false
     @State private var importing = false
     @State private var renaming: NoteDocument?
     @State private var newTitle = ""
@@ -146,6 +148,11 @@ struct LibraryView: View {
                         Button { showSettings = true } label: { Label("Sync", systemImage: "gearshape") }
                     }
                 }
+                ToolbarItem(placement: .topBarLeading) {
+                    if currentFolder == nil {
+                        Button { showLernen = true } label: { Label("Lernwörter üben", systemImage: "character.book.closed") }
+                    }
+                }
                 ToolbarItemGroup(placement: .primaryAction) {
                     if currentFolder == nil {
                         Button {
@@ -189,6 +196,11 @@ struct LibraryView: View {
                     return
                 }
                 #if DEBUG
+                // Nur für Tests im Simulator: notizbuch://debug/lernen?open öffnet die Lernwörter (der Rest in LernView)
+                if url.scheme == "notizbuch", url.host == "debug", url.path == "/lernen" {
+                    if url.query?.contains("open") == true { showLernen = true }
+                    return
+                }
                 // Nur für Tests im Simulator: notizbuch://debug/import?file=<Name in Dokumente> wie „Öffnen in“
                 if url.scheme == "notizbuch", url.host == "debug", url.path == "/import",
                    let name = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
@@ -200,6 +212,9 @@ struct LibraryView: View {
                 // Nur Dateien (Info.plist bietet die App für PDF und Markdown an)
                 guard url.isFileURL else { return }
                 openFile(url)
+            }
+            .fullScreenCover(isPresented: $showLernen) {
+                LernView(sync: sync)
             }
             .fullScreenCover(isPresented: $tabs.editorShown, onDismiss: { store.reload() }) {
                 EditorView(tabs: tabs, tools: tabs.tools).environmentObject(store).environmentObject(sync)

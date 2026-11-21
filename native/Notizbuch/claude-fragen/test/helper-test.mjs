@@ -407,6 +407,7 @@ async function main() {
   startHelper();
   ok(await waitFor(async () => (await askOf(doc, rs.id)).status === "answered", 15000, 200), `answered right after the restart (${((Date.now() - tRestart) / 1000).toFixed(1)} s), not after its 20-minute lease`);
 
+  await lernTests();
   helper.kill("SIGTERM");
   const logPath = path.join(HOME, "helfer.log");
   if (!failures && !process.env.KEEP) fs.rmSync(TMP, { recursive: true, force: true });
@@ -414,3 +415,61 @@ async function main() {
   process.exit(failures ? 1 : 0);
 }
 main().catch((e) => { console.error(e); helper?.kill(); process.exit(2); });
+
+async function createLern(wort, versuch = 1) {
+  const id = uuid();
+  const f = new FormData();
+  f.append("meta", JSON.stringify({ anchor: { page: 0, x: 0, y: 0, w: 768, h: 200 }, pv: 0, created: Date.now() / 1000, from: "iPad", wort, satz: `Ein Satz mit ${wort}.`, versuch }));
+  f.append("question", new Blob([PNG()], { type: "image/png" }), "question.png");
+  f.append("page", new Blob([PNG()], { type: "image/png" }), "page.png");
+  const r = await api("PUT", `/api/doc/lernwoerter/asks/${id}`, { body: f });
+  if (r.status !== 200) throw new Error("lern " + r.status + JSON.stringify(r.data));
+  return id;
+}
+
+async function lernTests() {
+  console.log("== Lernwörter");
+  setMode({ mode: "ok", gelesen: "Farad" });
+  const before = calls().filter((x) => x.args).length;
+  let id = await createLern("Fahrrad");
+  let x = await waitFor(async () => { const a = await askOf("lernwoerter", id); return a?.status === "answered" ? a : null; }, 15000, 50);
+  ok(x, "Lernwort beantwortet", x);
+  let ans = x && JSON.parse(x.answer);
+  ok(ans?.gelesen === "Farad" && ans.richtig === false && /doppelter Mitlaut/.test(ans.hinweis), "falsch: gelesen + Hinweis", ans);
+  const lc = calls().filter((c) => c.args).slice(before);
+  ok(lc.length === 2, "zwei Aufrufe (lesen, Hinweis)", lc.length);
+  const p1 = promptOf(lc[0]), p2 = promptOf(lc[1]);
+  ok(!p1.includes("Fahrrad") && !systemOf(lc[0]).includes("Fahrrad"), "Lesen kennt das Wort nicht", p1);
+  ok(p1.includes("wort.png") && fs.existsSync(path.join(lc[0].cwd, "wort.png")), "Bild im Chat-Ordner", lc[0].cwd);
+  ok(p2.includes("„Fahrrad“") && p2.includes("„Farad“") && p2.includes("Verrate das richtige Wort nicht"), "Hinweis: Wort, Gelesenes, nicht verraten", p2);
+  ok(lc[1].args[lc[1].args.indexOf("--resume") + 1] === lc[0].args[lc[0].args.indexOf("--session-id") + 1], "Hinweis im selben Chat");
+  ok(optOf(lc[0], "--tools") === "Read" && lc[0].args[lc[0].args.indexOf("--effort") + 1] === "low" && lc[0].args.includes("--restricted") && !lc[0].args.includes("--allowedTools"), "nur Read, effort low, eingeschränkt, kein Internet", lc[0].args);
+  ok(lc[0].envKeys.length === 0, "kein Schlüssel in der Umgebung");
+  await api("DELETE", `/api/doc/lernwoerter/asks/${id}`);
+
+  // Zweiter Versuch: Hinweis darf das Wort nennen
+  const n2 = calls().filter((c) => c.args).length;
+  id = await createLern("Fahrrad", 2);
+  x = await waitFor(async () => { const a = await askOf("lernwoerter", id); return a?.status === "answered" ? a : null; }, 15000, 50);
+  const c2 = calls().filter((c) => c.args).slice(n2);
+  ok(x && promptOf(c2[1]).includes("das Wort darfst du nennen"), "2. Versuch: Wort nennen erlaubt", c2.map(promptOf));
+
+  // Richtig: nur ein Aufruf; Großschreibung zählt
+  setMode({ mode: "ok", gelesen: "Fahrrad" });
+  const n3 = calls().filter((c) => c.args).length;
+  id = await createLern("Fahrrad");
+  x = await waitFor(async () => { const a = await askOf("lernwoerter", id); return a?.status === "answered" ? a : null; }, 15000, 50);
+  ans = x && JSON.parse(x.answer);
+  ok(ans?.richtig === true && ans.hinweis === null && calls().filter((c) => c.args).length - n3 === 1, "richtig: ein Aufruf, kein Hinweis", ans);
+  setMode({ mode: "ok", gelesen: "fahrrad" });
+  id = await createLern("Fahrrad");
+  x = await waitFor(async () => { const a = await askOf("lernwoerter", id); return a?.status === "answered" ? a : null; }, 15000, 50);
+  ok(x && JSON.parse(x.answer).richtig === false, "klein geschrieben ist nicht richtig");
+
+  // Unleserlich
+  setMode({ mode: "ok", unleserlich: true });
+  id = await createLern("Meer");
+  x = await waitFor(async () => { const a = await askOf("lernwoerter", id); return a?.status === "answered" ? a : null; }, 15000, 50);
+  ok(x && JSON.parse(x.answer).unleserlich === true, "unleserlich gemeldet", x?.answer);
+  setMode({ mode: "ok" });
+}

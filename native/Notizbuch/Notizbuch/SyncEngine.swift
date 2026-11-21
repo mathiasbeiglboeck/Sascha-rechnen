@@ -1078,6 +1078,14 @@ final class SyncEngine: ObservableObject {
         _ = try await request("PUT", "/api/outbox/\(recipient)/\(safe)", body: data, contentType: type)
     }
 
+    // MARK: Lernwörter
+
+    /// Für den Lernwörter-Modus (LernModel): ein Aufruf an den Server mit Adresse und Schlüssel dieses Geräts
+    func lernRequest(_ method: String, _ path: String, body: Data? = nil,
+                     contentType: String = "application/json") async throws -> Data {
+        try await request(method, path, body: body, contentType: contentType)
+    }
+
     // MARK: Live-Teilen
 
     /// Link für Gäste (bleibt gleich, bis das Teilen beendet wird)

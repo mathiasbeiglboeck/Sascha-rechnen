@@ -6,6 +6,9 @@
 //   blobs    PDFs und Ausgang-Dateien, in 1-MB-Stücken
 //   asks     Fragen an Claude („Claude fragen“ im Lasso-Menü) samt Antwort; die Bilder der Frage liegen in blobs,
 //            bis sie beantwortet ist. Ein Helfer am Mac holt sie ab (er bekommt neue sofort über /api/asks/ws)
+//   lern_*   Lernwörter für Sascha: die Wortliste (Claude legt sie über /api/lernen/woerter ab) und das Protokoll
+//            jedes Versuchs (nur anhängen, nie ändern: so gibt es zwischen den Geräten keine Konflikte). Beim Üben
+//            liest der Helfer am Mac das geschriebene Wort als Frage im Pseudo-Dokument LERN_DOC (effort "lernwort")
 // Jede Änderung bekommt eine fortlaufende Nummer (seq). Geräte fragen „alles seit seq X“.
 //
 // Alle /api-Adressen brauchen den Header  Authorization: Bearer <SECRET>.
@@ -26,6 +29,12 @@ const MAX_ANSWER_CHARS = 200000;
 // Markdown im Eingang (die App setzt es auf A4-Seiten): höchstens so groß
 const MAX_MARKDOWN_BYTES = 512 * 1024;
 const EFFORTS = ["quick", "thorough"];
+// Lernwörter: Das geschriebene Wort geht als Frage an den Helfer, im Pseudo-Dokument LERN_DOC (kein echtes Dokument,
+// deren Kennungen sind UUIDs) und nur dort mit dieser Art
+const LERN_DOC = "lernwoerter";
+const LERN_EFFORT = "lernwort";
+const MAX_LERN_WORDS = 500;
+const MAX_LERN_EVENTS = 200;
 // Frist, in der der Helfer eine übernommene Frage beantwortet (er kann sie verlängern), in Sekunden
 const ASK_LEASE = 900;
 // Läuft die Frist einer übernommenen Frage so oft ab, ohne dass eine Antwort kommt, gilt sie als gescheitert
@@ -88,6 +97,10 @@ export class Store extends DurableObject {
       CREATE INDEX IF NOT EXISTS asks_status ON asks (status);
       CREATE TABLE IF NOT EXISTS asks_gone (id TEXT PRIMARY KEY, t REAL NOT NULL);
       CREATE INDEX IF NOT EXISTS asks_gone_t ON asks_gone (t);
+      CREATE TABLE IF NOT EXISTS lern_words (wort TEXT PRIMARY KEY, satz TEXT, added REAL NOT NULL, ord INTEGER NOT NULL,
+                                             removed REAL);
+      CREATE TABLE IF NOT EXISTS lern_log (id TEXT PRIMARY KEY, seq INTEGER NOT NULL, data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS lern_log_seq ON lern_log (seq);
     `);
     // Lebenszeichen des Helfers am Mac: beantwortet, ohne das Objekt zu wecken (kostet so gut wie nichts)
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
@@ -124,6 +137,13 @@ export class Store extends DurableObject {
         if (id && sub === "claim" && method === "POST") return await this.claimAsk(id, request);
         if (id && (sub === "question" || sub === "page") && method === "GET") return this.blobResponse(`ask/${id}/${sub}`);
         if (id && sub === "answer" && method === "PUT") return await this.answerAsk(id, request, url);
+      }
+      // Lernwörter: Liste und Protokoll lesen (App, Claude), Wörter ablegen oder entfernen (Claude), Versuche
+      // anhängen (App)
+      if (area === "lernen") {
+        if (!id && method === "GET") return json(this.lernen(url));
+        if (id === "woerter" && !sub && method === "POST") return json(this.lernWords(await bodyJSON(request)));
+        if (id === "log" && !sub && method === "POST") return json(this.lernLog(await bodyJSON(request)));
       }
       if (area === "share" && id && method === "POST") return json({ token: this.shareToken(id) });
       if (area === "share" && id && method === "DELETE") {
@@ -520,8 +540,8 @@ export class Store extends DurableObject {
         "INSERT INTO asks (id, doc, status, anchor, pv, effort, created, updated, info, v) " +
           "VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)",
         askId, doc, JSON.stringify(anchor), Math.max(0, Math.trunc(Number(meta.pv) || 0)),
-        EFFORTS.includes(meta.effort) ? meta.effort : EFFORTS[0], Number(meta.created) || now, now,
-        JSON.stringify({ from: String(meta.from || "").slice(0, 40) }), v,
+        doc === LERN_DOC ? LERN_EFFORT : EFFORTS.includes(meta.effort) ? meta.effort : EFFORTS[0],
+        Number(meta.created) || now, now, JSON.stringify(askInfo(doc, meta)), v,
       );
     });
     this.asksChanged(doc, v);
@@ -532,6 +552,13 @@ export class Store extends DurableObject {
   /// Warum eine neue Frage nicht angenommen wird, sonst null. Mit `meta` auch: gestellt auf einem älteren Seitenstand
   /// (ein anderes Gerät hat inzwischen Seiten gelöscht oder eingefügt), dann stimmt ihre Stelle nicht mehr
   askRefused(doc, meta) {
+    if (doc === LERN_DOC) {
+      if (meta && !lernTarget(meta)) return fail("Lernwort fehlt", "bad-body", 400);
+      if (this.sql.exec("SELECT COUNT(*) AS n FROM asks WHERE status IN ('open', 'claimed')").one().n >= MAX_OPEN_ASKS) {
+        return fail("Zu viele offene Fragen", "too-many", 429);
+      }
+      return null;
+    }
     const d = this.sql.exec("SELECT meta FROM docs WHERE id = ?", doc).toArray()[0];
     const docMeta = d ? JSON.parse(d.meta) : null;
     if (!docMeta || docMeta.deleted) return fail("Dokument nicht auf dem Server", "no-doc", 404);
@@ -626,7 +653,8 @@ export class Store extends DurableObject {
     return {
       asks: rows
         .filter((r) => r.lease <= now)
-        .sort((a, b) => a.created - b.created)
+        // Lernwörter zuerst: Dort wartet ein Kind vor dem iPad
+        .sort((a, b) => (b.effort === LERN_EFFORT) - (a.effort === LERN_EFFORT) || a.created - b.created)
         .map((r) => ({ id: r.id, doc: r.doc, effort: r.effort, created: r.created, retry: r.status === "claimed" })),
       next: later.length ? Math.ceil(Math.min(...later)) : null,
     };
@@ -670,9 +698,11 @@ export class Store extends DurableObject {
     const meta = d ? JSON.parse(d.meta) : {};
     const image = (name) =>
       this.sql.exec("SELECT size, type FROM blobmeta WHERE key = ?", `ask/${askId}/${name}`).toArray()[0] || null;
+    const info = JSON.parse(row.info || "{}");
     return json({
       id: askId, claim, leaseUntil: now + lease, anchor: JSON.parse(row.anchor), pv: row.pv, effort: row.effort,
-      created: row.created, from: JSON.parse(row.info || "{}").from || null,
+      created: row.created, from: info.from || null,
+      ...(row.doc === LERN_DOC ? { lern: { wort: info.wort, satz: info.satz || null, versuch: info.versuch || 1 } } : {}),
       doc: {
         id: row.doc, title: meta.title || "", kind: meta.kind || "notebook", pageCount: meta.pageCount || 0,
         pagesVersion: meta.pagesVersion || 0, pdfVersion: meta.pdfVersion || 0,
@@ -749,6 +779,78 @@ export class Store extends DurableObject {
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1], ["helper"]);
     return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  // ---------- Lernwörter ----------
+  // Die Wortliste gehört allen Geräten; entfernte Wörter bleiben als Grabstein (removed), damit ein Gerät, das sie
+  // noch kennt, sie nicht übt. Das Protokoll ist nur anzuhängen: jeder Versuch einmal (seine id), mit fortlaufender
+  // Nummer, damit Geräte „alles seit“ holen. Daraus rechnet jede App selbst, welches Wort wann wieder dran ist.
+
+  nextLernV() {
+    return this.sql
+      .exec("INSERT INTO counter (k, v) VALUES ('lern', 1) ON CONFLICT(k) DO UPDATE SET v = v + 1 RETURNING v")
+      .one().v;
+  }
+
+  /// GET /api/lernen?since=N: alle Wörter (auch entfernte, mit removed) und die Versuche nach Nummer N
+  lernen(url) {
+    const since = Math.max(0, Math.trunc(Number(url.searchParams.get("since")) || 0));
+    const v = this.sql.exec("SELECT v FROM counter WHERE k = 'lern'").toArray()[0]?.v || 0;
+    const words = this.sql.exec("SELECT wort, satz, added, removed FROM lern_words ORDER BY ord").toArray()
+      .map((r) => ({ wort: r.wort, satz: r.satz || null, added: r.added, ...(r.removed ? { removed: r.removed } : {}) }));
+    const log = this.sql.exec("SELECT seq, data FROM lern_log WHERE seq > ? ORDER BY seq", since).toArray()
+      .map((r) => ({ ...JSON.parse(r.data), seq: r.seq }));
+    return { v, words, log };
+  }
+
+  /// POST /api/lernen/woerter {add: [{wort, satz?}] oder ["Wort", …], remove: ["Wort", …]}. Ein schon bekanntes Wort
+  /// behält seinen Lernstand (sein Satz wird ersetzt, wenn ein neuer kommt); ein entferntes kommt so zurück
+  lernWords(body) {
+    const add = Array.isArray(body.add) ? body.add : [];
+    const remove = Array.isArray(body.remove) ? body.remove.map(cleanWord).filter(Boolean) : [];
+    const now = Date.now() / 1000;
+    const added = [], removed = [];
+    this.ctx.storage.transactionSync(() => {
+      let ord = this.sql.exec("SELECT COALESCE(MAX(ord), 0) AS o FROM lern_words").one().o;
+      for (const item of add) {
+        const wort = cleanWord(typeof item === "string" ? item : item?.wort);
+        if (!wort) continue;
+        const satz = typeof item === "object" && typeof item.satz === "string" ? item.satz.trim().slice(0, 300) || null : null;
+        const row = this.sql.exec("SELECT wort, satz, removed FROM lern_words WHERE wort = ?", wort).toArray()[0];
+        if (row) {
+          this.sql.exec("UPDATE lern_words SET satz = COALESCE(?, satz), removed = NULL WHERE wort = ?", satz, wort);
+        } else {
+          if (this.sql.exec("SELECT COUNT(*) AS n FROM lern_words").one().n >= MAX_LERN_WORDS) break;
+          this.sql.exec("INSERT INTO lern_words (wort, satz, added, ord) VALUES (?, ?, ?, ?)", wort, satz, now, ++ord);
+        }
+        added.push(wort);
+      }
+      for (const wort of remove) {
+        if (!this.sql.exec("SELECT 1 FROM lern_words WHERE wort = ? AND removed IS NULL", wort).toArray().length) continue;
+        this.sql.exec("UPDATE lern_words SET removed = ? WHERE wort = ?", now, wort);
+        removed.push(wort);
+      }
+    });
+    const v = this.nextLernV();
+    this.broadcast(LERN_DOC, { type: "lernen", v }, `app:${LERN_DOC}`);
+    return { ok: true, added, removed, v };
+  }
+
+  /// POST /api/lernen/log {events: [{id, wort, t, ergebnis, …}]}: hängt neue Versuche an (bekannte ids überspringt er)
+  lernLog(body) {
+    const events = Array.isArray(body.events) ? body.events.slice(0, MAX_LERN_EVENTS) : [];
+    let added = 0;
+    this.ctx.storage.transactionSync(() => {
+      for (const e of events) {
+        const ev = cleanLernEvent(e);
+        if (!ev || this.sql.exec("SELECT 1 FROM lern_log WHERE id = ?", ev.id).toArray().length) continue;
+        this.sql.exec("INSERT INTO lern_log (id, seq, data) VALUES (?, ?, ?)", ev.id, this.nextLernV(), JSON.stringify(ev));
+        added++;
+      }
+    });
+    const v = this.sql.exec("SELECT v FROM counter WHERE k = 'lern'").toArray()[0]?.v || 0;
+    if (added) this.broadcast(LERN_DOC, { type: "lernen", v }, `app:${LERN_DOC}`);
+    return { ok: true, added, v };
   }
 
   // ---------- Briefkasten ----------
@@ -971,6 +1073,46 @@ function cleanAnchor(a, detached = false) {
   if (!Number.isInteger(page) || page < (detached ? -1 : 0) || page > 100000) return null;
   if (![x, y, w, h].every((n) => Number.isFinite(n) && Math.abs(n) < 1e6) || w < 0 || h < 0) return null;
   return { page, x, y, w, h };
+}
+
+/// Was zu einer Frage gespeichert wird: das Gerät, bei Lernwörtern auch das Wort (der Helfer braucht es für den Hinweis)
+function askInfo(doc, meta) {
+  const info = { from: String(meta.from || "").slice(0, 40) };
+  if (doc === LERN_DOC) {
+    const t = lernTarget(meta);
+    info.wort = t.wort;
+    if (t.satz) info.satz = t.satz;
+    info.versuch = t.versuch;
+  }
+  return info;
+}
+
+function lernTarget(meta) {
+  const wort = cleanWord(meta?.wort);
+  if (!wort) return null;
+  const satz = typeof meta.satz === "string" ? meta.satz.trim().slice(0, 300) : "";
+  return { wort, satz, versuch: Math.min(Math.max(Math.trunc(Number(meta.versuch) || 1), 1), 9) };
+}
+
+/// Ein Lernwort: getrimmt, Unicode zusammengesetzt (ä als ein Zeichen), höchstens 60 Zeichen, keine Zeilenumbrüche
+function cleanWord(w) {
+  if (typeof w !== "string") return null;
+  const s = w.normalize("NFC").replace(/\s+/g, " ").trim();
+  return s && s.length <= 60 ? s : null;
+}
+
+const LERN_RESULTS = ["richtig", "zweiter", "falsch"];
+/// Ein Versuch fürs Protokoll; nur bekannte Felder, kurz gehalten
+function cleanLernEvent(e) {
+  if (!e || typeof e !== "object" || !UUID_RE.test(String(e.id))) return null;
+  const wort = cleanWord(e.wort), t = Number(e.t);
+  if (!wort || !Number.isFinite(t) || !LERN_RESULTS.includes(e.ergebnis)) return null;
+  const ev = { id: String(e.id), wort, t, ergebnis: e.ergebnis };
+  if (Array.isArray(e.gelesen)) ev.gelesen = e.gelesen.slice(0, 5).map((g) => String(g).slice(0, 80));
+  if (e.wdh === true) ev.wdh = true;
+  if (e.selbst === true) ev.selbst = true;
+  if (typeof e.from === "string") ev.from = e.from.slice(0, 40);
+  return ev;
 }
 
 /// Was die Apps von einer Frage sehen (ohne den claim des Helfers)

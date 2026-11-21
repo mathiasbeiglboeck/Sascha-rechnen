@@ -102,6 +102,17 @@ const finish = () => {
     "",
     "Quellen: [Produktregel (Wikipedia)](https://de.wikipedia.org/wiki/Produktregel) und https://de.wikipedia.org/wiki/Differentialrechnung",
   ].join("\n");
+  // Lernwörter: Lesen antwortet mit mode.gelesen (Standard „Farad“), der Hinweis mit einem festen Satz, im Codeblock
+  if (prompt.includes("Buchstabe für Buchstabe")) {
+    const t = mode.unleserlich ? '{"gelesen": "", "unleserlich": true}' : JSON.stringify({ gelesen: mode.gelesen ?? "Farad" });
+    process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: t, session_id: session }) + "\n", () => process.exit(0));
+    return;
+  }
+  if (prompt.includes("Gesucht war")) {
+    const t = "```json\n" + JSON.stringify({ hinweis: "Hör genau hin: Nach dem kurzen a kommt ein doppelter Mitlaut." }) + "\n```";
+    process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: t, session_id: session }) + "\n", () => process.exit(0));
+    return;
+  }
   // "huge": eine Antwort über der Grenze des Servers (200 000 Zeichen), die er mit 413 ablehnt
   const text = mode.mode === "rich" ? rich : mode.mode === "huge" ? "x".repeat(210000) : `Antwort (${get("--effort")}) auf ${files.join(", ")}: $x^2$`;
   // Erst beenden, wenn alles geschrieben ist: Eine lange Antwort passt nicht auf einmal in die Pipe

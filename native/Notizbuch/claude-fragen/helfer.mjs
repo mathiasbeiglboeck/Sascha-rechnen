@@ -30,6 +30,8 @@ const DEFAULTS = {
   // Aufwand je Menüpunkt: „Claude fragen“ = quick, „Claude gründlich fragen“ = thorough
   quick: { effort: "medium", model: null, minutes: 15 },
   thorough: { effort: "max", model: null, minutes: 45 },
+  // Lernwörter für Sascha: Wort lesen (und bei einem Fehler einen Hinweis geben). Schnell, ein Kind wartet
+  lernen: { effort: "low", model: null, minutes: 3 },
   // Rückfallabfrage, falls eine Meldung über den WebSocket verloren geht (Sekunden)
   pollSeconds: 300,
   // Nach einem Fehler am Mac: neuer Versuch nach so vielen Sekunden; am Nutzungslimit mindestens so lange Pause
@@ -94,6 +96,7 @@ function loadConfig() {
     url: String(raw.url).replace(/\/+$/, ""),
     quick: { ...DEFAULTS.quick, ...(raw.quick || {}) },
     thorough: { ...DEFAULTS.thorough, ...(raw.thorough || {}) },
+    lernen: { ...DEFAULTS.lernen, ...(raw.lernen || {}) },
   };
 }
 
@@ -340,7 +343,8 @@ function stop(child) {
 }
 
 async function answer(ask) {
-  const level = ask.effort === "thorough" ? config.thorough : config.quick;
+  const lern = ask.effort === "lernwort";
+  const level = lern ? config.lernen : ask.effort === "thorough" ? config.thorough : config.quick;
   const lease = Math.max(900, level.minutes * 60 + 300);
   let job;
   try {
@@ -349,9 +353,13 @@ async function answer(ask) {
     if (e.status === 404 || e.status === 409) return false; // gelöscht, schon vergeben oder aufgegeben
     throw e;
   }
-  const title = job.doc.title || "Dokument";
-  const where = job.anchor.page >= 0 ? `Seite ${job.anchor.page + 1}` : "Seite gelöscht";
-  log(ask.id, `übernommen: „${title}“, ${where}, ${ask.effort === "thorough" ? "gründlich" : "schnell"}`);
+  if (lern) {
+    log(ask.id, `übernommen: Lernwort, ${job.lern?.versuch || 1}. Versuch`);
+  } else {
+    const title = job.doc.title || "Dokument";
+    const where = job.anchor.page >= 0 ? `Seite ${job.anchor.page + 1}` : "Seite gelöscht";
+    log(ask.id, `übernommen: „${title}“, ${where}, ${ask.effort === "thorough" ? "gründlich" : "schnell"}`);
+  }
   const t0 = Date.now();
   // Frist verlängern, solange Claude arbeitet
   const renew = setInterval(() => {
@@ -359,10 +367,15 @@ async function answer(ask) {
   }, 300000);
   current = { id: ask.id, claim: job.claim, child: null, cancelled: false };
   try {
-    const dir = path.join(CHATS, job.doc.id);
-    const files = await fetchFiles(job, dir);
-    if (current.cancelled) return;
-    const result = await askClaude(job, dir, files, level);
+    let result;
+    if (lern) {
+      result = await lernClaude(job, level);
+    } else {
+      const dir = path.join(CHATS, job.doc.id);
+      const files = await fetchFiles(job, dir);
+      if (current.cancelled) return;
+      result = await askClaude(job, dir, files, level);
+    }
     if (current.cancelled) return;
     if (result.ok) {
       localPause = 0;
@@ -627,6 +640,112 @@ async function askClaude(job, dir, files, level) {
   return { ok: false, error: "Chat konnte nicht fortgesetzt werden" };
 }
 
+// ---------- Lernwörter ----------
+//
+// Sascha (8) übt Lernwörter: Die App spricht ein Wort vor, er schreibt es, und hier wird es gelesen. Erster Aufruf:
+// abschreiben, was dasteht, OHNE das gesuchte Wort zu kennen (sonst „liest“ Claude das richtige Wort hinein). Weicht es
+// ab, zweiter Aufruf im selben Chat: ein kurzer Hinweis auf die Rechtschreibregel. Die Antwort an die App ist JSON:
+// {"gelesen": "…", "richtig": bool, "hinweis": "…" | null, "unleserlich"?: true}. Je Wort ein neuer, kurzer Chat
+
+const LERN_SYSTEM = `Du hilfst Sascha, einem 8-jährigen Volksschüler in Wien, beim Üben seiner Lernwörter \
+(Rechtschreibung). Er schreibt in einer Notizbuch-App auf dem iPad mit dem Stift ein Wort, das ihm vorgesprochen wurde. \
+Antworte immer nur mit dem verlangten JSON, ohne Erklärung davor oder danach, ohne Codeblock.`;
+
+function lernReadPrompt(file) {
+  return `In ${file} steht ein Wort (manchmal mit Artikel oder ein kurzer Ausdruck), das Sascha mit der Hand \
+geschrieben hat, in Druckschrift oder in Schreibschrift (Österreichische Schulschrift). Sieh es dir mit Read an und \
+schreib Buchstabe für Buchstabe genau ab, was dasteht, auch wenn es falsch geschrieben ist.
+- Nichts verbessern, nichts ergänzen: Fehlt ein Buchstabe, fehlt er auch bei dir; steht einer doppelt, schreibst du ihn doppelt.
+- Achte genau auf Groß- und Kleinschreibung (Höhe des ersten Buchstabens im Vergleich zu den anderen, Formen wie S/s, \
+K/k, W/w, Z/z), auf Umlaute (Punkte über a, o, u) und auf ß.
+- Durchgestrichenes oder Weggekritzeltes lässt du weg.
+Antwort nur als JSON: {"gelesen": "…"}. Ist gar nichts lesbar: {"gelesen": "", "unleserlich": true}.`;
+}
+
+function lernHintPrompt(lern, gelesen) {
+  const last = (lern.versuch || 1) >= 2;
+  return `Gesucht war das Wort „${lern.wort}“${lern.satz ? ` (vorgesprochen im Satz: „${lern.satz}“)` : ""}. \
+Gelesen hast du „${gelesen}“. Das ist ${last ? "sein zweiter Versuch" : "sein erster Versuch"}.
+
+Gib Sascha einen Hinweis, warum es noch nicht ganz passt: welche Rechtschreibregel er an welcher Stelle beachten \
+soll, so wie eine freundliche Lehrerin in der 2. oder 3. Klasse. Zum Beispiel:
+- Hauptwörter (Namenwörter) schreibt man groß; am Satzanfang auch.
+- Ein langer Selbstlaut hat oft ein stummes h (das hört man: Der Laut wird lang und langsam gesprochen), manchmal ist \
+er verdoppelt (Meer, Boot), ein langes i schreibt man meist ie.
+- Nach einem kurzen, schnell gesprochenen Selbstlaut kommt oft ein doppelter Mitlaut (mm, nn, ll, ss …), statt kk \
+schreibt man ck, statt zz tz.
+- ß nach langem Selbstlaut oder au/ei/eu, ss nach kurzem.
+- Am Wortende d oder t, b oder p, g oder k: verlängern hilft (Hund – Hunde).
+- ä und äu, wenn es ein verwandtes Wort mit a oder au gibt (Bälle – Ball, Häuser – Haus).
+- Wörter mit v, die man sich merken muss (Vogel, viel, vor …).
+${last
+    ? "Danach zeigt ihm die App das richtige Wort. Erklär kurz, warum man es so schreibt; das Wort darfst du nennen."
+    : "Er darf es gleich noch einmal versuchen. Verrate das richtige Wort nicht und schreib es nicht hin; nenn höchstens die Stelle (etwa „am Anfang“, „nach dem a“, „am Ende“) und die Regel."}
+Höchstens zwei kurze Sätze, Du-Form, einfache Wörter, freundlich und ermutigend (er hat sich bemüht). Hat er \
+mehrere Fehler, nimm den wichtigsten.
+Antwort nur als JSON: {"hinweis": "…"}.`;
+}
+
+/// Ein JSON-Objekt aus der Antwort von Claude (auch mit Codeblock oder Text drumherum), sonst null
+function lernJSON(text) {
+  const m = String(text || "").match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try {
+    const o = JSON.parse(m[0]);
+    return o && typeof o === "object" ? o : null;
+  } catch {
+    return null;
+  }
+}
+
+const lernNorm = (s) => String(s ?? "").normalize("NFC").replace(/\s+/g, " ").trim();
+
+async function lernClaude(job, level) {
+  const bin = findClaude();
+  if (!bin) {
+    return { ok: false, setup: true, error: "Claude Code ist am Mac nicht zu finden. Im Terminal claude installieren und anmelden." };
+  }
+  const lern = job.lern;
+  if (!lern?.wort) return { ok: false, final: true, error: "Lernwort fehlt (Server zu alt?)" };
+  const caps = await claudeCaps(bin);
+  const dir = path.join(CHATS, "lernwoerter", job.id);
+  fs.mkdirSync(dir, { recursive: true });
+  const { data, type } = await api("GET", `/api/asks/${job.id}/question`, { timeout: 60000 });
+  const file = type.includes("png") ? "wort.png" : "wort.jpg";
+  fs.writeFileSync(path.join(dir, file), data);
+  if (current?.cancelled) return { ok: false, error: "abgebrochen" };
+  const session = randomUUID();
+  const base = [
+    "--output-format", "json",
+    "--tools", "Read",
+    ...(caps.dontAsk ? ["--permission-mode", "dontAsk"] : []),
+    ...(useRestricted(caps) ? ["--restricted"] : []),
+    "--strict-mcp-config",
+    "--append-system-prompt", LERN_SYSTEM,
+    "--max-turns", "4",
+    ...(level.effort ? ["--effort", level.effort] : []),
+    ...(level.model ? ["--model", level.model] : []),
+  ];
+  const first = parseResult(await runClaude(bin, ["-p", lernReadPrompt(file), ...base, "--session-id", session], dir, level.minutes));
+  if (current?.cancelled) return { ok: false, error: "abgebrochen" };
+  if (!first.ok) return first;
+  const read = lernJSON(first.text);
+  const gelesen = lernNorm(read ? read.gelesen : first.text.split("\n")[0].replace(/^["„“]+|["„“]+$/g, ""));
+  if (!gelesen || read?.unleserlich) {
+    return { ok: true, text: JSON.stringify({ gelesen: "", richtig: false, hinweis: null, unleserlich: true }) };
+  }
+  const richtig = gelesen === lernNorm(lern.wort);
+  let hinweis = null;
+  if (!richtig) {
+    const second = parseResult(await runClaude(bin, ["-p", lernHintPrompt(lern, gelesen), ...base, "--resume", session], dir, level.minutes));
+    if (current?.cancelled) return { ok: false, error: "abgebrochen" };
+    // Ohne Hinweis (etwa am Limit) ist das Gelesene trotzdem wertvoll: Die App gibt dann einen allgemeinen Hinweis
+    if (second.ok) hinweis = lernNorm(lernJSON(second.text)?.hinweis) || null;
+    else log(job.id, "kein Hinweis:", second.error);
+  }
+  return { ok: true, text: JSON.stringify({ gelesen, richtig, hinweis }) };
+}
+
 /// Die Umgebung ohne Werte des Helfers (für Claude und andere Programme); Claude Code aktualisiert sich dabei nicht
 /// selbst (das tut es, wenn Mathias es im Terminal startet)
 function cleanEnv() {
@@ -734,7 +853,14 @@ function limitEnds(message, now = Date.now()) {
 function prune() {
   const limit = Date.now() - 60 * 86400000;
   try {
+    // Lernwörter: Die Bilder braucht nach dem Üben niemand mehr (nach 7 Tagen weg)
+    const lern = path.join(CHATS, "lernwoerter");
+    for (const id of listDir(lern)) {
+      const p = path.join(lern, id);
+      if (fs.statSync(p).mtimeMs < Date.now() - 7 * 86400000) fs.rmSync(p, { recursive: true, force: true });
+    }
     for (const doc of fs.readdirSync(CHATS)) {
+      if (doc === "lernwoerter") continue;
       const q = path.join(CHATS, doc, "fragen");
       if (!fs.existsSync(q)) continue;
       for (const id of fs.readdirSync(q)) {
