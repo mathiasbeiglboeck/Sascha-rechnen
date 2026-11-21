@@ -52,8 +52,8 @@ enum Lernkartei {
     }
 
     /// Richtig beim ersten Mal: ein Fach höher (ein neues Wort gleich ins zweite). Nach dem Hinweis richtig: halb
-    /// richtig, bleibt im Fach (ein neues ins erste). Falsch: zurück ins erste Fach. Wiederholungen in derselben Runde
-    /// zählen nur, wenn sie falsch sind
+    /// richtig, bleibt im Fach (ein neues ins erste). Falsch: zurück ins erste Fach. „Nochmal probieren“ am Ende einer
+    /// Runde (wdh) zählt nur, wenn es falsch ist
     static func karten(_ log: [LernEvent]) -> [String: Karte] {
         var k: [String: Karte] = [:]
         for e in log.sorted(by: { $0.t < $1.t }) {
@@ -247,7 +247,9 @@ final class LernModel: ObservableObject {
     private var since = 0
     private var pending: [LernEvent] = []
     private var gelesen: [String] = []
-    private var wiederholt: [String: Int] = [:]
+    /// Diese Runde wiederholt nur die Wörter der letzten, die noch nicht ganz gepasst haben (zählt nicht fürs Fach,
+    /// außer falsch)
+    @Published private(set) var nochmalRunde = false
     private var leseTask: Task<Void, Never>?
     /// Der Tipp, im Hintergrund geholt, sobald das Gelesene vom Wort abweicht (Sascha prüft derweil das Gelesene)
     private var tippTask: Task<String?, Never>?
@@ -262,7 +264,8 @@ final class LernModel: ObservableObject {
     var aktiveWoerter: [LernWort] { words.filter { $0.removed == nil } }
     var karten: [String: Lernkartei.Karte] { Lernkartei.karten(log) }
     var anzahlDran: Int { Lernkartei.anzahlDran(words, log) }
-    private var istWiederholung: Bool { index > 0 && queue[..<index].contains(queue[index]) }
+    /// Wörter dieser Runde, die beim ersten Versuch nicht richtig waren: Am Ende kann Sascha sie nochmal probieren
+    var nochmalWoerter: [LernWort] { queue.filter { ersteVersuche[$0.wort] != "richtig" } }
 
     // MARK: Speicher (Zwischenstand auf dem Gerät, falls offline)
 
@@ -356,13 +359,24 @@ final class LernModel: ObservableObject {
 
     // MARK: Ablauf
 
-    func starte(extra: Bool = false) {
-        queue = Lernkartei.runde(words, log, extra: extra)
-        guard !queue.isEmpty else { return }
+    /// Eine Runde mit `size` Wörtern (5 oder 10): zuerst die fälligen, dann neue, dann solche, die erst später dran
+    /// wären
+    func starte(size: Int) {
+        beginne(Lernkartei.runde(words, log, size: size, extra: true), nochmal: false)
+    }
+
+    /// Die Wörter der letzten Runde, die noch nicht ganz gepasst haben, nochmal
+    func nochmalProbieren() {
+        beginne(nochmalWoerter, nochmal: true)
+    }
+
+    private func beginne(_ q: [LernWort], nochmal: Bool) {
+        guard !q.isEmpty else { return }
+        queue = q
+        nochmalRunde = nochmal
         index = 0
         sterne = 0
         ersteVersuche = [:]
-        wiederholt = [:]
         neuesWort()
     }
 
@@ -497,7 +511,7 @@ final class LernModel: ObservableObject {
         index += 1
         if index >= queue.count {
             phase = .fertig
-            sprecher.sprich([sterne >= Double(Set(queue.map(\.wort)).count) ? "Alle richtig! Großartig, Sascha!" : "Geschafft! Gut gemacht, Sascha!"], langsam: false)
+            sprecher.sprich([nochmalWoerter.isEmpty ? "Alle richtig! Großartig, Sascha!" : "Geschafft! Gut gemacht, Sascha!"], langsam: false)
             Task { await refresh() }
         } else {
             neuesWort()
@@ -513,11 +527,9 @@ final class LernModel: ObservableObject {
 
     private func ergebnis(_ e: String, selbst: Bool = false) {
         guard let w = aktuell else { return }
-        let wdh = istWiederholung
-        if !wdh {
-            ersteVersuche[w.wort] = e
-            sterne += e == "richtig" ? 1 : e == "zweiter" ? 0.5 : 0
-        }
+        let wdh = nochmalRunde
+        ersteVersuche[w.wort] = e
+        sterne += e == "richtig" ? 1 : e == "zweiter" ? 0.5 : 0
         let ev = LernEvent(id: UUID().uuidString, wort: w.wort, t: Date().timeIntervalSince1970, ergebnis: e,
                            gelesen: gelesen.isEmpty ? nil : gelesen, wdh: wdh ? true : nil, selbst: selbst ? true : nil,
                            from: UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone")
@@ -525,11 +537,6 @@ final class LernModel: ObservableObject {
         pending.append(ev)
         save()
         Task { try? await flush() }
-        // Nicht gleich gekonnt: später in dieser Runde noch einmal (höchstens zweimal je Wort)
-        if e != "richtig" && (wiederholt[w.wort] ?? 0) < 2 {
-            wiederholt[w.wort, default: 0] += 1
-            queue.insert(w, at: min(index + 3, queue.count))
-        }
     }
 
     static let lob = ["Super, richtig!", "Toll gemacht!", "Genau so!", "Bravo, Sascha!", "Richtig, sehr gut!", "Perfekt!"]

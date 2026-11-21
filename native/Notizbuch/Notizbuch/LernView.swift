@@ -41,8 +41,9 @@ struct LernView: View {
         guard url.scheme == "notizbuch", url.host == "debug", url.path == "/lernen",
               let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else { return }
         let has = { (n: String) in items.contains { $0.name == n } }
-        if has("start") { model.starte() }
-        if has("extra") { model.starte(extra: true) }
+        if has("start") { model.starte(size: 10) }
+        if has("extra") || has("fuenf") { model.starte(size: 5) }
+        if has("nochmalrunde") { model.nochmalProbieren() }
         if has("schreib") {
             let pts = (0...40).map { i -> PKStrokePoint in
                 let x = 120 + Double(i) * 9, y = 150 + sin(Double(i) / 2) * 30
@@ -83,13 +84,15 @@ struct LernView: View {
             if model.aktiveWoerter.isEmpty {
                 Text("Noch keine Lernwörter da.\nPapa schickt sie an Claude, dann erscheinen sie hier.")
                     .multilineTextAlignment(.center).font(.title3).foregroundStyle(.secondary)
-            } else if dran > 0 {
-                Text(dran == 1 ? "1 Wort ist heute dran." : "\(min(dran, 10)) Wörter sind heute dran.")
-                    .font(.title2.weight(.medium)).foregroundStyle(.secondary)
-                grosserKnopf("Los geht's!", farbe: Self.gruen) { model.starte() }
             } else {
-                Text("Heute ist alles geübt. 🎉").font(.title2.weight(.medium))
-                Button("Trotzdem üben") { model.starte(extra: true) }.font(.title3)
+                Text(dran == 0 ? "Heute ist alles geübt. 🎉 Üben geht trotzdem."
+                     : dran == 1 ? "1 Wort ist heute dran." : "\(dran) Wörter sind heute dran.")
+                    .font(.title2.weight(.medium)).foregroundStyle(.secondary)
+                Text("Wie viele Wörter möchtest du üben?").font(.title3)
+                HStack(spacing: 20) {
+                    rundenKnopf(5)
+                    rundenKnopf(10)
+                }
             }
             if let s = model.status {
                 Text(s).font(.callout).foregroundStyle(.orange).multilineTextAlignment(.center).padding(.horizontal)
@@ -228,7 +231,7 @@ struct LernView: View {
                     Text("Du hast geschrieben: \(g)").font(.callout).foregroundStyle(.secondary)
                 }
                 if let h { Text(h).font(.title3).multilineTextAlignment(.center) }
-                Text("Es kommt später noch einmal dran.").font(.callout).foregroundStyle(.secondary)
+                Text("Am Ende kannst du es nochmal probieren.").font(.callout).foregroundStyle(.secondary)
                 grosserKnopf("Weiter", farbe: Self.blau) { model.weiter() }
             }
         case .selbst(let grund):
@@ -258,7 +261,7 @@ struct LernView: View {
         let ersteRichtig = woerter.filter { model.ersteVersuche[$0] == "richtig" }.count
         return VStack(spacing: 18) {
             Spacer()
-            Text("Geschafft! 🎉").font(.system(size: 44, weight: .bold, design: .rounded))
+            Text(model.nochmalRunde ? "Nochmal geübt! 🎉" : "Geschafft! 🎉").font(.system(size: 44, weight: .bold, design: .rounded))
             Text("⭐ \(Self.sterne(model.sterne))").font(.system(size: 40, weight: .semibold))
             Text("\(ersteRichtig) von \(woerter.count) gleich beim ersten Mal richtig.").font(.title3)
             VStack(alignment: .leading, spacing: 6) {
@@ -272,10 +275,16 @@ struct LernView: View {
             .padding()
             .background(.white, in: RoundedRectangle(cornerRadius: 16))
             Spacer()
-            HStack(spacing: 16) {
-                if model.anzahlDran > 0 {
-                    grosserKnopf("Noch eine Runde", farbe: Self.blau) { model.starte() }
+            let nochmal = model.nochmalWoerter.count
+            if nochmal > 0 {
+                Text(nochmal == 1 ? "Ein Wort war noch nicht ganz richtig. Möchtest du es nochmal probieren?"
+                     : "\(nochmal) Wörter waren noch nicht ganz richtig. Möchtest du sie nochmal probieren?")
+                    .font(.title3).multilineTextAlignment(.center)
+                HStack(spacing: 16) {
+                    grosserKnopf("Ja, nochmal", farbe: Self.blau) { model.nochmalProbieren() }
+                    grosserKnopf("Nein, fertig", farbe: Self.gruen) { model.beenden() }
                 }
+            } else {
                 grosserKnopf("Fertig", farbe: Self.gruen) { model.beenden() }
             }
             Spacer()
@@ -284,6 +293,20 @@ struct LernView: View {
     }
 
     // MARK: Bausteine
+
+    /// „5 Wörter“ / „10 Wörter“ (weniger, wenn es so viele noch nicht gibt)
+    private func rundenKnopf(_ n: Int) -> some View {
+        Button { model.starte(size: n) } label: {
+            VStack(spacing: 2) {
+                Text("\(n)").font(.system(size: 44, weight: .bold, design: .rounded))
+                Text("Wörter").font(.title3.weight(.semibold))
+            }
+            .frame(width: 150, height: 120)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(n == 5 ? Self.blau : Self.gruen)
+        .buttonBorderShape(.roundedRectangle(radius: 24))
+    }
 
     private func box<C: View>(@ViewBuilder _ content: () -> C) -> some View {
         VStack(spacing: 14, content: content)
