@@ -273,7 +273,9 @@ struct LernView: View {
             Spacer()
             Text(model.nochmalRunde ? "Nochmal geübt! 🎉" : "Geschafft! 🎉").font(.system(size: 44, weight: .bold, design: .rounded))
             Text("⭐ \(Self.sterne(model.sterne))").font(.system(size: 40, weight: .semibold))
-            Text("\(ersteRichtig) von \(woerter.count) gleich beim ersten Mal richtig.").font(.title3)
+            if !model.nochmalRunde {
+                Text("\(ersteRichtig) von \(woerter.count) gleich beim ersten Mal richtig.").font(.title3)
+            }
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(woerter, id: \.self) { w in
                     HStack {
