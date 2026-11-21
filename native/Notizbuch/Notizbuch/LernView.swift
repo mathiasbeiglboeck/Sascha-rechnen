@@ -8,6 +8,8 @@ struct LernView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var radierer = false
     @State private var bearbeiten = false
+    /// Vorsprechen: nur das Wort (Standard) oder Wort, Beispielsatz, Wort
+    @AppStorage(Sprecher.mitSatzKey) private var mitSatz = false
 
     init(sync: SyncEngine) {
         _model = StateObject(wrappedValue: LernModel(sync: sync))
@@ -93,6 +95,14 @@ struct LernView: View {
                     rundenKnopf(5)
                     rundenKnopf(10)
                 }
+                Toggle(isOn: $mitSatz) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Mit Beispielsatz vorsprechen").font(.headline)
+                        Text(mitSatz ? "Wort, Satz, nochmal das Wort" : "Nur das Wort").font(.subheadline).foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: 360)
+                .padding(.top, 8)
             }
             if let s = model.status {
                 Text(s).font(.callout).foregroundStyle(.orange).multilineTextAlignment(.center).padding(.horizontal)
