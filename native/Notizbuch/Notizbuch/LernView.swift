@@ -36,7 +36,7 @@ struct LernView: View {
         .task { await model.refresh() }
         .onDisappear { model.sprecher.stop() }
         .sheet(isPresented: $bearbeiten) { LernWoerterSheet(model: model) }
-        .sheet(isPresented: $statistik) { LernStatistikView(model: model) }
+        .fullScreenCover(isPresented: $statistik) { LernStatistikView(model: model) }
         #if DEBUG
         .onOpenURL { url in debug(url) }
         #endif
@@ -161,15 +161,13 @@ struct LernView: View {
         let k = model.karten
         return VStack(alignment: .leading, spacing: 10) {
             Text("Als Nächstes dran").font(.headline)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(Array(liste.enumerated()), id: \.element.id) { i, w in
-                        NaechstesWort(nummer: i + 1, wort: w.wort, fach: k[w.wort]?.fach ?? 0)
-                        if (i == 4 && liste.count > 5) || (i == 9 && liste.count > 10) { Divider() }
-                    }
+            // Alle Wörter untereinander; die Seite scrollt als Ganzes
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(Array(liste.enumerated()), id: \.element.id) { i, w in
+                    NaechstesWort(nummer: i + 1, wort: w.wort, fach: k[w.wort]?.fach ?? 0)
+                    if (i == 4 && liste.count > 5) || (i == 9 && liste.count > 10) { Divider() }
                 }
             }
-            .frame(maxHeight: 330)
             Text("Blau: die nächsten 5 Wörter, grün: bis 10").font(.caption).foregroundStyle(.secondary)
         }
         .lernKarte()
