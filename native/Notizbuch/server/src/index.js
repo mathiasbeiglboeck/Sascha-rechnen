@@ -9,9 +9,12 @@
 //   lern_*   Lernwörter für Sascha: die Wortliste (Claude legt sie über /api/lernen/woerter ab) und das Protokoll
 //            jedes Versuchs (nur anhängen, nie ändern: so gibt es zwischen den Geräten keine Konflikte). Beim Üben
 //            liest der Helfer am Mac das geschriebene Wort als Frage im Pseudo-Dokument LERN_DOC (effort "lernwort")
+//   Vokabelfotos  Mios Lernkarten-App (Web-App auf GitHub Pages) schickt ein Foto einer Vokabelliste; es ist eine Frage
+//            im Pseudo-Dokument KARTEN_DOC (effort "vokabeln"), der Helfer macht daraus Karten (JSON als Antwort)
 // Jede Änderung bekommt eine fortlaufende Nummer (seq). Geräte fragen „alles seit seq X“.
 //
-// Alle /api-Adressen brauchen den Header  Authorization: Bearer <SECRET>.
+// Alle /api-Adressen brauchen den Header  Authorization: Bearer <SECRET>. Nur /api/karten/… geht auch mit dem
+// Lernkarten-Schlüssel (aus SECRET abgeleitet, siehe kartenKey): Er darf nichts anderes, steckt im Handy eines Kindes.
 
 import { DurableObject } from "cloudflare:workers";
 import viewerHTML from "./viewer.html";
@@ -35,6 +38,13 @@ const LERN_DOC = "lernwoerter";
 const LERN_EFFORT = "lernwort";
 const MAX_LERN_WORDS = 500;
 const MAX_LERN_EVENTS = 200;
+// Vokabelfotos aus Mios Lernkarten-App
+const KARTEN_DOC = "vokabelfoto";
+const KARTEN_EFFORT = "vokabeln";
+const MAX_FOTO_BYTES = 6 * 1024 * 1024;
+// Woher die Lernkarten-App Adressen dieses Servers aufrufen darf (CORS)
+const KARTEN_ORIGINS = ["https://mathiasbeiglboeck.github.io"];
+const kartenOrigin = (o) => KARTEN_ORIGINS.includes(o) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(o || "");
 // Frist, in der der Helfer eine übernommene Frage beantwortet (er kann sie verlängern), in Sekunden
 const ASK_LEASE = 900;
 // Läuft die Frist einer übernommenen Frage so oft ab, ohne dass eine Antwort kommt, gilt sie als gescheitert
@@ -68,12 +78,37 @@ export default {
       return new Response("Notizbuch-Server läuft.\n", { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
     const auth = request.headers.get("authorization") || "";
+    // Lernkarten-App im Browser: eigener Schlüssel, nur /api/karten/…, mit CORS
+    if (url.pathname.startsWith("/api/karten/")) {
+      const origin = request.headers.get("origin");
+      const cors = kartenOrigin(origin)
+        ? { "access-control-allow-origin": origin, "access-control-allow-headers": "authorization, content-type",
+          "access-control-allow-methods": "GET, POST, DELETE", "access-control-max-age": "86400", vary: "origin" }
+        : {};
+      if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+      const ok = env.SECRET && (sameSecret(auth, `Bearer ${await kartenKey(env.SECRET)}`) || sameSecret(auth, `Bearer ${env.SECRET}`));
+      const res = ok ? await store.fetch(request) : json({ error: "Falscher oder fehlender Schlüssel" }, 401);
+      const out = new Response(res.body, res);
+      for (const [k, v] of Object.entries(cors)) out.headers.set(k, v);
+      return out;
+    }
     if (!env.SECRET || !sameSecret(auth, `Bearer ${env.SECRET}`)) {
       return json({ error: "Falscher oder fehlender Schlüssel" }, 401);
     }
     return store.fetch(request);
   },
 };
+
+/// Der Lernkarten-Schlüssel: HMAC-SHA256(SECRET, "lernkarten-foto"), base64url, 32 Zeichen. So muss niemand ein
+/// zweites Geheimnis eintragen; claude-fragen/karten-link.mjs rechnet am Mac dasselbe aus
+async function kartenKey(secret) {
+  if (kartenKey.cache?.secret === secret) return kartenKey.cache.key;
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode("lernkarten-foto")));
+  const key = btoa(String.fromCharCode(...mac)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "").slice(0, 32);
+  kartenKey.cache = { secret, key };
+  return key;
+}
 
 export class Store extends DurableObject {
   constructor(ctx, env) {
@@ -144,6 +179,17 @@ export class Store extends DurableObject {
         if (!id && method === "GET") return json(this.lernen(url));
         if (id === "woerter" && !sub && method === "POST") return json(this.lernWords(await bodyJSON(request)));
         if (id === "log" && !sub && method === "POST") return json(this.lernLog(await bodyJSON(request)));
+      }
+      // Vokabelfotos (Lernkarten-App): Foto hochladen, Stand und Karten abholen, danach löschen
+      if (area === "karten" && id === "foto" && sub && !extra) {
+        if (method === "POST") return await this.createFoto(request, sub);
+        if (method === "GET") {
+          const row = this.askRow(sub);
+          if (!row || row.doc !== KARTEN_DOC) return fail("Dieses Foto gibt es nicht (mehr)", "gone", 404);
+          const a = publicAsk(row);
+          return json({ id: a.id, status: a.status, answer: a.answer, note: a.note, created: a.created, updated: a.updated });
+        }
+        if (method === "DELETE") { this.deleteAsk(KARTEN_DOC, sub); return json({ ok: true }); }
       }
       if (area === "share" && id && method === "POST") return json({ token: this.shareToken(id) });
       if (area === "share" && id && method === "DELETE") {
@@ -505,6 +551,7 @@ export class Store extends DurableObject {
   /// ändert sich nichts
   async createAsk(request, doc, askId) {
     if (!UUID_RE.test(askId)) return fail("Ungültige Kennung", "bad-id", 400);
+    if (doc === KARTEN_DOC) return fail("Vokabelfotos über /api/karten/foto", "bad-doc", 400);
     if (this.askRow(askId) || this.askGone(askId)) return json(this.docAsks(doc));
     // Billige Prüfungen, bevor die Bilder gelesen werden (danach noch einmal: dazwischen kann anderes laufen)
     const early = this.askRefused(doc, null);
@@ -549,9 +596,60 @@ export class Store extends DurableObject {
     return json(this.docAsks(doc));
   }
 
+  /// Vokabelfoto aus der Lernkarten-App: multipart mit foto (JPEG oder PNG) und meta (JSON, optional: from, hinweis).
+  /// Wird zur Frage im Pseudo-Dokument KARTEN_DOC; der Helfer holt das Foto als "question". Doppelt hochgeladen: nichts
+  async createFoto(request, askId) {
+    if (!UUID_RE.test(askId)) return fail("Ungültige Kennung", "bad-id", 400);
+    const state = () => { const r = this.askRow(askId); return json({ id: askId, status: r ? r.status : "gone" }); };
+    if (this.askRow(askId) || this.askGone(askId)) return state();
+    const early = this.askRefused(KARTEN_DOC, null);
+    if (early) return early;
+    let form;
+    try {
+      form = await request.formData();
+    } catch {
+      return fail("multipart erwartet", "bad-body", 400);
+    }
+    const f = form.get("foto"), m = form.get("meta");
+    if (!f || typeof f === "string") return fail("Foto fehlt", "bad-body", 400);
+    if (f.size > MAX_FOTO_BYTES) return fail("Foto zu groß", "too-large", 413);
+    let meta = {};
+    try {
+      meta = JSON.parse(typeof m === "string" ? m : m ? await m.text() : "{}") || {};
+    } catch {}
+    const fb = await f.arrayBuffer();
+    if (this.askRow(askId) || this.askGone(askId)) return state();
+    const ft = imageType(fb);
+    if (!ft) return fail("Kein Bild", "bad-body", 400);
+    const refused = this.askRefused(KARTEN_DOC, meta);
+    if (refused) return refused;
+    const now = Date.now() / 1000;
+    const info = { from: String(meta.from || "").slice(0, 40) };
+    if (typeof meta.hinweis === "string" && meta.hinweis.trim()) info.hinweis = meta.hinweis.trim().slice(0, 300);
+    let v;
+    this.ctx.storage.transactionSync(() => {
+      this.writeBlob(`ask/${askId}/question`, fb, ft);
+      v = this.nextAsksV();
+      this.sql.exec(
+        "INSERT INTO asks (id, doc, status, anchor, pv, effort, created, updated, info, v) " +
+          "VALUES (?, ?, 'open', ?, 0, ?, ?, ?, ?, ?)",
+        askId, KARTEN_DOC, JSON.stringify({ page: 0, x: 0, y: 0, w: 0, h: 0 }), KARTEN_EFFORT, now, now,
+        JSON.stringify(info), v,
+      );
+    });
+    this.broadcast(null, { type: "ask" }, "helper");
+    return state();
+  }
+
   /// Warum eine neue Frage nicht angenommen wird, sonst null. Mit `meta` auch: gestellt auf einem älteren Seitenstand
   /// (ein anderes Gerät hat inzwischen Seiten gelöscht oder eingefügt), dann stimmt ihre Stelle nicht mehr
   askRefused(doc, meta) {
+    if (doc === KARTEN_DOC) {
+      if (this.sql.exec("SELECT COUNT(*) AS n FROM asks WHERE status IN ('open', 'claimed')").one().n >= MAX_OPEN_ASKS) {
+        return fail("Zu viele offene Fragen", "too-many", 429);
+      }
+      return null;
+    }
     if (doc === LERN_DOC) {
       if (meta && !lernTarget(meta)) return fail("Lernwort fehlt", "bad-body", 400);
       if (this.sql.exec("SELECT COUNT(*) AS n FROM asks WHERE status IN ('open', 'claimed')").one().n >= MAX_OPEN_ASKS) {
@@ -654,7 +752,9 @@ export class Store extends DurableObject {
       asks: rows
         .filter((r) => r.lease <= now)
         // Lernwörter zuerst: Dort wartet ein Kind vor dem iPad
-        .sort((a, b) => (b.effort === LERN_EFFORT) - (a.effort === LERN_EFFORT) || a.created - b.created)
+        // danach Vokabelfotos (Mio wartet in der Lernkarten-App)
+        .sort((a, b) => (b.effort === LERN_EFFORT) - (a.effort === LERN_EFFORT) ||
+          (b.effort === KARTEN_EFFORT) - (a.effort === KARTEN_EFFORT) || a.created - b.created)
         .map((r) => ({ id: r.id, doc: r.doc, effort: r.effort, created: r.created, retry: r.status === "claimed" })),
       next: later.length ? Math.ceil(Math.min(...later)) : null,
     };
@@ -702,6 +802,7 @@ export class Store extends DurableObject {
     return json({
       id: askId, claim, leaseUntil: now + lease, anchor: JSON.parse(row.anchor), pv: row.pv, effort: row.effort,
       created: row.created, from: info.from || null,
+      ...(row.doc === KARTEN_DOC ? { karten: { hinweis: info.hinweis || null } } : {}),
       ...(row.doc === LERN_DOC ? { lern: { wort: info.wort, satz: info.satz || null, versuch: info.versuch || 1, gelesen: info.gelesen || null } } : {}),
       doc: {
         id: row.doc, title: meta.title || "", kind: meta.kind || "notebook", pageCount: meta.pageCount || 0,

@@ -407,6 +407,7 @@ async function main() {
   startHelper();
   ok(await waitFor(async () => (await askOf(doc, rs.id)).status === "answered", 15000, 200), `answered right after the restart (${((Date.now() - tRestart) / 1000).toFixed(1)} s), not after its 20-minute lease`);
 
+  await vokabelTests();
   await lernTests();
   helper.kill("SIGTERM");
   const logPath = path.join(HOME, "helfer.log");
@@ -504,4 +505,48 @@ async function lernTests() {
   ok(x && Date.now() - t0 < 3000 && /Mitlaut/.test(JSON.parse(x.answer).hinweis), `Tipp ebenso (${Date.now() - t0} ms)`);
   await sleep(500);
   setMode({ mode: "ok" });
+}
+
+async function createFoto(hinweis) {
+  const id = uuid();
+  const f = new FormData();
+  f.append("meta", JSON.stringify({ from: "Mios iPhone", ...(hinweis ? { hinweis } : {}) }));
+  const jpg = new Uint8Array(1500); jpg.set([0xff, 0xd8, 0xff, 0xe0]);
+  f.append("foto", new Blob([jpg], { type: "image/jpeg" }), "foto.jpg");
+  const r = await api("POST", `/api/karten/foto/${id}`, { body: f });
+  if (r.status !== 200) throw new Error("foto " + r.status + JSON.stringify(r.data));
+  return id;
+}
+const fotoDone = (id) => waitFor(async () => { const r = await api("GET", `/api/karten/foto/${id}`); return r.data?.status === "answered" || r.data?.status === "failed" ? r.data : null; }, 15000, 50);
+
+async function vokabelTests() {
+  console.log("== Vokabelfotos");
+  setMode({ mode: "ok" });
+  let n = calls().filter((c) => c.args).length;
+  let id = await createFoto("Unit 3, Seite 42");
+  let x = await fotoDone(id);
+  let ans = x && x.answer && JSON.parse(x.answer);
+  ok(ans?.titel === "Unit 3" && ans.karten.length === 2 && ans.karten[0].deutsch === "Hund" && ans.karten[1].satzSelbst === false, "Karten aus dem Foto", x);
+  ok(ans && ans.geheim === undefined && ans.karten[0].extra === undefined, "nur bekannte Felder", ans);
+  let lc = calls().filter((c) => c.args).slice(n);
+  ok(lc.length === 1 && lc[0].stream && lc[0].imageBytes === 1500, "ein Aufruf, Foto in der Nachricht", lc.map((c) => [c.stream, c.imageBytes]));
+  ok(promptAny(lc[0]).includes("„Unit 3, Seite 42“"), "Mios Hinweis im Auftrag", promptAny(lc[0]));
+  ok(optOf(lc[0], "--tools") === "Read" && lc[0].args[lc[0].args.indexOf("--effort") + 1] === "medium" && lc[0].args.includes("--restricted") && !lc[0].args.includes("--allowedTools"), "nur Read, effort medium, eingeschränkt, kein Internet", lc[0].args);
+  ok(lc[0].envKeys.length === 0 && fs.existsSync(path.join(lc[0].cwd, "foto.jpg")) && lc[0].cwd.includes("vokabelfotos"), "eigener Ordner, Foto darin, kein Schlüssel");
+  ok(fs.readFileSync(path.join(HOME, "helfer.log"), "utf8").includes("Vokabelfoto"), "Protokoll: Vokabelfoto");
+  await api("DELETE", `/api/karten/foto/${id}`);
+
+  setMode({ mode: "ok", vokabelnLeer: true });
+  id = await createFoto();
+  x = await fotoDone(id);
+  ans = x && x.answer && JSON.parse(x.answer);
+  ok(ans && ans.karten.length === 0 && /keine Vokabeln/.test(ans.problem), "keine Liste: Hinweis für Mio", x);
+
+  setMode({ mode: "error" });
+  id = await createFoto();
+  x = await waitFor(async () => { const r = await api("GET", `/api/karten/foto/${id}`); return r.data?.status === "open" && r.data.note ? r.data : null; }, 15000, 100);
+  ok(x && /Fehler am Mac/.test(x.note), "Fehler: zurück in die Warteschlange mit Hinweis", x);
+  await api("DELETE", `/api/karten/foto/${id}`);
+  setMode({ mode: "ok" });
+  await sleep(300);
 }

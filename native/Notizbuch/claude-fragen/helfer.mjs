@@ -32,6 +32,8 @@ const DEFAULTS = {
   thorough: { effort: "max", model: null, minutes: 45 },
   // Lernwörter für Sascha: Wort lesen (und bei einem Fehler einen Hinweis geben). Schnell, ein Kind wartet
   lernen: { effort: "low", model: null, minutes: 3 },
+  // Vokabelfotos aus Mios Lernkarten-App: Liste lesen, Karten mit Beispielsätzen schreiben
+  vokabeln: { effort: "medium", model: null, minutes: 6 },
   // Rückfallabfrage, falls eine Meldung über den WebSocket verloren geht (Sekunden)
   pollSeconds: 300,
   // Nach einem Fehler am Mac: neuer Versuch nach so vielen Sekunden; am Nutzungslimit mindestens so lange Pause
@@ -343,8 +345,9 @@ function stop(child) {
 }
 
 async function answer(ask) {
-  const lern = ask.effort === "lernwort";
-  const level = lern ? config.lernen : ask.effort === "thorough" ? config.thorough : config.quick;
+  const lern = ask.effort === "lernwort", vok = ask.effort === "vokabeln";
+  const level = lern ? config.lernen : vok ? { ...DEFAULTS.vokabeln, ...(config.vokabeln || {}) }
+    : ask.effort === "thorough" ? config.thorough : config.quick;
   const lease = Math.max(900, level.minutes * 60 + 300);
   let job;
   try {
@@ -353,7 +356,9 @@ async function answer(ask) {
     if (e.status === 404 || e.status === 409) return false; // gelöscht, schon vergeben oder aufgegeben
     throw e;
   }
-  if (lern) {
+  if (vok) {
+    log(ask.id, "übernommen: Vokabelfoto aus der Lernkarten-App");
+  } else if (lern) {
     log(ask.id, `übernommen: Lernwort, ${job.lern?.gelesen ? "Hinweis" : "lesen"}, ${job.lern?.versuch || 1}. Versuch`);
   } else {
     const title = job.doc.title || "Dokument";
@@ -370,6 +375,8 @@ async function answer(ask) {
     let result;
     if (lern) {
       result = await lernClaude(job, level);
+    } else if (vok) {
+      result = await vokabelClaude(job, level);
     } else {
       const dir = path.join(CHATS, job.doc.id);
       const files = await fetchFiles(job, dir);
@@ -768,6 +775,101 @@ async function lernClaude(job, level) {
     return { ok: true, text: JSON.stringify({ gelesen: "", richtig: false, hinweis: null, unleserlich: true }) };
   }
   return { ok: true, text: JSON.stringify({ gelesen, richtig: gelesen === lernNorm(lern.wort), hinweis: null }) };
+}
+
+// ---------- Vokabelfotos (Mios Lernkarten-App) ----------
+//
+// Mio (11, 2. Klasse Gymnasium) fotografiert eine Vokabelliste aus Heft oder Buch. Claude liest sie und schreibt je
+// Vokabel: Fremdwort, Deutsch, einen Beispielsatz (aus der Liste, sonst selbst gemacht). Die App macht daraus Karten
+// in beide Richtungen. Antwort an die App: {"titel", "sprache", "karten": [{fremd, deutsch, satz, satzSelbst}]}.
+// Je Foto ein neuer Chat, das Bild gleich in der Nachricht (sonst mit Read)
+
+const VOK_SYSTEM = `Du hilfst Mio, einem 11-jährigen Schüler in der 2. Klasse Gymnasium in Wien, beim Vokabellernen. \
+Er fotografiert Vokabellisten aus seinem Vokabelheft oder Schulbuch, und du machst daraus Lernkarten. \
+Antworte immer nur mit dem verlangten JSON, ohne Erklärung davor oder danach, ohne Codeblock.`;
+
+function vokabelPrompt(file, hinweis) {
+  const where = file ? `In ${file} ist ein Foto` : "Auf dem Bild ist ein Foto";
+  return `${where} einer Vokabelliste (Fremdsprache und Deutsch, gedruckt oder mit der Hand geschrieben).${file ? " Sieh es dir mit Read an." : ""}
+${hinweis ? `Mio schreibt dazu: „${hinweis}“\n` : ""}
+Schreib jede Vokabel, die auf dem Foto steht, als Eintrag heraus, in der Reihenfolge der Liste:
+- "fremd": das Wort oder der Ausdruck in der Fremdsprache, so wie es dasteht (mit Zusätzen wie „to“ bei Verben, \
+unregelmäßigen Formen wie „go – went – gone“ oder Mehrzahl, wenn sie dabeistehen).
+- "deutsch": die deutsche Bedeutung, so wie sie dasteht (mehrere Bedeutungen mit Beistrich).
+- "satz": ein Beispielsatz in der Fremdsprache, in dem das Wort vorkommt. Steht auf dem Foto bei der Vokabel schon einer, \
+nimm genau diesen und setz "satzSelbst": false. Sonst schreib selbst einen kurzen, natürlichen Satz, den ein \
+11-Jähriger versteht (Alltag, Schule, Familie, Freunde, Sport, Tiere), und setz "satzSelbst": true.
+- Ist ein Wort offensichtlich falsch geschrieben (etwa ein Fehler beim Abschreiben ins Heft), verbessere es und setz \
+"verbessert": "<wie es dastand>".
+- Unleserliches, Überschriften, Seitenzahlen und Übungsaufgaben lässt du weg. Durchgestrichenes auch.
+"titel": eine kurze Überschrift für den Stapel, wenn auf dem Foto eine steht (etwa „Unit 3“ oder „Lektion 5“), sonst \
+ein passendes Thema in zwei, drei Wörtern. "sprache": die Fremdsprache auf Deutsch (etwa „Englisch“).
+Antwort nur als JSON: {"titel": "…", "sprache": "…", "karten": [{"fremd": "…", "deutsch": "…", "satz": "…", "satzSelbst": true}]}.
+Ist auf dem Foto keine Vokabelliste zu erkennen: {"titel": "", "sprache": "", "karten": [], "problem": "<kurz, für Mio>"}.`;
+}
+
+const vokClean = (s, max = 300) => String(s ?? "").normalize("NFC").replace(/\s+/g, " ").trim().slice(0, max);
+
+/// Was die App bekommt: nur bekannte Felder, gekürzt, höchstens 150 Karten
+function vokabelAnswer(o) {
+  if (!o || !Array.isArray(o.karten)) return null;
+  const karten = o.karten.map((k) => ({
+    fremd: vokClean(k?.fremd, 200), deutsch: vokClean(k?.deutsch, 200), satz: vokClean(k?.satz),
+    satzSelbst: k?.satzSelbst !== false, ...(k?.verbessert ? { verbessert: vokClean(k.verbessert, 200) } : {}),
+  })).filter((k) => k.fremd && k.deutsch).slice(0, 150);
+  return {
+    titel: vokClean(o.titel, 60), sprache: vokClean(o.sprache, 30), karten,
+    ...(o.problem && !karten.length ? { problem: vokClean(o.problem) } : {}),
+  };
+}
+
+// Wie lernInline, aber eigen: Ein Fehler hier soll das Lesen der Lernwörter nicht verlangsamen
+let vokInline = true;
+
+async function vokabelClaude(job, level) {
+  const bin = findClaude();
+  if (!bin) {
+    return { ok: false, setup: true, error: "Claude Code ist am Mac nicht zu finden. Im Terminal claude installieren und anmelden." };
+  }
+  const caps = await claudeCaps(bin);
+  const dir = path.join(CHATS, "vokabelfotos", job.id);
+  fs.mkdirSync(dir, { recursive: true });
+  const base = [
+    "--tools", "Read",
+    ...(caps.dontAsk ? ["--permission-mode", "dontAsk"] : []),
+    ...(useRestricted(caps) ? ["--restricted"] : []),
+    "--strict-mcp-config",
+    "--append-system-prompt", VOK_SYSTEM,
+    "--max-turns", "4",
+    "--session-id", randomUUID(),
+    ...(level.effort ? ["--effort", level.effort] : []),
+    ...(level.model ? ["--model", level.model] : []),
+  ];
+  const { data, type } = await api("GET", `/api/asks/${job.id}/question`, { timeout: 60000 });
+  const png = type.includes("png");
+  const file = png ? "foto.png" : "foto.jpg";
+  fs.writeFileSync(path.join(dir, file), data);
+  if (current?.cancelled) return { ok: false, error: "abgebrochen" };
+  const hinweis = job.karten?.hinweis || null;
+  let r = null;
+  if (vokInline) {
+    const msg = { type: "user", message: { role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: png ? "image/png" : "image/jpeg", data: data.toString("base64") } },
+      { type: "text", text: vokabelPrompt(null, hinweis) },
+    ] } };
+    r = parseResult(await runClaude(bin, ["-p", "--input-format", "stream-json", "--output-format", "stream-json",
+      "--verbose", ...base], dir, level.minutes, JSON.stringify(msg) + "\n", (t) => Array.isArray(lernJSON(t)?.karten)));
+    if (!r.ok && !(r.auth || r.setup || r.limit || r.transient || current?.cancelled)) {
+      log(job.id, "Foto in der Nachricht geht nicht, wieder mit Read:", r.error);
+      vokInline = false;
+      r = null;
+    }
+  }
+  if (!r) r = parseResult(await runClaude(bin, ["-p", vokabelPrompt(file, hinweis), "--output-format", "json", ...base], dir, level.minutes));
+  if (!r.ok) return r;
+  const out = vokabelAnswer(lernJSON(r.text));
+  if (!out) return { ok: false, error: "Claude hat keine Karten geschrieben" };
+  return { ok: true, text: JSON.stringify(out) };
 }
 
 /// Die Umgebung ohne Werte des Helfers (für Claude und andere Programme); Claude Code aktualisiert sich dabei nicht

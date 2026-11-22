@@ -124,6 +124,16 @@ const finish = () => {
     const t = mode.unleserlich ? '{"gelesen": "", "unleserlich": true}' : JSON.stringify({ gelesen: mode.gelesen ?? "Farad" });
     return lernOut(t);
   }
+  // Vokabelfotos: zwei Vokabeln, eine mit Satz aus dem Buch; mode.vokabelnLeer: keine Liste erkannt
+  if (prompt.includes("Vokabelliste")) {
+    const t = mode.vokabelnLeer
+      ? JSON.stringify({ titel: "", sprache: "", karten: [], problem: "Ich sehe keine Vokabeln." })
+      : "Hier:\n" + JSON.stringify({ titel: "Unit 3", sprache: "Englisch", geheim: "weg", karten: [
+        { fremd: "dog", deutsch: "Hund", satz: "My dog likes to run.", satzSelbst: true, extra: 1 },
+        { fremd: "to go – went – gone", deutsch: "gehen", satz: "We go to school.", satzSelbst: false },
+        { fremd: "", deutsch: "leer" }] });
+    return lernOut(t);
+  }
   if (prompt.includes("Gesucht war")) {
     const t = "```json\n" + JSON.stringify({ hinweis: "Hör genau hin: Nach dem kurzen a kommt ein doppelter Mitlaut." }) + "\n```";
     return lernOut(t);

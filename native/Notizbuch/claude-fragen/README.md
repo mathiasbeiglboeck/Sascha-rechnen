@@ -83,3 +83,15 @@ BASE=http://127.0.0.1:8791 KEY=testkey node native/Notizbuch/claude-fragen/test/
 ```
 
 `helper-test.mjs` startet den Helfer mit `test/fake-claude` statt Claude Code und `test/fake-osascript` statt macOS; sein Arbeitsordner wird nach einem erfolgreichen Lauf gelöscht (`KEEP=1` behält ihn). `fake-claude` lässt sich auch von Hand als `claude` in einer Test-`config.json` eintragen: Mit `{"mode": "rich"}` in `$FAKE_STATE/mode.json` antwortet er mit Formeln, Liste und Code, um die Karte in der App anzusehen.
+
+## Vokabelfotos für Mios Lernkarten
+
+Die Lernkarten-App (Web-App unter `karten/` im Repo, auf GitHub Pages) schickt Fotos von Vokabellisten an
+`/api/karten/foto/<uuid>` des Notizbuch-Servers, mit einem eigenen Schlüssel, der nur dort gilt (HMAC aus dem
+Server-Schlüssel, nichts einzutragen). Der Helfer nimmt sie als Frage mit effort `vokabeln` (gleich nach den
+Lernwörtern), lässt Claude die Vokabeln samt Beispielsatz als JSON schreiben und antwortet damit; die App macht daraus
+Karten in beide Richtungen. Einstellbar in config.json: `"vokabeln": {"effort": "medium", "minutes": 6}`.
+
+Einrichtungslink für Mios iPhone: `zsh native/Notizbuch/claude-fragen/karten-link.sh` (legt ihn in die
+Zwischenablage). In der Lernkarten-App: ⋯ → Vokabelfotos → Link einsetzen.
+Test: `node server/test/karten.mjs` (Server) und `claude-fragen/test/helper-test.mjs` (Abschnitt Vokabelfotos).
