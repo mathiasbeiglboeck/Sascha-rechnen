@@ -394,7 +394,8 @@ document.addEventListener("keydown", e => {
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("sw.js").catch(() => {});
   // Neue Version: auf der Startseite neu laden
-  navigator.serviceWorker.addEventListener("controllerchange", () => { if (S.view === "home" && !$("#sheet")) location.reload(); });
+  const hadController = !!navigator.serviceWorker.controller; // beim allerersten Start nicht neu laden
+  navigator.serviceWorker.addEventListener("controllerchange", () => { if (hadController && S.view === "home" && !$("#sheet")) location.reload(); });
 }
 
 load().then(home).catch(e => { app().textContent = "Fehler beim Laden: " + e; });
