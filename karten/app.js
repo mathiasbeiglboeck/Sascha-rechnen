@@ -156,6 +156,7 @@ function home() {
         <p class="sub">Füge einen Anki-Stapel hinzu (eine <b>.apkg</b>-Datei, z. B. von AnkiWeb oder von deiner Lehrerin).</p>
       </div>`}
     <div class="add">
+      ${Foto.homeHTML()}
       <label class="addbtn">＋ Anki-Stapel hinzufügen<input type="file" id="file" hidden></label>
     </div>
   </div>`;
@@ -164,6 +165,7 @@ function home() {
   const st = $("#start"); if (st) st.onclick = () => startSession();
   $("#file").onchange = e => { const f = e.target.files[0]; e.target.value = ""; if (f) doImport(f); };
   $("#menu").onclick = settings;
+  Foto.wireHome();
 }
 
 function toggleDeck(name) {
@@ -235,6 +237,7 @@ async function fillCard(host, html, nt) {
   }
   const sounds = [...root.querySelectorAll(".snd")];
   for (const b of sounds) b.onclick = async e => { e.stopPropagation(); play(b.dataset.snd); };
+  for (const b of root.querySelectorAll(".tts")) b.onclick = e => { e.stopPropagation(); speak(b.dataset.t, b.dataset.lang); };
   return sounds.map(b => b.dataset.snd);
 }
 const CARD_CSS = `
@@ -247,7 +250,20 @@ const CARD_CSS = `
   .typed { font-weight: 700; color: #1f6fd1; }
   details.hint summary { color: #1f6fd1; cursor: pointer; font-size: 18px; }
   ul, ol { text-align: left; display: inline-block; }
+  .dir { font-size: 13px; color: #8a8f88; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 14px; }
+  .w { font-size: 30px; font-weight: 600; }
+  .s { font-size: 19px; font-style: italic; color: #4c5a52; margin-top: 12px; }
+  .tts { font-size: 16px; border: 1px solid #e0d8c6; background: #fff; border-radius: 16px; width: 32px; height: 32px; cursor: pointer; vertical-align: middle; margin-left: 6px; font-style: normal; }
 `;
+function speak(text, lang) {
+  try {
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text); u.lang = lang; u.rate = 0.9;
+    const v = speechSynthesis.getVoices().find(v => v.lang.replace("_", "-") === lang) || speechSynthesis.getVoices().find(v => v.lang.startsWith(lang.slice(0, 2)));
+    if (v) u.voice = v;
+    speechSynthesis.speak(u);
+  } catch {}
+}
 let audio = null;
 async function play(name) {
   const u = await mediaUrl(name); if (!u) return;
@@ -335,11 +351,13 @@ function settings() {
     <h2>Einstellungen</h2>
     <h3>Stapel entfernen</h3>
     ${tree.length ? tree.map(d => `<button class="row" data-del="${esc(d.name)}">${esc(d.name)} <span>${d.n} Karten · entfernen</span></button>`).join("") : `<p class="sub">Keine Stapel.</p>`}
+    ${Foto.settingsHTML()}
     <h3>Lernstand</h3>
     <p class="sub">Der Lernstand ist nur auf diesem Gerät gespeichert. Eine Sicherung kannst du z. B. in „Dateien“ ablegen.</p>
     <button class="row" id="exp">Lernstand sichern</button>
     <label class="row">Lernstand zurückholen<input type="file" id="imp" hidden></label>
   `, root => {
+    Foto.wireSettings(root);
     root.querySelectorAll("[data-del]").forEach(b => b.onclick = async () => {
       const name = b.dataset.del;
       if (b.dataset.sure !== "1") { b.dataset.sure = "1"; b.querySelector("span").textContent = "Wirklich? Nochmal tippen"; b.classList.add("warn"); return; }

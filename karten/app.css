@@ -87,3 +87,28 @@ button:disabled { opacity: .45; cursor: default; }
   padding: 13px 14px; margin: 6px 0; font-size: 16px; text-align: left; cursor: pointer; }
 .row span { color: var(--muted); font-size: 13px; }
 .row.warn span { color: var(--r1); font-weight: 700; }
+
+/* Vokabelfotos */
+.add { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.addbtn.cam { border-style: solid; border-color: var(--acc); color: var(--acc); background: var(--card); }
+.link { color: var(--muted); font-size: 13px; text-decoration: underline; cursor: pointer; }
+.fotoitem { width: 100%; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; text-align: left; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+.fotoitem.ready { border-color: var(--r3); background: #eef7f0; }
+.fotoitem.bad { border-color: #f0c5bf; color: var(--r1); }
+.fotoitem .x { margin-left: auto; color: var(--muted); font-size: 13px; text-decoration: underline; }
+.spin.s { width: 16px; height: 16px; border-width: 2.5px; margin: 0; display: inline-block; flex: none; }
+.review { display: flex; flex-direction: column; flex: 1; }
+.field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); font-weight: 600; margin: 6px 0; }
+.review input, .review textarea, .sheet input { font: inherit; font-size: 16px; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 9px 10px; width: 100%; }
+.review textarea { font-size: 15px; font-style: italic; resize: vertical; }
+.voks { list-style: none; padding: 0; margin: 0 0 8px; display: flex; flex-direction: column; gap: 10px; }
+.voks li { background: #fbf9f3; border: 1px solid var(--line); border-radius: 14px; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
+.voks li.off { opacity: .4; }
+.voks li.off input, .voks li.off textarea { text-decoration: line-through; }
+.vrow { display: flex; gap: 6px; align-items: center; }
+.vf { font-weight: 650; }
+.vx { width: 36px; height: 36px; flex: none; border-radius: 18px; border: 1px solid var(--line); background: var(--card); color: var(--muted); }
+.vnote { font-size: 12px; color: var(--muted); }
+.vnote.warn { color: var(--r2); font-weight: 600; }
+.row.small { width: auto; margin: 0; }
+.vrow input { flex: 1; min-width: 0; } .vrow .vf { flex: 1.3; }

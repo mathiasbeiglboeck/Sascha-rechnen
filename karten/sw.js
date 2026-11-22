@@ -1,6 +1,6 @@
 // Offline: App-Dateien vorab speichern. Karten und Lernstand liegen im Gerät (IndexedDB).
-const CACHE = "karten-v1";
-const FILES = ["./", "index.html", "app.js", "anki.js", "app.css", "manifest.webmanifest", "icon-180.png", "icon-192.png", "icon-512.png",
+const CACHE = "karten-v2";
+const FILES = ["./", "index.html", "app.js", "anki.js", "foto.js", "app.css", "manifest.webmanifest", "icon-180.png", "icon-192.png", "icon-512.png",
   "lib/sql-wasm.js", "lib/sql-wasm.wasm", "lib/jszip.min.js", "lib/fzstd.js"];
 self.addEventListener("install", e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener("activate", e => {
