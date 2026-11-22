@@ -192,6 +192,20 @@ async function main() {
   ctxFile = Object.keys(c.sizes).find((f) => f.endsWith(`${a.id}/nachbarseiten.pdf`));
   ok(ctxFile && promptOf(c).includes(`- ${ctxFile}: Seite 2, wie sie in der App aussieht, oben mit ihrer Nummer beschriftet\nVon Seite 1 bis 4 ist außer der Seite der Frage nur auf Seite 2 etwas geschrieben, die übrigen sind leer.`), "one written page: singular", promptOf(c));
 
+  console.log("== ∞ (question as JPEG: the printed question over the spot)");
+  {
+    const id = uuid();
+    const f = new FormData();
+    f.append("meta", JSON.stringify({ anchor: { page: 1, x: 10, y: 20, w: 100, h: 30 }, pv: 0, effort: "quick", created: Date.now() / 1000, from: "iPad", span: [0, 2], pages: [] }));
+    f.append("question", new Blob([JPG()], { type: "image/jpeg" }), "question.jpg");
+    f.append("page", new Blob([JPG()], { type: "image/jpeg" }), "page.jpg");
+    const r = await api("PUT", `/api/doc/${nb}/asks/${id}`, { body: f });
+    ok(r.status === 200 && await waitFor(async () => (await askOf(nb, id)).status === "answered", 15000), "answered", r.status);
+    c = calls().filter((x) => x.args).at(-1);
+    ok(/frage\.jpg: die Frage \(oben gedruckt\) und die Stelle, um die es geht, pink umrandet\n- \S+seite\.jpg: die ganze Seite 2, die Stelle darauf farbig umrandet\n/.test(promptOf(c)), "∞: printed question and the spot", promptOf(c));
+    ok(/zieht mit dem Lasso ein ∞ über eine Stelle/.test(systemOf(c)), "system prompt knows the ∞", systemOf(c));
+  }
+
   console.log("== retry without the pages (moved meanwhile): no stale pages PDF from the first try");
   setMode({ mode: "error" });
   a = await createAsk(nb, "quick", 2, { span: [0, 3], pages: [0], bytes: 900 });

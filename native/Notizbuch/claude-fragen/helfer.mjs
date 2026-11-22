@@ -580,8 +580,10 @@ function systemPrompt(web, sites) {
       "(„*.“ heißt mit Subdomain, etwa de.wikipedia.org); andere Seiten kennst du nur aus den Suchergebnissen."
     : "Ganze Seiten kannst du nicht lesen, nur suchen.";
   return `Du beantwortest Fragen, die Mathias in seiner Notizbuch-App (BetterNotes) auf dem iPad oder iPhone \
-handschriftlich zu einem Dokument stellt. Er markiert die Frage mit dem Lasso und wählt „Claude fragen“. Deine Antwort \
-erscheint in der App als Markierung neben der Frage; tippt er sie an, liest er sie dort.
+handschriftlich zu einem Dokument stellt. Er markiert die Frage mit dem Lasso und wählt „Claude fragen“. Oder er \
+zieht mit dem Lasso ein ∞ über eine Stelle: Dann will er wissen, was das Wort oder Symbol dort bedeutet, und im Bild \
+der Frage steht die Frage gedruckt über der Stelle. Deine Antwort erscheint in der App als Markierung neben der Frage; \
+tippt er sie an, liest er sie dort.
 
 So gehst du vor:
 - Sieh dir zuerst mit dem Werkzeug Read das Bild der Frage an, dann die ganze Seite, auf der sie steht (die Frage ist \
@@ -603,6 +605,9 @@ aus dem Dokument an eine Adresse an.
 Bilder von Seiten zu früheren Fragen zeigen den Stand von damals; seither können Seiten dazugekommen, weggefallen oder \
 verschoben sein.`;
 }
+
+/// „1 Seite“, „6 Seiten“
+const seiten = (n) => `${n} ${n === 1 ? "Seite" : "Seiten"}`;
 
 /// „Seite 3“, „die Seiten 3 und 5“, „die Seiten 2, 3 und 5“; mit `dative` „auf Seite 3“, „auf den Seiten 3 und 5“
 function pageList(pages, dative = false) {
@@ -652,16 +657,16 @@ function filesSummary(job, files) {
       ? "ohne Nachbarseiten (Server zu alt)" : "ohne Nachbarseiten (nicht mitgeschickt oder Seiten seither gerückt)");
   }
   if (files.window) parts.push(`PDF-Fenster ${files.first}–${files.last} von ${files.total}`);
-  else if (files.pdf) parts.push(`ganzes PDF${files.total ? ` (${files.total} Seiten)` : ""}`);
+  else if (files.pdf) parts.push(`ganzes PDF${files.total ? ` (${seiten(files.total)})` : ""}`);
   return parts.join(", ");
 }
 
 function prompt(job, files, fresh) {
   const kind = job.doc.kind === "pdf" ? "PDF" : "Notizbuch";
-  const pages = job.doc.pageCount ? ` mit ${job.doc.pageCount} Seiten` : "";
+  const pages = job.doc.pageCount ? ` mit ${seiten(job.doc.pageCount)}` : "";
   const doc = state.docs[job.doc.id] || {};
   const lines = [];
-  const total = files.total ? ` mit ${files.total} Seiten` : pages;
+  const total = files.total ? ` mit ${seiten(files.total)}` : pages;
   if (fresh) {
     lines.push(`Dokument: „${job.doc.title || "ohne Titel"}“ (${kind}${total}).`);
     if (files.pdf && !files.window) lines.push(`Das ganze Dokument liegt in ${files.pdf}.`);
@@ -674,9 +679,12 @@ function prompt(job, files, fresh) {
     if (doc.pdfChanged && files.pdf) lines.push(`Das PDF wurde seit der letzten Frage geändert; ${files.pdf} ist neu.`);
     lines.push(`Neue Frage zum selben Dokument${job.doc.title ? ` („${job.doc.title}“)` : ""}:`);
   }
-  lines.push(`- ${files.question}: die handgeschriebene Frage`);
+  // Ein JPEG statt PNG ist das ∞: die gedruckte Frage über der Stelle (sonst nur die Striche der Frage)
+  const infinity = files.question.endsWith(".jpg");
+  lines.push(infinity ? `- ${files.question}: die Frage (oben gedruckt) und die Stelle, um die es geht, pink umrandet`
+    : `- ${files.question}: die handgeschriebene Frage`);
   const page = job.anchor.page >= 0 ? `die ganze Seite ${job.anchor.page + 1}` : "die ganze Seite";
-  lines.push(`- ${files.page}: ${page}, die Frage darauf farbig umrandet`);
+  lines.push(`- ${files.page}: ${page}, ${infinity ? "die Stelle" : "die Frage"} darauf farbig umrandet`);
   if (files.window) lines.push(`- ${files.window}: die Seiten ${files.first} bis ${files.last} des Dokuments, um die Frage herum`);
   if (files.contextFile) {
     lines.push(`- ${files.contextFile}: ${pageList(files.context)}, ` + (files.context.length === 1
