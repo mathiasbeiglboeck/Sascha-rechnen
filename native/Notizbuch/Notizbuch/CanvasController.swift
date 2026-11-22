@@ -2397,6 +2397,9 @@ extension CanvasController: UIGestureRecognizerDelegate {
         // Hinweise auch, wenn diese Leinwand inzwischen zu ist (Tab gewechselt)
         let flash = onFlashTimed
         Task {
+            // Auch wenn die App gleich in den Hintergrund geht: erst fertig vorbereiten
+            let background = BackgroundWork("Frage an Claude vorbereiten")
+            defer { background.end() }
             do {
                 try await PageExport.run {
                     let question = PageExport.questionPNG(box.value, region: rect)
@@ -2552,6 +2555,8 @@ extension CanvasController: UIGestureRecognizerDelegate {
         // Hinweise auch, wenn diese Leinwand inzwischen zu ist (Tab gewechselt)
         let flash = onFlashTimed
         Task {
+            let background = BackgroundWork("Frage an Claude vorbereiten")
+            defer { background.end() }
             do {
                 try await PageExport.run {
                     let question = export.meaningJPEG(page: page, spot: spot, context: context,

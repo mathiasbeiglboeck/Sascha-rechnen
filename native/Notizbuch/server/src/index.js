@@ -825,8 +825,10 @@ export class Store extends DurableObject {
       images: { question: image("question"), page: image("page"), pages: image("pages") },
       // Seiten um die Frage (Nummern ab 0, siehe contextPart): span [erste, letzte] und pages, die beschriebenen davon
       // außer der Seite der Frage, als PDF unter /api/asks/<id>/pages. Beides null, wenn die App sie nicht schickte
-      // oder die Seiten seither rückten (anderer Seitenstand oder andere Seite der Frage)
+      // oder die Seiten seither rückten: anderer Seitenstand oder andere Seite der Frage, oder das Dokument hat einen
+      // neueren Seitenstand, auch wenn diese Frage (noch) nicht mitgerückt ist
       ...(Array.isArray(info.span) && Array.isArray(info.pages) && info.spanPv === row.pv &&
+          (Number(meta.pagesVersion) || 0) <= info.spanPv &&
           info.spanPage === anchor?.page && (!info.pages.length || image("pages"))
         ? { span: info.span, pages: info.pages } : { span: null, pages: null }),
     });
@@ -1201,11 +1203,14 @@ function cleanAnchor(a, detached = false) {
 /// beschriebene Seiten: pages leer und kein PDF. Gibt { span, pages, bytes } zurück; fehlt etwas oder passt es nicht: null
 async function contextPart(part, list, span) {
   if (!Array.isArray(span) || span.length !== 2 || !Array.isArray(list)) return null;
-  const [first, last] = span.map(Number), pages = list.map(Number);
+  // Nur ganze Zahlen, wie die App sie schickt, nichts umwandeln: Aus null, "" oder true würden sonst Seitennummern,
+  // und ein Objekt könnte beim Umwandeln einen Fehler werfen (dann ginge die ganze Frage verloren)
+  const [first, last] = span;
   if (!Number.isInteger(first) || !Number.isInteger(last) || first < 0 || last < first || last - first > 20 ||
       last > 100000) return null;
-  if (pages.length > MAX_CONTEXT_PAGES || new Set(pages).size !== pages.length ||
-      !pages.every((n) => Number.isInteger(n) && n >= first && n <= last)) return null;
+  if (list.length > MAX_CONTEXT_PAGES || !list.every((n) => Number.isInteger(n) && n >= first && n <= last) ||
+      new Set(list).size !== list.length) return null;
+  const pages = [...list];
   const file = part && typeof part !== "string" ? part : null;
   if (!pages.length) return file ? null : { span: [first, last], pages, bytes: null };
   if (!file || file.size > MAX_CONTEXT_BYTES) return null;

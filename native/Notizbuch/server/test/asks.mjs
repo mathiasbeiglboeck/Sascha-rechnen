@@ -428,6 +428,19 @@ async function main() {
       await api("PUT", `/api/asks/${cs}/answer`, { json: { claim: cl.data.claim, markdown: "ok" } });
     }
 
+    // The document got a newer page version (pages inserted elsewhere) before this ask moved along: numbers may be off
+    {
+      const pvd = await newDoc("Seitenstand");
+      const cp = uuid();
+      await createAsk(pvd, cp, { anchor: anchor(3), pv: 0, span: [0, 4], pages: [1] }, { ctx: PDF(700) });
+      const t3 = Date.now() / 1000 + 60;
+      const up = await api("PUT", `/api/library/${pvd}`, { json: { id: pvd, title: "Seitenstand", kind: "pdf", created: t3, modified: t3, pageCount: 6, pagesVersion: 1 } });
+      cl = await api("POST", `/api/asks/${cp}/claim`, { json: {} });
+      ok(up.status === 200 && up.data.pagesVersion === 1 && cl.status === 200 && cl.data.anchor.page === 3 && cl.data.span === null && cl.data.pages === null,
+        "newer page version of the document, ask not moved yet: span and pages left out", { up: up.data, claim: cl.data });
+      await api("PUT", `/api/asks/${cp}/answer`, { json: { claim: cl.data.claim, markdown: "ok" } });
+    }
+
     // An old app (nothing about the pages): as before
     const cOld = uuid();
     r = await createAsk(doc, cOld, { anchor: anchor(2), pv: 0 }, {});
@@ -452,6 +465,11 @@ async function main() {
       ["too large", { pages: [1] }, { ctx: PDF(8 * 1024 * 1024 + 1) }],
       ["part without filename (text)", { pages: [1] }, { ctx: PDF(300), ctxName: null }],
       ["list without part", { pages: [1] }, {}],
+      // Keine Zahlen: nicht umwandeln (aus null würde Seite 0) und nie einen Fehler werfen
+      ["null in the span", { span: [null, 3], pages: [1] }, { ctx: ctxBytes }],
+      ["page as text", { pages: ["1"] }, { ctx: ctxBytes }],
+      ["page true", { pages: [true] }, { ctx: ctxBytes }],
+      ["object that cannot become a number", { span: [{ valueOf: 1, toString: 1 }, 6], pages: [1] }, { ctx: ctxBytes }],
     ];
     for (const [name, extra, opts] of variants) {
       const id = uuid();

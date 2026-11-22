@@ -135,6 +135,15 @@ final class SyncEngine: ObservableObject {
         config.waitsForConnectivity = false
         return URLSession(configuration: config)
     }()
+    /// Nur für neue Fragen (uploadAsk, mit den Seiten um die Frage einige MB): eigene Verbindung, damit Striche nicht
+    /// hinter dem großen Hochladen warten, und als Hintergrundverkehr, der der Leitung den Vortritt für sie lässt
+    private let askSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 20
+        config.waitsForConnectivity = false
+        config.networkServiceType = .background
+        return URLSession(configuration: config)
+    }()
 
     private var pendingDeletes: Set<String> {
         get { Set(UserDefaults.standard.stringArray(forKey: "syncPendingDeletes") ?? []) }
@@ -241,7 +250,7 @@ final class SyncEngine: ObservableObject {
     // MARK: HTTP
 
     private func request(_ method: String, _ path: String, body: Data? = nil,
-                         contentType: String = "application/json") async throws -> Data {
+                         contentType: String = "application/json", background: Bool = false) async throws -> Data {
         guard isConfigured else { throw SyncError.notConfigured }
         var base = serverURL.trimmingCharacters(in: .whitespaces)
         while base.hasSuffix("/") { base.removeLast() }
@@ -253,7 +262,7 @@ final class SyncEngine: ObservableObject {
             req.httpBody = body
             req.setValue(contentType, forHTTPHeaderField: "Content-Type")
         }
-        let (data, response) = try await session.data(for: req)
+        let (data, response) = try await (background ? askSession : session).data(for: req)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(code) else {
             throw SyncError.http(code, String(data: data, encoding: .utf8) ?? "")
@@ -1063,7 +1072,7 @@ final class SyncEngine: ObservableObject {
         if let pdf = context?.pdf { part("pages", filename: AskContext.pdfName, type: "application/pdf", pdf) }
         body.append(Data("--\(boundary)--\r\n".utf8))
         let data = try await request("PUT", Self.askPath(doc) + "/" + ask.id, body: body,
-                                     contentType: "multipart/form-data; boundary=\(boundary)")
+                                     contentType: "multipart/form-data; boundary=\(boundary)", background: true)
         return try JSONDecoder().decode(AskList.self, from: data)
     }
 

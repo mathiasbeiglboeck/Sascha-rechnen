@@ -2,7 +2,7 @@
 
 In der Notizbuch-App eine handgeschriebene Frage mit dem Lasso markieren und im Menü **Claude fragen** (knapp) oder **Claude gründlich fragen** wählen. Neben der Frage erscheint eine Sprechblase. Ist die Antwort da, wird sie blau; antippen zeigt die Antwort mit Formeln. Dort lässt sich die Markierung auch wieder löschen, auf allen Geräten. Die Markierungen gibt es nur in der App, nicht im PDF, nicht im Export und nicht im geteilten Link.
 
-Beantwortet wird am Mac: Dieser Helfer läuft dort im Hintergrund und bekommt jede neue Frage sofort vom Notizbuch-Server gemeldet. Er fragt Claude Code (`claude -p`) mit dem Bild der Frage, der ganzen Seite und, bei PDFs, dem Dokument. Claude darf dabei im Internet nachschlagen; die Quellen stehen dann als Links unter der Antwort (antippen öffnet sie im Browser). Bei einem PDF mit mehr als 10 Seiten bekommt Claude zuerst die Seiten um die Frage als eigenes kleines PDF (bei „Claude fragen“ drei davor und eine danach, gründlich sieben davor und zwei danach); das ganze PDF liegt daneben. Je Dokument gibt es einen eigenen Chat, der mit jeder Frage weitergeht: Claude kennt die früheren Fragen zum selben Dokument.
+Beantwortet wird am Mac: Dieser Helfer läuft dort im Hintergrund und bekommt jede neue Frage sofort vom Notizbuch-Server gemeldet. Er fragt Claude Code (`claude -p`) mit dem Bild der Frage, der ganzen Seite, den beschriebenen Seiten davor und danach, wie sie in der App aussehen (bei „Claude fragen“ aus drei davor und einer danach, gründlich aus sieben davor und zwei danach; die App schickt sie als ein PDF mit, ohne die leeren), und, bei PDFs, dem Dokument. Claude darf dabei im Internet nachschlagen; die Quellen stehen dann als Links unter der Antwort (antippen öffnet sie im Browser). Bei einem PDF mit mehr als 10 Seiten bekommt Claude zuerst die Seiten um die Frage als eigenes kleines PDF (bei „Claude fragen“ drei davor und eine danach, gründlich sieben davor und zwei danach); das ganze PDF liegt daneben. Je Dokument gibt es einen eigenen Chat, der mit jeder Frage weitergeht: Claude kennt die früheren Fragen zum selben Dokument. Wird ein Chat zu groß für Claude (jede Frage bringt Bilder und Seiten mit), fängt der Helfer für die nächste Frage einen neuen an.
 
 Ist der Mac aus oder im Ruhezustand, warten die Fragen am Server und werden beantwortet, sobald er wieder läuft. Ist das Nutzungslimit von Claude erreicht, zeigt die App das an, und der Helfer macht weiter, sobald das Limit vorbei ist (im Zweifel nach 30 Minuten).
 
@@ -61,14 +61,14 @@ Schnittstelle am Server (alle mit `Authorization: Bearer <Schlüssel>`):
 
 | Aufruf | Wer | Wozu |
 |---|---|---|
-| `PUT /api/doc/<doc>/asks/<id>` | App | neue Frage: multipart mit `meta` (JSON), `question` (PNG) und `page` (JPEG/PNG), beide mit Dateinamen |
+| `PUT /api/doc/<doc>/asks/<id>` | App | neue Frage: multipart mit `meta` (JSON), `question` (PNG, beim ∞ JPEG) und `page` (JPEG/PNG), beide mit Dateinamen; dazu die Seiten um die Frage: `meta.span` [erste, letzte] (ab 0, höchstens 21 Seiten), `meta.pages` (die beschriebenen darin außer der Seite der Frage, höchstens 12) und, wenn `pages` nicht leer ist, der Teil `pages` (PDF mit Dateinamen, je Seite eine, höchstens 8 MB). Passt etwas davon nicht, gilt die Frage ohne die Seiten |
 | `GET /api/doc/<doc>/asks` | App | alle Fragen des Dokuments mit Version `v` |
 | `DELETE /api/doc/<doc>/asks/<id>` | App | Markierung löschen |
 | `PATCH /api/doc/<doc>/asks` | App | Stellen nach Seitenänderungen: `{pv, anchors: {id: anchor oder null}}`; Seite −1 heißt: Seite gelöscht, Rückgängig noch möglich (nicht angezeigt) |
 | `GET /api/asks/ws` | Helfer | WebSocket: `{"type":"ask"}` bei neuen Fragen, `{"type":"cancel","id"}` beim Löschen; `ping` → `pong` |
 | `GET /api/asks/open` | Helfer | offene Fragen, `next`: Sekunden bis zur nächsten zurückgestellten |
-| `POST /api/asks/<id>/claim` | Helfer | übernehmen (`{lease}`), mit `{claim}` die Frist verlängern |
-| `GET /api/asks/<id>/question`, `…/page` | Helfer | die beiden Bilder |
+| `POST /api/asks/<id>/claim` | Helfer | übernehmen (`{lease}`), mit `{claim}` die Frist verlängern; gibt auch `span`, `pages` und `images.pages` zurück, oder `span`/`pages` null, wenn die App sie nicht schickte oder die Seiten seither rückten (Seitenstand der Frage oder des Dokuments neuer, Frage auf einer anderen Seite) |
+| `GET /api/asks/<id>/question`, `…/page`, `…/pages` | Helfer | die beiden Bilder und das PDF der Seiten um die Frage |
 | `PUT /api/asks/<id>/answer` | Helfer | `{claim, markdown}`, `{claim, error}` oder `{claim, release: true, note, retryAfter}` |
 
 Nach jeder Änderung schickt der Server den Apps mit diesem Dokument offen `{"type":"asks","v":N}`; Gäste eines geteilten Links bekommen nichts davon. Gelöschte Fragen merkt er sich 30 Tage: Lädt eine App eine davon noch einmal hoch (ihre erste Antwort ging verloren), entsteht sie nicht neu. Eine neue Frage auf einem älteren Seitenstand, als er kennt, lehnt er mit 409 `stale-pages` ab (ihre Stelle stimmt nicht mehr).

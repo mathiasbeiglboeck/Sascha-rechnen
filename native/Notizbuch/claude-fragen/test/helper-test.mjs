@@ -4,6 +4,8 @@
 //   BASE=http://127.0.0.1:8791 KEY=testkey node native/Notizbuch/claude-fragen/test/helper-test.mjs
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -131,8 +133,10 @@ async function main() {
   ok(/Analysis 2 – Blatt 3/.test(promptText) && /Seite 3/.test(promptText) && /knapp/.test(promptText), "prompt names the doc, page 3 and quick", promptText);
   const win = Object.keys(c.sizes).find((f) => /seiten-1-4\.pdf$/.test(f));
   ok(win && c.sizes[win] > 0 && /PDF mit 30 Seiten/.test(promptText) && /seiten-1-4\.pdf: die Seiten 1 bis 4 des Dokuments/.test(promptText) && /weitere Seiten mit Read und dem Parameter pages/.test(promptText), "window file present and named in the prompt", { sizes: c.sizes, promptText });
-  ok(/\nHandschrift siehst du nur auf der Seite der Frage; dokument\.pdf ist das PDF ohne Handschrift\.\n/.test(promptText) && !/nachbarseiten/.test(promptText), "old app (no pages around the question): says handwriting is only on the question's page", promptText);
-  ok(logText().includes(`${a.id} Unterlagen: ohne Nachbarseiten (App zu alt oder Seiten gerückt), PDF-Fenster 1–4 von 30`), "log lists what Claude got", logText().split("\n").filter((l) => l.includes("Unterlagen")));
+  ok(promptText.includes(`\nNotizen aus der App siehst du zu dieser Frage nur auf der Seite der Frage; dokument.pdf und ${win} zeigen das PDF ohne die Notizen aus der App.\n`) && !/nachbarseiten/.test(promptText), "old app (no pages around the question): notes only on the question's page, both PDFs without them", promptText);
+  ok(logText().includes(`${a.id} Unterlagen: ohne Nachbarseiten (nicht mitgeschickt oder Seiten seither gerückt), PDF-Fenster 1–4 von 30`), "log lists what Claude got", logText().split("\n").filter((l) => l.includes("Unterlagen")));
+  ok(/Lies dann die weiteren Dateien, die die Nachricht zur Frage nennt, und bei einem PDF, soweit es für die Antwort hilft, weitere Seiten aus dokument\.pdf\. Rate keine Dateinamen/.test(systemOf(c)) && !/mehr vom Dokument/.test(systemOf(c)), "system prompt: read the files the message names, no guessing file names", systemOf(c));
+  ok(/Bilder von Seiten zu früheren Fragen zeigen den Stand von damals/.test(systemOf(c)), "system prompt: page images of earlier questions are from back then", systemOf(c));
   ok(answered.answer.startsWith("Antwort (medium)"), "answer text stored", answered.answer);
   ok(!fs.readFileSync(path.join(HOME, "helfer.log"), "utf8").includes(KEY), "key never in the log");
 
@@ -154,7 +158,7 @@ async function main() {
   c = calls().filter((x) => x.args).at(-1);
   ok(c.args.includes("--session-id") && c.args[c.args.indexOf("--session-id") + 1] !== sid && c.cwd.endsWith(nb), "new session in its own folder", c);
   ok(!Object.keys(c.sizes).includes("dokument.pdf") && /Notizbuch/.test(c.args[c.args.indexOf("-p") + 1]), "no PDF for a notebook", c.sizes);
-  ok(/\nVon diesem Notizbuch hast du nur diese eine Seite\. Such nicht nach anderen Dateien, und braucht die Frage eine Seite, die du nicht siehst, sag das kurz\.\n/.test(promptOf(c)), "old app, notebook: says this one page is all there is and not to search", promptOf(c));
+  ok(/\nZu dieser Frage hast du vom Notizbuch nur diese eine Seite\. Such nicht nach anderen Dateien, und braucht die Frage eine Seite, die du nicht siehst, sag das kurz\.\n/.test(promptOf(c)), "old app, notebook: says this one page is all there is for this question and not to search", promptOf(c));
 
   console.log("== notebook with the pages around the question (new app)");
   a = await createAsk(nb, "thorough", 3, { span: [0, 5], pages: [0, 1, 4], bytes: 4321 });
@@ -162,7 +166,7 @@ async function main() {
   c = calls().filter((x) => x.args).at(-1);
   let ctxFile = Object.keys(c.sizes).find((f) => f.endsWith(`${a.id}/nachbarseiten.pdf`));
   ok(ctxFile && c.sizes[ctxFile] === 4321, "pages PDF downloaded next to the question", c.sizes);
-  ok(promptOf(c).includes(`- ${ctxFile}: die Seiten 1, 2 und 5 mit der Handschrift darauf, so wie sie in der App aussehen (jede oben mit ihrer Nummer beschriftet)\nVon Seite 1 bis 6 sind das mit der Seite der Frage alle beschriebenen Seiten; die übrigen dort sind leer. Weitere Seiten des Notizbuchs hast du nicht: Such nicht nach anderen Dateien`), "prompt names the pages (from 1) and says the others in the range are empty", promptOf(c));
+  ok(promptOf(c).includes(`- ${ctxFile}: die Seiten 1, 2 und 5, wie sie in der App aussehen, jede oben mit ihrer Nummer beschriftet\nVon Seite 1 bis 6 ist außer der Seite der Frage nur auf den Seiten 1, 2 und 5 etwas geschrieben, die übrigen sind leer. Weitere Seiten hast du zu dieser Frage nicht: Such nicht nach anderen Dateien`), "prompt names the pages (from 1) and says the others in the range are empty", promptOf(c));
   ok(/die ganze Seite 4, die Frage darauf/.test(promptOf(c)) && c.args.includes("--resume"), "question on page 4, same chat as before", promptOf(c));
   ok(logText().includes(`${a.id} Unterlagen: Nachbarseiten 1, 2, 5 (Bereich 1–6)`), "log lists the pages", logText().split("\n").filter((l) => l.includes("Unterlagen")).slice(-1));
 
@@ -170,7 +174,7 @@ async function main() {
   a = await createAsk(nb, "quick", 2, { span: [0, 3], pages: [] });
   ok(await waitFor(async () => (await askOf(nb, a.id)).status === "answered", 15000), "answered");
   c = calls().filter((x) => x.args).at(-1);
-  ok(/\nDie anderen Seiten von 1 bis 4 sind leer\. Weitere Seiten des Notizbuchs hast du nicht/.test(promptOf(c)) && !/nachbarseiten/.test(promptOf(c)) && !fs.existsSync(path.join(HOME, "chats", nb, "fragen", a.id, "nachbarseiten.pdf")), "empty neighbours: said so, no file", promptOf(c));
+  ok(/\nVon Seite 1 bis 4 ist außer der Seite der Frage nichts geschrieben\. Weitere Seiten hast du zu dieser Frage nicht/.test(promptOf(c)) && !/nachbarseiten/.test(promptOf(c)) && !fs.existsSync(path.join(HOME, "chats", nb, "fragen", a.id, "nachbarseiten.pdf")), "empty neighbours: said so, no file", promptOf(c));
   ok(logText().includes(`${a.id} Unterlagen: Nachbarseiten keine beschrieben (Bereich 1–4)`), "log: none written");
   a = await createAsk(nb, "quick", 0, { span: [0, 0], pages: [] });
   ok(await waitFor(async () => (await askOf(nb, a.id)).status === "answered", 15000), "answered");
@@ -180,7 +184,26 @@ async function main() {
   a = await createAsk(nb, "quick", 9, { span: [0, 5], pages: [1], bytes: 500 });
   ok(await waitFor(async () => (await askOf(nb, a.id)).status === "answered", 15000), "answered");
   c = calls().filter((x) => x.args).at(-1);
-  ok(/Von diesem Notizbuch hast du nur diese eine Seite/.test(promptOf(c)) && !/nachbarseiten/.test(promptOf(c)), "question outside the range: pages ignored", promptOf(c));
+  ok(/Zu dieser Frage hast du vom Notizbuch nur diese eine Seite/.test(promptOf(c)) && !/nachbarseiten/.test(promptOf(c)), "question outside the range: pages ignored", promptOf(c));
+  // Eine Seite beschrieben: Einzahl
+  a = await createAsk(nb, "quick", 2, { span: [0, 3], pages: [1], bytes: 800 });
+  ok(await waitFor(async () => (await askOf(nb, a.id)).status === "answered", 15000), "answered");
+  c = calls().filter((x) => x.args).at(-1);
+  ctxFile = Object.keys(c.sizes).find((f) => f.endsWith(`${a.id}/nachbarseiten.pdf`));
+  ok(ctxFile && promptOf(c).includes(`- ${ctxFile}: Seite 2, wie sie in der App aussieht, oben mit ihrer Nummer beschriftet\nVon Seite 1 bis 4 ist außer der Seite der Frage nur auf Seite 2 etwas geschrieben, die übrigen sind leer.`), "one written page: singular", promptOf(c));
+
+  console.log("== retry without the pages (moved meanwhile): no stale pages PDF from the first try");
+  setMode({ mode: "error" });
+  a = await createAsk(nb, "quick", 2, { span: [0, 3], pages: [0], bytes: 900 });
+  const firstTry = await waitFor(async () => { const x = await askOf(nb, a.id); return x.status === "open" && /Fehler am Mac/.test(x.note || "") ? x : null; }, 10000, 100);
+  c = calls().filter((x) => x.args).at(-1);
+  ok(firstTry && Object.keys(c.sizes).some((f) => f.endsWith(`${a.id}/nachbarseiten.pdf`)), "first try had the pages PDF", { firstTry, sizes: c.sizes });
+  setMode({ mode: "ok" });
+  const moved = await api("PATCH", `/api/doc/${nb}/asks`, { json: { pv: 1, anchors: { [a.id]: { page: 3, x: 10, y: 20, w: 100, h: 30 } } } });
+  ok(moved.status === 200 && await waitFor(async () => (await askOf(nb, a.id)).status === "answered", 20000, 200), "answered on the retry", moved.status);
+  c = calls().filter((x) => x.args).at(-1);
+  ok(!/nachbarseiten/.test(promptOf(c)) && !fs.existsSync(path.join(HOME, "chats", nb, "fragen", a.id, "nachbarseiten.pdf")) && /Zu dieser Frage hast du vom Notizbuch nur diese eine Seite/.test(promptOf(c)) && /die ganze Seite 4/.test(promptOf(c)), "retry: no pages, old file gone, only this page", promptOf(c));
+  ok(logText().includes(`${a.id} Unterlagen: ohne Nachbarseiten (nicht mitgeschickt oder Seiten seither gerückt)`), "log: pages moved", logText().split("\n").filter((l) => l.includes("Unterlagen")).slice(-1));
 
   console.log("== new PDF version: downloaded again and mentioned");
   await api("PUT", `/api/library/${doc}`, { json: { id: doc, title: "Analysis 2 – Blatt 3", kind: "pdf", created: now, modified: now + 5, pageCount: 4, pdfVersion: 9 } });
@@ -191,20 +214,20 @@ async function main() {
   c = calls().filter((x) => x.args).at(-1);
   ok(c.sizes["dokument.pdf"] === 9009 && /PDF wurde seit der letzten Frage geändert/.test(c.args[c.args.indexOf("-p") + 1]), "new PDF fetched and mentioned", c.sizes);
   ok(!/seiten-/.test(promptOf(c)) && !fs.readdirSync(path.join(HOME, "chats", doc, "fragen", a.id)).some((f) => f.startsWith("seiten")), "small PDF (6 pages): no window, no leftover file", promptOf(c));
-  ok(/\n- dokument\.pdf: das ganze Dokument\n/.test(promptOf(c)) && c.args.includes("--resume"), "follow-up without a window names dokument.pdf", promptOf(c));
+  ok(!/\n- dokument\.pdf/.test(promptOf(c)) && c.args.includes("--resume") && /\nNotizen aus der App siehst du zu dieser Frage nur auf der Seite der Frage; dokument\.pdf zeigt das PDF ohne die Notizen aus der App\.\n/.test(promptOf(c)), "follow-up without a window: dokument.pdf not listed again (Claude has it), only the note", promptOf(c));
 
   console.log("== PDF with handwriting on the pages around the question (new app)");
   a = await createAsk(doc, "thorough", 1, { span: [0, 3], pages: [0, 3], bytes: 2500 });
   ok(await waitFor(async () => (await askOf(doc, a.id)).status === "answered", 15000), "answered");
   c = calls().filter((x) => x.args).at(-1);
   ctxFile = Object.keys(c.sizes).find((f) => f.endsWith(`${a.id}/nachbarseiten.pdf`));
-  ok(ctxFile && c.sizes[ctxFile] === 2500 && promptOf(c).includes(`- ${ctxFile}: die Seiten 1 und 4 mit der Handschrift darauf`), "pages PDF downloaded and named", { sizes: c.sizes, p: promptOf(c) });
-  ok(promptOf(c).includes("\nHandschrift gibt es von Seite 1 bis 4 nur auf diesen Seiten und der Seite der Frage; dokument.pdf ist das PDF ohne Handschrift. Handschrift auf weiter entfernten Seiten siehst du nicht.\n"), "PDF: where the handwriting is, the PDF has none", promptOf(c));
+  ok(ctxFile && c.sizes[ctxFile] === 2500 && promptOf(c).includes(`- ${ctxFile}: die Seiten 1 und 4, wie sie in der App aussehen, jede oben mit ihrer Nummer beschriftet`), "pages PDF downloaded and named", { sizes: c.sizes, p: promptOf(c) });
+  ok(promptOf(c).includes("\nVon Seite 1 bis 4 gibt es Notizen aus der App nur auf den Seiten 1 und 4 und der Seite der Frage; dokument.pdf zeigt das PDF ohne die Notizen aus der App. Notizen auf weiter entfernten Seiten siehst du zu dieser Frage nicht.\n"), "PDF: where the notes are, the PDF has none", promptOf(c));
   ok(logText().includes(`${a.id} Unterlagen: Nachbarseiten 1, 4 (Bereich 1–4), ganzes PDF (6 Seiten)`), "log: pages and whole PDF", logText().split("\n").filter((l) => l.includes("Unterlagen")).slice(-1));
   a = await createAsk(doc, "quick", 1, { span: [0, 2], pages: [] });
   ok(await waitFor(async () => (await askOf(doc, a.id)).status === "answered", 15000), "answered");
   c = calls().filter((x) => x.args).at(-1);
-  ok(promptOf(c).includes("\nHandschrift gibt es von Seite 1 bis 3 nur auf der Seite der Frage; dokument.pdf ist das PDF ohne Handschrift."), "PDF, no handwriting nearby: said so", promptOf(c));
+  ok(promptOf(c).includes("\nVon Seite 1 bis 3 gibt es Notizen aus der App nur auf der Seite der Frage; dokument.pdf zeigt das PDF ohne die Notizen aus der App."), "PDF, no notes nearby: said so", promptOf(c));
   setPages({ n: 30 });
 
   console.log("== usage limit: released with note, helper pauses, then answers");
@@ -260,6 +283,24 @@ async function main() {
   ok(await waitFor(async () => (await askOf(doc, a.id)).status === "answered", 15000), "answered");
   const last2 = calls().filter((x) => x.args).slice(-2);
   ok(last2[0].args.includes("--resume") && last2[1].args.includes("--session-id") && /Dokument: „Analysis/.test(last2[1].args[last2[1].args.indexOf("-p") + 1]), "resume failed → fresh session with full intro", last2.map((x) => x.args.slice(0, 2)));
+
+  console.log("== chat too big for Claude (images and pages of many questions): new chat, no pause");
+  for (const message of ["Prompt is too long", "Context limit reached · /compact or /clear to continue", "API Error: 400 A maximum of 100 PDF pages may be provided.", "Request too large for the API's 32MB request limit"]) {
+    setMode({ mode: "toobig", message });
+    const runs = calls().filter((x) => x.args).length;
+    a = await createAsk(doc, "quick", 1);
+    const big = await waitFor(async () => { const x = await askOf(doc, a.id); return x.status === "answered" ? x : null; }, 15000, 100);
+    const tb = calls().filter((x) => x.args).slice(runs);
+    ok(big && tb.length === 2 && tb[0].args.includes("--resume") && tb[1].args.includes("--session-id") && /Dokument: „Analysis/.test(promptOf(tb[1])), `„${message.slice(0, 30)}…“: fresh chat answers at once`, tb.map((x) => x.args.slice(0, 2)));
+    ok(logText().includes(`${a.id} Chat zu groß, neuer Chat`) && !logText().split("\n").some((l) => l.includes(a.id) && /Nutzungslimit/.test(l)), "logged, not taken for a usage limit");
+  }
+  // Der neue Chat geht weiter
+  setMode({ mode: "ok" });
+  a = await createAsk(doc, "quick", 1);
+  ok(await waitFor(async () => (await askOf(doc, a.id)).status === "answered", 15000), "answered");
+  c = calls().filter((x) => x.args).at(-1);
+  const prev = calls().filter((x) => x.args).at(-2);
+  ok(c.args.includes("--resume") && c.args[c.args.indexOf("--resume") + 1] === prev.args[prev.args.indexOf("--session-id") + 1], "next question resumes the new chat", c.args.slice(0, 4));
 
   console.log("== helper down: question waits; on start it is picked up");
   helper.kill("SIGTERM");
@@ -336,6 +377,45 @@ async function main() {
   ok(logText().split("\n").filter((l) => l.includes("nicht ausgeschnitten") && l.includes("PDFKit kaputt")).length === 1, "failure logged once with the reason");
   ok(r.c.args.includes("--restricted"), "restricted again with the default config");
   setPages({ n: 30 });
+
+  console.log("== pages PDF cannot be downloaded: tried twice, then answered without the pages");
+  {
+    // Zwischen Helfer und Server: reicht alles durch (auch den WebSocket), nur das PDF der Seiten scheitert
+    let failed = 0;
+    const proxy = http.createServer(async (req, res) => {
+      if (/^\/api\/asks\/[^/]+\/pages$/.test(req.url)) {
+        failed++;
+        res.writeHead(500, { "content-type": "text/plain" }).end("kaputt");
+        return;
+      }
+      const chunks = [];
+      for await (const x of req) chunks.push(x);
+      const skip = new Set(["host", "connection", "content-length", "transfer-encoding"]);
+      const up = await fetch(BASE + req.url, { method: req.method, headers: Object.fromEntries(Object.entries(req.headers).filter(([k]) => !skip.has(k))), body: chunks.length ? Buffer.concat(chunks) : undefined });
+      res.writeHead(up.status, Object.fromEntries([...up.headers].filter(([k]) => !skip.has(k) && k !== "content-encoding")));
+      res.end(Buffer.from(await up.arrayBuffer()));
+    });
+    proxy.on("upgrade", (req, socket, head) => {
+      const target = new URL(BASE);
+      const up = net.connect(Number(target.port), target.hostname, () => {
+        up.write(`${req.method} ${req.url} HTTP/1.1\r\n${Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join("\r\n")}\r\n\r\n`);
+        if (head.length) up.write(head);
+        socket.pipe(up).pipe(socket);
+      });
+      up.on("error", () => socket.destroy());
+      socket.on("error", () => up.destroy());
+    });
+    await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    await restartWith(() => writeConfig({ url: `http://127.0.0.1:${proxy.address().port}` }));
+    a = await createAsk(nb, "quick", 2, { span: [0, 3], pages: [1], bytes: 600 });
+    ok(await waitFor(async () => (await askOf(nb, a.id)).status === "answered", 15000), "answered without the pages");
+    c = calls().filter((x) => x.args).at(-1);
+    ok(failed === 2 && !/nachbarseiten/.test(promptOf(c)) && /Zu dieser Frage hast du vom Notizbuch nur diese eine Seite/.test(promptOf(c)) && !fs.existsSync(path.join(HOME, "chats", nb, "fragen", a.id, "nachbarseiten.pdf")), `tried twice (${failed}), prompt says only this page`, promptOf(c));
+    ok(logText().includes(`${a.id} Nachbarseiten nicht geladen: HTTP 500`) && logText().includes(`${a.id} Unterlagen: Nachbarseiten nicht geladen`), "logged", logText().split("\n").filter((l) => l.includes(a.id)));
+    await restartWith(() => writeConfig());
+    proxy.close();
+    proxy.closeAllConnections?.();
+  }
 
   // Der Helfer sucht auch in /opt/homebrew/bin und /usr/local/bin: Liegt dort ein echtes claude, fiele der Test darauf
   // herein (und würde es aufrufen). Dann diese beiden Abschnitte auslassen

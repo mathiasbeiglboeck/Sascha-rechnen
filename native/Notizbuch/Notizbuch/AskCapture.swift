@@ -160,14 +160,14 @@ extension PageExport {
 
     /// Schreibt die Seiten um die Frage auf Seite `q` neben ihre Bilder in `folder`, erst pages.pdf, dann pages.json
     /// (AskContext), im Hintergrund. Legt den Ordner nicht an: Ist die Frage inzwischen gelöscht oder schon oben,
-    /// bleibt nichts liegen. Scheitert es, geht die Frage ohne die Seiten. „Schnell“ höchstens 2,5 MB, „gründlich“ 5:
-    /// Die Frage soll auch bei schwachem Netz rasch oben sein
+    /// bleibt nichts liegen. Scheitert es, geht die Frage ohne die Seiten. „Schnell“ höchstens 2 MB, „gründlich“ 4:
+    /// Die Frage soll auch bei schwachem Netz rasch oben sein, und der Server schreibt sie in einem Zug
     static func writeContext(_ export: PageExport, span: ClosedRange<Int>, question q: Int, pv: Int, effort: String,
                              to folder: URL) async {
         do {
             try await run { () throws -> Void in
                 let started = Date()
-                let maxBytes = effort == "thorough" ? 5_000_000 : 2_500_000
+                let maxBytes = effort == "thorough" ? 4_000_000 : 2_000_000
                 guard let made = export.indexed().contextPDF(span: span, question: q, maxBytes: maxBytes) else {
                     #if DEBUG
                     NSLog("Asks-Debug: Nachbarseiten %@: PDF zu groß, ohne sie", folder.lastPathComponent)
@@ -259,10 +259,31 @@ extension PageExport {
         format.scale = 1
         format.opaque = true
         format.preferredRange = .standard
-        let jpeg = UIGraphicsImageRenderer(size: size, format: format).jpegData(withCompressionQuality: 0.65) { c in
+        let jpeg = UIGraphicsImageRenderer(size: size, format: format).jpegData(withCompressionQuality: 0.6) { c in
             c.cgContext.scaleBy(x: s, y: s)
             drawPage(i, in: c.cgContext, inkScale: s)
         }
         return (jpeg, size)
+    }
+}
+
+/// Hält die App wach, wenn sie während einer Arbeit in den Hintergrund geht (Bildschirm gesperrt, andere App), bis
+/// `end()`, längstens so lange, wie iOS es erlaubt. Für das Vorbereiten einer Frage: Friert das Zeichnen der Seiten um
+/// sie ein, ginge sie nach 30 s ohne sie hinauf (AskStore.add)
+@MainActor
+final class BackgroundWork {
+    private var id = UIBackgroundTaskIdentifier.invalid
+
+    init(_ name: String) {
+        id = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            // Die Zeit ist um: jetzt beenden, sonst beendet iOS die App
+            MainActor.assumeIsolated { self?.end() }
+        }
+    }
+
+    func end() {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+        id = .invalid
     }
 }
