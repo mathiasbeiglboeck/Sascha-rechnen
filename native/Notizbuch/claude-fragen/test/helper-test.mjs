@@ -39,12 +39,15 @@ async function api(method, p, { json, body, headers } = {}) {
 }
 const PNG = () => { const b = new Uint8Array(1000); b.set([0x89, 0x50, 0x4e, 0x47]); return b; };
 const JPG = () => { const b = new Uint8Array(3000); b.set([0xff, 0xd8, 0xff, 0xe0]); return b; };
-async function createAsk(doc, effort = "quick", page = 1) {
+// ctx: die Seiten um die Frage wie von der App ({ span, pages, bytes }: Bereich und beschriebene Seiten ab 0, das PDF)
+const CTX_PDF = (n) => { const b = new Uint8Array(n); b.set([0x25, 0x50, 0x44, 0x46, 0x2d]); return b; };
+async function createAsk(doc, effort = "quick", page = 1, ctx = null) {
   const id = uuid();
   const f = new FormData();
-  f.append("meta", JSON.stringify({ anchor: { page, x: 10, y: 20, w: 100, h: 30 }, pv: 0, effort, created: Date.now() / 1000, from: "iPad" }));
+  f.append("meta", JSON.stringify({ anchor: { page, x: 10, y: 20, w: 100, h: 30 }, pv: 0, effort, created: Date.now() / 1000, from: "iPad", ...(ctx ? { span: ctx.span, pages: ctx.pages } : {}) }));
   f.append("question", new Blob([PNG()], { type: "image/png" }), "question.png");
   f.append("page", new Blob([JPG()], { type: "image/jpeg" }), "page.jpg");
+  if (ctx?.bytes) f.append("pages", new Blob([CTX_PDF(ctx.bytes)], { type: "application/pdf" }), "pages.pdf");
   const r = await api("PUT", `/api/doc/${doc}/asks/${id}`, { body: f });
   if (r.status !== 200) throw new Error("create " + r.status + JSON.stringify(r.data));
   return { id, t: Date.now() };
@@ -128,6 +131,8 @@ async function main() {
   ok(/Analysis 2 – Blatt 3/.test(promptText) && /Seite 3/.test(promptText) && /knapp/.test(promptText), "prompt names the doc, page 3 and quick", promptText);
   const win = Object.keys(c.sizes).find((f) => /seiten-1-4\.pdf$/.test(f));
   ok(win && c.sizes[win] > 0 && /PDF mit 30 Seiten/.test(promptText) && /seiten-1-4\.pdf: die Seiten 1 bis 4 des Dokuments/.test(promptText) && /weitere Seiten mit Read und dem Parameter pages/.test(promptText), "window file present and named in the prompt", { sizes: c.sizes, promptText });
+  ok(/\nHandschrift siehst du nur auf der Seite der Frage; dokument\.pdf ist das PDF ohne Handschrift\.\n/.test(promptText) && !/nachbarseiten/.test(promptText), "old app (no pages around the question): says handwriting is only on the question's page", promptText);
+  ok(logText().includes(`${a.id} Unterlagen: ohne Nachbarseiten (App zu alt oder Seiten gerückt), PDF-Fenster 1–4 von 30`), "log lists what Claude got", logText().split("\n").filter((l) => l.includes("Unterlagen")));
   ok(answered.answer.startsWith("Antwort (medium)"), "answer text stored", answered.answer);
   ok(!fs.readFileSync(path.join(HOME, "helfer.log"), "utf8").includes(KEY), "key never in the log");
 
@@ -149,6 +154,33 @@ async function main() {
   c = calls().filter((x) => x.args).at(-1);
   ok(c.args.includes("--session-id") && c.args[c.args.indexOf("--session-id") + 1] !== sid && c.cwd.endsWith(nb), "new session in its own folder", c);
   ok(!Object.keys(c.sizes).includes("dokument.pdf") && /Notizbuch/.test(c.args[c.args.indexOf("-p") + 1]), "no PDF for a notebook", c.sizes);
+  ok(/\nVon diesem Notizbuch hast du nur diese eine Seite\. Such nicht nach anderen Dateien, und braucht die Frage eine Seite, die du nicht siehst, sag das kurz\.\n/.test(promptOf(c)), "old app, notebook: says this one page is all there is and not to search", promptOf(c));
+
+  console.log("== notebook with the pages around the question (new app)");
+  a = await createAsk(nb, "thorough", 3, { span: [0, 5], pages: [0, 1, 4], bytes: 4321 });
+  ok(await waitFor(async () => (await askOf(nb, a.id)).status === "answered", 15000), "answered");
+  c = calls().filter((x) => x.args).at(-1);
+  let ctxFile = Object.keys(c.sizes).find((f) => f.endsWith(`${a.id}/nachbarseiten.pdf`));
+  ok(ctxFile && c.sizes[ctxFile] === 4321, "pages PDF downloaded next to the question", c.sizes);
+  ok(promptOf(c).includes(`- ${ctxFile}: die Seiten 1, 2 und 5 mit der Handschrift darauf, so wie sie in der App aussehen (jede oben mit ihrer Nummer beschriftet)\nVon Seite 1 bis 6 sind das mit der Seite der Frage alle beschriebenen Seiten; die übrigen dort sind leer. Weitere Seiten des Notizbuchs hast du nicht: Such nicht nach anderen Dateien`), "prompt names the pages (from 1) and says the others in the range are empty", promptOf(c));
+  ok(/die ganze Seite 4, die Frage darauf/.test(promptOf(c)) && c.args.includes("--resume"), "question on page 4, same chat as before", promptOf(c));
+  ok(logText().includes(`${a.id} Unterlagen: Nachbarseiten 1, 2, 5 (Bereich 1–6)`), "log lists the pages", logText().split("\n").filter((l) => l.includes("Unterlagen")).slice(-1));
+
+  console.log("== notebook: nothing else written nearby; a one-page notebook; pages out of range");
+  a = await createAsk(nb, "quick", 2, { span: [0, 3], pages: [] });
+  ok(await waitFor(async () => (await askOf(nb, a.id)).status === "answered", 15000), "answered");
+  c = calls().filter((x) => x.args).at(-1);
+  ok(/\nDie anderen Seiten von 1 bis 4 sind leer\. Weitere Seiten des Notizbuchs hast du nicht/.test(promptOf(c)) && !/nachbarseiten/.test(promptOf(c)) && !fs.existsSync(path.join(HOME, "chats", nb, "fragen", a.id, "nachbarseiten.pdf")), "empty neighbours: said so, no file", promptOf(c));
+  ok(logText().includes(`${a.id} Unterlagen: Nachbarseiten keine beschrieben (Bereich 1–4)`), "log: none written");
+  a = await createAsk(nb, "quick", 0, { span: [0, 0], pages: [] });
+  ok(await waitFor(async () => (await askOf(nb, a.id)).status === "answered", 15000), "answered");
+  c = calls().filter((x) => x.args).at(-1);
+  ok(/\nDas Notizbuch hat nur diese eine Seite\. Such nicht nach anderen Dateien\.\n/.test(promptOf(c)), "one-page notebook: said so", promptOf(c));
+  // Frage nicht im Bereich (dürfte nie vorkommen): lieber nichts über die anderen Seiten sagen
+  a = await createAsk(nb, "quick", 9, { span: [0, 5], pages: [1], bytes: 500 });
+  ok(await waitFor(async () => (await askOf(nb, a.id)).status === "answered", 15000), "answered");
+  c = calls().filter((x) => x.args).at(-1);
+  ok(/Von diesem Notizbuch hast du nur diese eine Seite/.test(promptOf(c)) && !/nachbarseiten/.test(promptOf(c)), "question outside the range: pages ignored", promptOf(c));
 
   console.log("== new PDF version: downloaded again and mentioned");
   await api("PUT", `/api/library/${doc}`, { json: { id: doc, title: "Analysis 2 – Blatt 3", kind: "pdf", created: now, modified: now + 5, pageCount: 4, pdfVersion: 9 } });
@@ -159,6 +191,20 @@ async function main() {
   c = calls().filter((x) => x.args).at(-1);
   ok(c.sizes["dokument.pdf"] === 9009 && /PDF wurde seit der letzten Frage geändert/.test(c.args[c.args.indexOf("-p") + 1]), "new PDF fetched and mentioned", c.sizes);
   ok(!/seiten-/.test(promptOf(c)) && !fs.readdirSync(path.join(HOME, "chats", doc, "fragen", a.id)).some((f) => f.startsWith("seiten")), "small PDF (6 pages): no window, no leftover file", promptOf(c));
+  ok(/\n- dokument\.pdf: das ganze Dokument\n/.test(promptOf(c)) && c.args.includes("--resume"), "follow-up without a window names dokument.pdf", promptOf(c));
+
+  console.log("== PDF with handwriting on the pages around the question (new app)");
+  a = await createAsk(doc, "thorough", 1, { span: [0, 3], pages: [0, 3], bytes: 2500 });
+  ok(await waitFor(async () => (await askOf(doc, a.id)).status === "answered", 15000), "answered");
+  c = calls().filter((x) => x.args).at(-1);
+  ctxFile = Object.keys(c.sizes).find((f) => f.endsWith(`${a.id}/nachbarseiten.pdf`));
+  ok(ctxFile && c.sizes[ctxFile] === 2500 && promptOf(c).includes(`- ${ctxFile}: die Seiten 1 und 4 mit der Handschrift darauf`), "pages PDF downloaded and named", { sizes: c.sizes, p: promptOf(c) });
+  ok(promptOf(c).includes("\nHandschrift gibt es von Seite 1 bis 4 nur auf diesen Seiten und der Seite der Frage; dokument.pdf ist das PDF ohne Handschrift. Handschrift auf weiter entfernten Seiten siehst du nicht.\n"), "PDF: where the handwriting is, the PDF has none", promptOf(c));
+  ok(logText().includes(`${a.id} Unterlagen: Nachbarseiten 1, 4 (Bereich 1–4), ganzes PDF (6 Seiten)`), "log: pages and whole PDF", logText().split("\n").filter((l) => l.includes("Unterlagen")).slice(-1));
+  a = await createAsk(doc, "quick", 1, { span: [0, 2], pages: [] });
+  ok(await waitFor(async () => (await askOf(doc, a.id)).status === "answered", 15000), "answered");
+  c = calls().filter((x) => x.args).at(-1);
+  ok(promptOf(c).includes("\nHandschrift gibt es von Seite 1 bis 3 nur auf der Seite der Frage; dokument.pdf ist das PDF ohne Handschrift."), "PDF, no handwriting nearby: said so", promptOf(c));
   setPages({ n: 30 });
 
   console.log("== usage limit: released with note, helper pauses, then answers");

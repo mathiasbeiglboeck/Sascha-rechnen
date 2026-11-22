@@ -59,6 +59,23 @@ struct Ask: Codable, Identifiable, Equatable {
     var isVisible: Bool { deleting != true && hidden != true && anchor.page >= 0 }
 }
 
+/// Die Seiten um eine Frage, wie sie in der App aussehen (mit Handschrift): So versteht Claude auch „oben“ und „wie
+/// vorhin“, und es weiß, welche Seiten leer sind. Liegen als pages.json und pages.pdf neben den Bildern der Frage, bis
+/// sie oben ist (PageExport.writeContext)
+struct AskContext: Codable, Equatable {
+    /// Seitenstand und Seite der Frage, als die Seiten entstanden: Rücken die Seiten bis zum Hochladen, passen die
+    /// Nummern nicht mehr, dann gehen sie nicht mit
+    var pv: Int
+    var page: Int
+    /// Angesehener Bereich [erste, letzte] und die Seiten darin mit Tinte außer der Seite der Frage (ab 0), je eine
+    /// Seite in pages.pdf. Ohne solche Seiten gibt es kein PDF, und Claude erfährt, dass die anderen leer sind
+    var span: [Int]
+    var pages: [Int]
+
+    static let infoName = "pages.json"
+    static let pdfName = "pages.pdf"
+}
+
 /// Fragen an Claude je Dokument: Zwischenspeicher in <Dokument>/asks.json, Abgleich mit dem Server.
 ///
 /// Läuft ganz neben dem Abgleich der Striche: eigene Anfragen, nie in dessen Takt. Der Server bestimmt, welche
@@ -91,6 +108,8 @@ final class AskStore: ObservableObject {
     /// Dokumente, deren letzter Versuch am Netz scheiterte (offline): Klappt der Abgleich der Bibliothek wieder, geht
     /// es gleich weiter statt erst nach der Wartezeit
     private var offline = Set<UUID>()
+    /// Neue Fragen, deren Seiten ringsum noch entstehen (`add(_:_:preparing:)`): Bis dahin wartet ihr Hochladen
+    private var preparing = Set<String>()
 
     init(store: DocumentStore, sync: SyncEngine) {
         self.store = store
@@ -159,9 +178,25 @@ final class AskStore: ObservableObject {
         UserDefaults.standard.set(pendingDocs.map(\.uuidString), forKey: Self.pendingKey)
     }
 
-    /// Neue Frage; ihre Bilder liegen schon in `imageFolder(doc, ask.id)`
-    func add(_ doc: UUID, _ ask: Ask) {
+    /// Neue Frage; ihre Bilder liegen schon in `imageFolder(doc, ask.id)`. Mit `preparing` entstehen die Seiten um die
+    /// Frage noch: Die Markierung erscheint gleich, hinauf geht die Frage erst nach `prepared` (spätestens nach 30 s,
+    /// dann ohne die Seiten)
+    func add(_ doc: UUID, _ ask: Ask, preparing: Bool = false) {
+        guard preparing else {
+            edit(doc) { $0.append(ask) }
+            return refresh(doc)
+        }
+        self.preparing.insert(ask.id)
         edit(doc) { $0.append(ask) }
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(30))
+            self?.prepared(doc, ask.id)
+        }
+    }
+
+    /// Die Seiten um die Frage sind fertig (oder ließen sich nicht machen): Jetzt geht sie hinauf
+    func prepared(_ doc: UUID, _ id: String) {
+        guard preparing.remove(id) != nil else { return }
         refresh(doc)
     }
 
@@ -386,9 +421,9 @@ final class AskStore: ObservableObject {
         var uploadError: Error?
         for id in asks(doc).filter({ $0.status == "local" }).map(\.id) {
             // Jedes Mal frisch gelesen: Während eine andere hochging, kann sich diese geändert haben (Seite gelöscht,
-            // gelöscht, vom Server schon bekannt)
+            // gelöscht, vom Server schon bekannt). Entstehen ihre Seiten ringsum noch, kommt sie mit `prepared`
             guard uploadError == nil, let ask = self.ask(doc, id), ask.status == "local", ask.deleting != true,
-                  ask.hidden != true else { continue }
+                  ask.hidden != true, !preparing.contains(id) else { continue }
             let folder = imageFolder(doc, ask.id)
             guard let question = questionImage(in: folder),
                   let page = try? Data(contentsOf: folder.appendingPathComponent("page.jpg")) else {
@@ -397,7 +432,8 @@ final class AskStore: ObservableObject {
             }
             let list: SyncEngine.AskList
             do {
-                list = try await upload(doc, ask, question: question, page: page)
+                list = try await upload(doc, ask, question: question, page: page,
+                                        context: Self.context(in: folder, for: ask))
             } catch {
                 switch Self.classify(error) {
                 case .tooMany:
@@ -469,14 +505,26 @@ final class AskStore: ObservableObject {
         return nil
     }
 
+    /// Die Seiten um die Frage (pages.json, bei Tinte daneben auch pages.pdf), wenn sie noch zu ihrer Stelle passen:
+    /// Rückten die Seiten seither, stimmen ihre Nummern nicht mehr, dann geht die Frage ohne sie
+    private static func context(in folder: URL, for ask: Ask) -> SyncEngine.AskPages? {
+        guard let data = try? Data(contentsOf: folder.appendingPathComponent(AskContext.infoName)),
+              let info = try? JSONDecoder().decode(AskContext.self, from: data),
+              info.pv == ask.pv, info.page == ask.anchor.page, info.span.count == 2 else { return nil }
+        guard !info.pages.isEmpty else { return SyncEngine.AskPages(info: info, pdf: nil) }
+        guard let pdf = try? Data(contentsOf: folder.appendingPathComponent(AskContext.pdfName)) else { return nil }
+        return SyncEngine.AskPages(info: info, pdf: pdf)
+    }
+
     /// Eine neue Frage hinauf; ist ihr Dokument noch nicht am Server, erst die Bibliothek abgleichen
-    private func upload(_ doc: UUID, _ ask: Ask, question: Data, page: Data) async throws -> SyncEngine.AskList {
+    private func upload(_ doc: UUID, _ ask: Ask, question: Data, page: Data,
+                        context: SyncEngine.AskPages?) async throws -> SyncEngine.AskList {
         do {
-            return try await sync.uploadAsk(doc, ask, question: question, page: page)
+            return try await sync.uploadAsk(doc, ask, question: question, page: page, context: context)
         } catch {
             guard case .noDoc = Self.classify(error) else { throw error }
             await sync.syncLibrary()
-            return try await sync.uploadAsk(doc, ask, question: question, page: page)
+            return try await sync.uploadAsk(doc, ask, question: question, page: page, context: context)
         }
     }
 

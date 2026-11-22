@@ -46,6 +46,9 @@ struct PageExport: @unchecked Sendable {
         return ink.strokes.filter { $0.renderBounds.intersects(frame) }
     }
 
+    /// Steht auf Seite `i` Tinte?
+    func hasInk(page i: Int) -> Bool { !strokes(on: i).isEmpty }
+
     /// Zeichnet Seite `i` (Hintergrund und Tinte) in Seitenpunkten ab (0, 0)
     func drawPage(_ i: Int, in ctx: CGContext, inkScale: CGFloat) {
         let frame = frames[i]

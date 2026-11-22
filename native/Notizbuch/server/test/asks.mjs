@@ -32,7 +32,9 @@ async function api(method, path, { json, body, headers } = {}) {
 const PNG = (n = 200) => { const b = new Uint8Array(n); b.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]); for (let i = 8; i < n; i++) b[i] = (i * 7) & 255; return b; };
 const JPG = (n = 300) => { const b = new Uint8Array(n); b.set([0xff, 0xd8, 0xff, 0xe0]); for (let i = 4; i < n; i++) b[i] = (i * 13) & 255; return b; };
 
-function form(meta, { q = PNG(), p = JPG(), qName = "question.png", pName = "page.jpg", metaAsFile = false } = {}) {
+const PDF = (n = 400) => { const b = new Uint8Array(n); b.set([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37]); for (let i = 8; i < n; i++) b[i] = (i * 11) & 255; return b; };
+
+function form(meta, { q = PNG(), p = JPG(), qName = "question.png", pName = "page.jpg", metaAsFile = false, ctx = null, ctxName = "pages.pdf" } = {}) {
   const f = new FormData();
   if (meta !== undefined) {
     if (metaAsFile) f.append("meta", new Blob([JSON.stringify(meta)], { type: "application/json" }), "meta.json");
@@ -40,6 +42,7 @@ function form(meta, { q = PNG(), p = JPG(), qName = "question.png", pName = "pag
   }
   if (q) qName ? f.append("question", new Blob([q], { type: "image/png" }), qName) : f.append("question", new TextDecoder("latin1").decode(q));
   if (p) pName ? f.append("page", new Blob([p], { type: "image/jpeg" }), pName) : f.append("page", new TextDecoder("latin1").decode(p));
+  if (ctx) ctxName ? f.append("pages", new Blob([ctx], { type: "application/pdf" }), ctxName) : f.append("pages", new TextDecoder("latin1").decode(ctx));
   return f;
 }
 const createAsk = (doc, id, meta, opts) => api("PUT", `/api/doc/${doc}/asks/${id}`, { body: form(meta, opts) });
@@ -378,6 +381,111 @@ async function main() {
     rel = await api("POST", `/api/asks/${a10}/claim`, { json: {} });
   }
   ok(rel.status === 200, "long pauses (usage limit) never use up the retries", rel);
+
+  console.log("== context pages (meta.span, meta.pages and the PDF pages: the pages around the question)");
+  {
+    const ctxBytes = PDF(5000);
+    const c1 = uuid();
+    r = await createAsk(doc, c1, { anchor: anchor(3), pv: 0, effort: "thorough", span: [0, 5], pages: [0, 1, 2, 4] }, { ctx: ctxBytes });
+    ok(r.status === 200 && r.data.asks.some((a) => a.id === c1), "ask with pages accepted", r);
+    const pub = r.data.asks.find((a) => a.id === c1);
+    ok(!("pages" in pub) && !("span" in pub), "span and pages not in the public ask", pub);
+    r = await api("POST", `/api/asks/${c1}/claim`, { json: {} });
+    ok(r.status === 200 && JSON.stringify(r.data.span) === "[0,5]" && JSON.stringify(r.data.pages) === "[0,1,2,4]" && r.data.images.pages?.size === 5000 && r.data.images.pages?.type === "application/pdf", "claim gives span, pages and the PDF", r.data);
+    const cc1 = r.data.claim;
+    r = await api("GET", `/api/asks/${c1}/pages`);
+    ok(r.status === 200 && r.data.length === 5000 && r.data[0] === 0x25 && r.data[4999] === ctxBytes[4999], "helper downloads the pages PDF", r.status);
+    r = await api("PUT", `/api/asks/${c1}/answer`, { json: { claim: cc1, markdown: "mit Seiten" } });
+    ok(r.status === 200, "answered", r);
+    r = await api("GET", `/api/asks/${c1}/pages`);
+    ok(r.status === 404, "pages PDF gone after the answer (like question and page)", r.status);
+    r = await api("GET", `/api/asks/${c1}/question`);
+    ok(r.status === 404, "question gone after the answer as before", r.status);
+
+    // No other page with handwriting in the span: span and an empty list, no PDF
+    const c0 = uuid();
+    r = await createAsk(doc, c0, { anchor: anchor(2), pv: 0, span: [0, 3], pages: [] }, {});
+    let cl = await api("POST", `/api/asks/${c0}/claim`, { json: {} });
+    ok(r.status === 200 && cl.status === 200 && JSON.stringify(cl.data.span) === "[0,3]" && JSON.stringify(cl.data.pages) === "[]" && cl.data.images.pages === null, "span without written pages: empty list, no PDF", cl.data);
+    await api("PUT", `/api/asks/${c0}/answer`, { json: { claim: cl.data.claim, markdown: "ok" } });
+
+    // Pages moved after the upload (new pages version, or the question on another page): numbers no longer fit
+    for (const [name, change] of [["new pages version", { pv: 4, page: 5 }], ["same version, other page", { pv: 0, page: 6 }]]) {
+      const cm = uuid();
+      await createAsk(doc, cm, { anchor: anchor(5), pv: 0, span: [2, 6], pages: [3] }, { ctx: PDF(700) });
+      const mv = await api("PATCH", `/api/doc/${doc}/asks`, { json: { pv: change.pv, anchors: { [cm]: anchor(change.page) } } });
+      cl = await api("POST", `/api/asks/${cm}/claim`, { json: {} });
+      ok(mv.status === 200 && cl.status === 200 && cl.data.anchor.page === change.page && cl.data.span === null && cl.data.pages === null, `${name}: span and pages left out`, { mv: mv.status, claim: cl.data });
+      await api("PUT", `/api/asks/${cm}/answer`, { json: { claim: cl.data.claim, markdown: "ok" } });
+    }
+    // Moved to the same place (nothing changed): still there
+    {
+      const cs = uuid();
+      await createAsk(doc, cs, { anchor: anchor(5), pv: 2, span: [2, 6], pages: [3] }, { ctx: PDF(700) });
+      await api("PATCH", `/api/doc/${doc}/asks`, { json: { pv: 2, anchors: { [cs]: { ...anchor(5), x: 99 } } } });
+      cl = await api("POST", `/api/asks/${cs}/claim`, { json: {} });
+      ok(cl.status === 200 && JSON.stringify(cl.data.span) === "[2,6]" && JSON.stringify(cl.data.pages) === "[3]", "same page and version: span and pages stay", cl.data);
+      await api("PUT", `/api/asks/${cs}/answer`, { json: { claim: cl.data.claim, markdown: "ok" } });
+    }
+
+    // An old app (nothing about the pages): as before
+    const cOld = uuid();
+    r = await createAsk(doc, cOld, { anchor: anchor(2), pv: 0 }, {});
+    cl = await api("POST", `/api/asks/${cOld}/claim`, { json: {} });
+    ok(r.status === 200 && cl.status === 200 && cl.data.span === null && cl.data.pages === null && cl.data.images.pages === null, "old app: span and pages null", cl.data);
+    await api("PUT", `/api/asks/${cOld}/answer`, { json: { claim: cl.data.claim, markdown: "ok" } });
+
+    // Anything wrong: the ask counts, the pages are left out
+    const variants = [
+      ["no meta.span", { span: undefined, pages: [1] }, { ctx: ctxBytes }],
+      ["no meta.pages", { pages: undefined }, { ctx: ctxBytes }],
+      ["span not a pair", { span: [1], pages: [1] }, { ctx: ctxBytes }],
+      ["span backwards", { span: [4, 1], pages: [1] }, { ctx: ctxBytes }],
+      ["span too long", { span: [0, 21], pages: [1] }, { ctx: ctxBytes }],
+      ["negative span", { span: [-1, 3], pages: [1] }, { ctx: ctxBytes }],
+      ["page outside the span", { span: [2, 5], pages: [1] }, { ctx: ctxBytes }],
+      ["empty list with a PDF", { pages: [] }, { ctx: ctxBytes }],
+      ["duplicate pages", { pages: [1, 1] }, { ctx: ctxBytes }],
+      ["fraction", { pages: [1.5] }, { ctx: ctxBytes }],
+      ["too many pages", { span: [0, 20], pages: Array.from({ length: 13 }, (_, i) => i) }, { ctx: ctxBytes }],
+      ["not a PDF", { pages: [1] }, { ctx: JPG(800) }],
+      ["too large", { pages: [1] }, { ctx: PDF(8 * 1024 * 1024 + 1) }],
+      ["part without filename (text)", { pages: [1] }, { ctx: PDF(300), ctxName: null }],
+      ["list without part", { pages: [1] }, {}],
+    ];
+    for (const [name, extra, opts] of variants) {
+      const id = uuid();
+      const meta = { anchor: anchor(2), pv: 0, span: [0, 6], ...extra };
+      for (const k of ["span", "pages"]) if (meta[k] === undefined) delete meta[k];
+      r = await createAsk(doc, id, meta, opts);
+      const created = r.status === 200 && r.data.asks.some((a) => a.id === id);
+      const claim = created ? await api("POST", `/api/asks/${id}/claim`, { json: {} }) : null;
+      const blob = created ? await api("GET", `/api/asks/${id}/pages`) : null;
+      ok(created && claim.status === 200 && claim.data.span === null && claim.data.pages === null && claim.data.images.pages === null && blob.status === 404,
+        `${name}: ask created, pages left out`, { status: r.status, span: claim?.data?.span, pages: claim?.data?.pages, images: claim?.data?.images, blob: blob?.status });
+      if (claim?.status === 200) await api("PUT", `/api/asks/${id}/answer`, { json: { claim: claim.data.claim, markdown: "ok" } });
+    }
+
+    // Exactly 12 pages, a span of 21 and exactly the size limit are fine
+    const c2 = uuid();
+    r = await createAsk(doc, c2, { anchor: anchor(12), pv: 0, effort: "thorough", span: [0, 20], pages: Array.from({ length: 12 }, (_, i) => i) }, { ctx: PDF(8 * 1024 * 1024) });
+    cl = await api("POST", `/api/asks/${c2}/claim`, { json: {} });
+    ok(r.status === 200 && cl.status === 200 && cl.data.pages?.length === 12 && JSON.stringify(cl.data.span) === "[0,20]" && cl.data.images.pages?.size === 8 * 1024 * 1024, "12 pages, span of 21 and 8 MB accepted", cl.data);
+    r = await api("GET", `/api/asks/${c2}/pages`);
+    ok(r.status === 200 && r.data.length === 8 * 1024 * 1024, "8 MB PDF comes back whole (several chunks)", r.data.length);
+    // Deleting the ask removes the PDF too
+    r = await api("DELETE", `/api/doc/${doc}/asks/${c2}`);
+    r = await api("GET", `/api/asks/${c2}/pages`);
+    ok(r.status === 404, "pages PDF gone after deleting the ask", r.status);
+
+    // A repeated upload of the same ask (answer lost) changes nothing, even with other pages
+    const c3 = uuid();
+    await createAsk(doc, c3, { anchor: anchor(1), pv: 0, span: [0, 2], pages: [0] }, { ctx: PDF(600) });
+    r = await createAsk(doc, c3, { anchor: anchor(1), pv: 0, span: [0, 2], pages: [0, 2] }, { ctx: PDF(900) });
+    cl = await api("POST", `/api/asks/${c3}/claim`, { json: {} });
+    ok(r.status === 200 && JSON.stringify(cl.data.pages) === "[0]" && cl.data.images.pages?.size === 600, "repeat upload keeps the first pages", cl.data);
+    await api("PUT", `/api/asks/${c3}/answer`, { json: { claim: cl.data.claim, markdown: "ok" } });
+  }
 
   // Aufräumen: Offene Fragen blieben sonst für den nächsten Lauf (oder den Helfer-Test) liegen
   for (const a of (await api("GET", `/api/doc/${doc}/asks`)).data.asks) await api("DELETE", `/api/doc/${doc}/asks/${a.id}`);

@@ -2376,10 +2376,11 @@ extension CanvasController: UIGestureRecognizerDelegate {
             local = CGRect(x: x, y: y, width: 1, height: 1)
         }
         let lassoOnPage = lasso.points.map { CGPoint(x: $0.x - frame.minX, y: $0.y - frame.minY) }
-        // Für das Bild der Seite nur ihre Striche (nicht die ganze Zeichnung umrechnen)
-        let pageArea = frame.applying(toCanvas)
+        // Für die Bilder nur die Striche der Seite und der Seiten um sie (nicht die ganze Zeichnung umrechnen)
+        let span = PageExport.contextSpan(around: page, count: layout.frames.count, effort: effort)
+        let spanArea = layout.frames[span.lowerBound].union(layout.frames[span.upperBound]).applying(toCanvas)
         let export = PageExport(frames: layout.frames, pdf: pdf,
-                                ink: PKDrawing(strokes: strokes.filter { $0.renderBounds.intersects(pageArea) })
+                                ink: PKDrawing(strokes: strokes.filter { $0.renderBounds.intersects(spanArea) })
                                     .transformed(using: toPage))
         let ask = Ask(id: UUID().uuidString, status: "local",
                       anchor: AskAnchor(page: page, x: Double(local.minX), y: Double(local.minY),
@@ -2404,11 +2405,15 @@ extension CanvasController: UIGestureRecognizerDelegate {
                     try question.write(to: folder.appendingPathComponent("question.png"), options: .atomic)
                     try pageImage.write(to: folder.appendingPathComponent("page.jpg"), options: .atomic)
                 }
-                asks.add(id, ask)
+                // Die Markierung gleich; hinauf geht die Frage, sobald die Seiten um sie fertig sind
+                asks.add(id, ask, preparing: true)
                 flash(effort == "thorough" ? "Frage an Claude geschickt (gründlich)" : "Frage an Claude geschickt", 2)
             } catch {
                 flash("Frage konnte nicht vorbereitet werden: \(error.localizedDescription)", 3)
+                return
             }
+            await PageExport.writeContext(export, span: span, question: page, pv: ask.pv, effort: effort, to: folder)
+            asks.prepared(id, ask.id)
         }
     }
 
@@ -2531,10 +2536,11 @@ extension CanvasController: UIGestureRecognizerDelegate {
         // Auf dem Bild der ganzen Seite ist die Stelle umrandet wie sonst die Frage
         let outline = [CGPoint(x: spot.minX - 2, y: spot.minY - 2), CGPoint(x: spot.maxX + 2, y: spot.minY - 2),
                        CGPoint(x: spot.maxX + 2, y: spot.maxY + 2), CGPoint(x: spot.minX - 2, y: spot.maxY + 2)]
-        // Für die Bilder nur die Striche dieser Seite (nicht die ganze Zeichnung umrechnen)
-        let pageArea = frame.applying(toCanvas)
+        // Für die Bilder nur die Striche dieser Seite und der Seiten um sie (nicht die ganze Zeichnung umrechnen)
+        let span = PageExport.contextSpan(around: page, count: layout.frames.count, effort: "quick")
+        let spanArea = layout.frames[span.lowerBound].union(layout.frames[span.upperBound]).applying(toCanvas)
         let export = PageExport(frames: layout.frames, pdf: pdf,
-                                ink: PKDrawing(strokes: strokes.filter { $0.renderBounds.intersects(pageArea) })
+                                ink: PKDrawing(strokes: strokes.filter { $0.renderBounds.intersects(spanArea) })
                                     .transformed(using: toPage))
         let ask = Ask(id: UUID().uuidString, status: "local",
                       anchor: AskAnchor(page: page, x: Double(spot.minX), y: Double(spot.minY),
@@ -2555,11 +2561,14 @@ extension CanvasController: UIGestureRecognizerDelegate {
                     try question.write(to: folder.appendingPathComponent("question.jpg"), options: .atomic)
                     try pageImage.write(to: folder.appendingPathComponent("page.jpg"), options: .atomic)
                 }
-                asks.add(id, ask)
+                asks.add(id, ask, preparing: true)
                 flash("∞ – Claude erklärt die Stelle", 2)
             } catch {
                 flash("Frage konnte nicht vorbereitet werden: \(error.localizedDescription)", 3)
+                return
             }
+            await PageExport.writeContext(export, span: span, question: page, pv: ask.pv, effort: "quick", to: folder)
+            asks.prepared(id, ask.id)
         }
     }
 

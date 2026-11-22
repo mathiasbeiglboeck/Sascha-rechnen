@@ -202,6 +202,12 @@ struct LibraryView: View {
                     if url.query?.contains("open") == true { showLernen = true }
                     return
                 }
+                // Nur für Tests im Simulator: notizbuch://debug/new legt ein Notizbuch an und öffnet es (wie der Knopf)
+                if url.scheme == "notizbuch", url.host == "debug", url.path == "/new" {
+                    tabs.open(store.createNotebook(inFolder: currentFolder))
+                    Task { await sync.syncLibrary() }
+                    return
+                }
                 // Nur für Tests im Simulator: notizbuch://debug/import?file=<Name in Dokumente> wie „Öffnen in“
                 if url.scheme == "notizbuch", url.host == "debug", url.path == "/import",
                    let name = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?

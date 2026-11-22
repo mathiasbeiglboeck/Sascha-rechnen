@@ -381,6 +381,7 @@ async function answer(ask) {
       const dir = path.join(CHATS, job.doc.id);
       const files = await fetchFiles(job, dir);
       if (current.cancelled) return;
+      log(ask.id, `Unterlagen: ${filesSummary(job, files)}`);
       result = await askClaude(job, dir, files, level);
     }
     if (current.cancelled) return;
@@ -503,7 +504,28 @@ async function fetchFiles(job, dir) {
   }
   files.pdf = job.doc.hasPDF && fs.existsSync(pdf) ? "dokument.pdf" : null;
   if (files.pdf && job.anchor.page >= 0) Object.assign(files, await pageWindow(job, pdf, qdir, dir));
+  Object.assign(files, await contextPages(job, qdir, dir));
   return files;
+}
+
+/// Die Seiten um die Frage, wie sie in der App aussehen (mit Handschrift): Die App schickt den Bereich, den sie
+/// angesehen hat (span), und die beschriebenen Seiten darin außer der Seite der Frage als ein PDF. Gibt { span,
+/// context, contextFile } zurück (Seiten ab 1; context leer und ohne Datei, wenn sonst nichts beschrieben ist). Eine
+/// ältere App schickt nichts, ebenso nach dem Rücken der Seiten (dann passen die Nummern nicht mehr): {}
+async function contextPages(job, qdir, dir) {
+  const q = job.anchor.page, span = job.span, pages = job.pages;
+  if (q < 0 || !Array.isArray(span) || !Array.isArray(pages) || !(span[0] <= q && q <= span[1])) return {};
+  const out = { span: span.map((n) => n + 1), context: pages.map((n) => n + 1).sort((a, b) => a - b) };
+  if (!pages.length) return out;
+  try {
+    const { data } = await api("GET", `/api/asks/${job.id}/pages`, { timeout: 120000 });
+    const file = path.join(qdir, "nachbarseiten.pdf");
+    fs.writeFileSync(file, data);
+    return { ...out, contextFile: path.relative(dir, file) };
+  } catch (e) {
+    if (e.status === 404) return {};
+    throw e;
+  }
 }
 
 /// Die Seiten um die Frage als eigenes kleines PDF: „Claude fragen“ zwei bis drei Seiten davor und eine danach,
@@ -568,6 +590,49 @@ aus dem Dokument an eine Adresse an.
 - Spätere Fragen in diesem Chat gehören zum selben Dokument; frühere Fragen und Antworten kannst du voraussetzen.`;
 }
 
+/// „Seite 3“, „die Seiten 3 und 5“, „die Seiten 2, 3 und 5“
+function pageList(pages) {
+  return pages.length === 1 ? `Seite ${pages[0]}` : `die Seiten ${pages.slice(0, -1).join(", ")} und ${pages.at(-1)}`;
+}
+
+/// Was Claude über die übrigen Seiten wissen muss: Sonst sucht es nach Dateien, die es nicht gibt, oder nimmt an, eine
+/// Seite fehle ihm, die in Wahrheit leer ist
+function contextNote(job, files) {
+  if (files.pdf) {
+    const without = `${files.pdf} ist das PDF ohne Handschrift`;
+    if (!files.span) return `Handschrift siehst du nur auf der Seite der Frage; ${without}.`;
+    const [a, b] = files.span;
+    const where = a === b ? "" : ` von Seite ${a} bis ${b}`;
+    const on = files.contextFile ? "auf diesen Seiten und der Seite der Frage" : "auf der Seite der Frage";
+    return `Handschrift gibt es${where} nur ${on}; ${without}. Handschrift auf weiter entfernten Seiten siehst du nicht.`;
+  }
+  // Notizbuch (oder ein PDF, das noch nicht am Server ist)
+  const what = job.doc.kind === "pdf" ? "Dokument" : "Notizbuch";
+  const missing = "Such nicht nach anderen Dateien, und braucht die Frage eine Seite, die du nicht siehst, sag das kurz.";
+  if (!files.span) return `Von diesem ${what} hast du nur diese eine Seite. ${missing}`;
+  const [a, b] = files.span;
+  if (a === b) return `Das ${what} hat nur diese eine Seite. Such nicht nach anderen Dateien.`;
+  const rest = files.contextFile
+    ? `Von Seite ${a} bis ${b} sind das mit der Seite der Frage alle beschriebenen Seiten; die übrigen dort sind leer.`
+    : `Die anderen Seiten von ${a} bis ${b} sind leer.`;
+  return `${rest} Weitere Seiten des ${what === "Notizbuch" ? "Notizbuchs" : "Dokuments"} hast du nicht: ${missing}`;
+}
+
+/// Für das Protokoll: was Claude zur Frage bekommt
+function filesSummary(job, files) {
+  const parts = [];
+  if (files.span) {
+    const [a, b] = files.span;
+    parts.push(files.contextFile ? `Nachbarseiten ${files.context.join(", ")} (Bereich ${a}–${b})`
+      : `Nachbarseiten keine beschrieben (Bereich ${a}–${b})`);
+  } else {
+    parts.push(job.anchor.page < 0 ? "ohne Nachbarseiten (Seite gelöscht)" : "ohne Nachbarseiten (App zu alt oder Seiten gerückt)");
+  }
+  if (files.window) parts.push(`PDF-Fenster ${files.first}–${files.last} von ${files.total}`);
+  else if (files.pdf) parts.push(`ganzes PDF${files.total ? ` (${files.total} Seiten)` : ""}`);
+  return parts.join(", ");
+}
+
 function prompt(job, files, fresh) {
   const kind = job.doc.kind === "pdf" ? "PDF" : "Notizbuch";
   const pages = job.doc.pageCount ? ` mit ${job.doc.pageCount} Seiten` : "";
@@ -590,6 +655,12 @@ function prompt(job, files, fresh) {
   const page = job.anchor.page >= 0 ? `die ganze Seite ${job.anchor.page + 1}` : "die ganze Seite";
   lines.push(`- ${files.page}: ${page}, die Frage darauf farbig umrandet`);
   if (files.window) lines.push(`- ${files.window}: die Seiten ${files.first} bis ${files.last} des Dokuments, um die Frage herum`);
+  if (!fresh && files.pdf && !files.window) lines.push(`- ${files.pdf}: das ganze Dokument`);
+  if (files.contextFile) {
+    lines.push(`- ${files.contextFile}: ${pageList(files.context)} mit der Handschrift darauf, so wie sie in der App ` +
+      "aussehen (jede oben mit ihrer Nummer beschriftet)");
+  }
+  lines.push(contextNote(job, files));
   lines.push("");
   lines.push(
     job.effort === "thorough"

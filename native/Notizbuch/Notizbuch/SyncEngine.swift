@@ -1020,8 +1020,16 @@ final class SyncEngine: ObservableObject {
         try JSONDecoder().decode(AskList.self, from: try await request("GET", Self.askPath(doc)))
     }
 
-    /// Neue Frage mit ihren beiden Bildern in einem Aufruf (multipart); noch einmal hochladen ändert nichts
-    func uploadAsk(_ doc: UUID, _ ask: Ask, question: Data, page: Data) async throws -> AskList {
+    /// Die Seiten um eine Frage zum Hochladen: Bereich und Seiten (AskContext), das PDF nur bei Tinte auf ihnen
+    struct AskPages {
+        var info: AskContext
+        var pdf: Data?
+    }
+
+    /// Neue Frage mit ihren beiden Bildern in einem Aufruf (multipart), dazu die Seiten um sie, wenn es sie gibt (ein
+    /// älterer Server übergeht sie); noch einmal hochladen ändert nichts
+    func uploadAsk(_ doc: UUID, _ ask: Ask, question: Data, page: Data,
+                   context: AskPages? = nil) async throws -> AskList {
         let boundary = "BetterNotes-" + UUID().uuidString
         var body = Data()
         // Bilder mit Dateinamen: Ohne kämen sie am Server als Text an
@@ -1040,14 +1048,19 @@ final class SyncEngine: ObservableObject {
             var effort: String
             var created: Double
             var from: String
+            /// Die Seiten um die Frage (AskContext); ohne sie fehlen beide
+            var span: [Int]?
+            var pages: [Int]?
         }
-        let meta = Meta(anchor: ask.anchor, pv: ask.pv, effort: ask.effort, created: ask.created, from: ask.from ?? "")
+        let meta = Meta(anchor: ask.anchor, pv: ask.pv, effort: ask.effort, created: ask.created, from: ask.from ?? "",
+                        span: context?.info.span, pages: context?.info.pages)
         part("meta", try JSONEncoder().encode(meta))
         // Die Frage als PNG (Lasso) oder JPEG (∞); der Server erkennt die Art ohnehin an den ersten Bytes
         let jpeg = question.starts(with: [0xFF, 0xD8, 0xFF])
         part("question", filename: jpeg ? "question.jpg" : "question.png", type: jpeg ? "image/jpeg" : "image/png",
              question)
         part("page", filename: "page.jpg", type: "image/jpeg", page)
+        if let pdf = context?.pdf { part("pages", filename: AskContext.pdfName, type: "application/pdf", pdf) }
         body.append(Data("--\(boundary)--\r\n".utf8))
         let data = try await request("PUT", Self.askPath(doc) + "/" + ask.id, body: body,
                                      contentType: "multipart/form-data; boundary=\(boundary)")

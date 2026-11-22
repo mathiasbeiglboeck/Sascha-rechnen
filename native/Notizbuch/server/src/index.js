@@ -28,6 +28,9 @@ const isColor = (c) => typeof c === "string" && /^#[0-9a-fA-F]{6}$/.test(c);
 const MAX_OPEN_ASKS = 50;
 const MAX_QUESTION_BYTES = 4 * 1024 * 1024;
 const MAX_PAGE_BYTES = 8 * 1024 * 1024;
+// Die Seiten um die Frage, wie sie in der App aussehen (mit Handschrift), als ein PDF: höchstens so groß und so viele
+const MAX_CONTEXT_BYTES = 8 * 1024 * 1024;
+const MAX_CONTEXT_PAGES = 12;
 const MAX_ANSWER_CHARS = 200000;
 // Markdown im Eingang (die App setzt es auf A4-Seiten): höchstens so groß
 const MAX_MARKDOWN_BYTES = 512 * 1024;
@@ -170,7 +173,9 @@ export class Store extends DurableObject {
         if (id === "ws" && !sub) return this.acceptHelper(request);
         if (id === "open" && !sub && method === "GET") return json(this.openAsks());
         if (id && sub === "claim" && method === "POST") return await this.claimAsk(id, request);
-        if (id && (sub === "question" || sub === "page") && method === "GET") return this.blobResponse(`ask/${id}/${sub}`);
+        if (id && (sub === "question" || sub === "page" || sub === "pages") && method === "GET") {
+          return this.blobResponse(`ask/${id}/${sub}`);
+        }
         if (id && sub === "answer" && method === "PUT") return await this.answerAsk(id, request, url);
       }
       // Lernwörter: Liste und Protokoll lesen (App, Claude), Wörter ablegen oder entfernen (Claude), Versuche
@@ -546,9 +551,10 @@ export class Store extends DurableObject {
   }
 
   /// Neue Frage in einem einzigen multipart-Aufruf: meta (JSON: anchor, pv, effort, created, from), question (PNG,
-  /// nur die Frage) und page (JPEG oder PNG: die ganze Seite, die Frage darauf hervorgehoben). Bilder und Zeile
-  /// landen zusammen oder gar nicht. Lädt die App dieselbe Frage noch einmal hoch (Antwort verloren),
-  /// ändert sich nichts
+  /// nur die Frage) und page (JPEG oder PNG: die ganze Seite, die Frage darauf hervorgehoben). Dazu, wenn die App sie
+  /// schickt, die Seiten um die Frage (siehe contextPart): meta.span, meta.pages und das PDF pages. Passt davon etwas
+  /// nicht, bleiben sie weg, die Frage gilt trotzdem. Bilder und Zeile landen zusammen oder gar nicht. Lädt die App
+  /// dieselbe Frage noch einmal hoch (Antwort verloren), ändert sich nichts
   async createAsk(request, doc, askId) {
     if (!UUID_RE.test(askId)) return fail("Ungültige Kennung", "bad-id", 400);
     if (doc === KARTEN_DOC) return fail("Vokabelfotos über /api/karten/foto", "bad-doc", 400);
@@ -571,6 +577,7 @@ export class Store extends DurableObject {
       meta = JSON.parse(typeof m === "string" ? m : m ? await m.text() : "null");
     } catch {}
     const qb = await q.arrayBuffer(), pb = await p.arrayBuffer();
+    const context = await contextPart(form.get("pages"), meta?.pages, meta?.span);
     // Ab hier ohne Unterbrechung: Dazwischen läuft nichts anderes
     if (this.askRow(askId) || this.askGone(askId)) return json(this.docAsks(doc));
     const anchor = cleanAnchor(meta?.anchor), qt = imageType(qb), pt = imageType(pb);
@@ -579,16 +586,21 @@ export class Store extends DurableObject {
     if (refused) return refused;
     const now = Date.now() / 1000;
     let v;
+    const pv = Math.max(0, Math.trunc(Number(meta.pv) || 0));
     this.ctx.storage.transactionSync(() => {
       this.writeBlob(`ask/${askId}/question`, qb, qt);
       this.writeBlob(`ask/${askId}/page`, pb, pt);
+      if (context?.bytes) this.writeBlob(`ask/${askId}/pages`, context.bytes, "application/pdf");
       v = this.nextAsksV();
+      const info = askInfo(doc, meta);
+      // Mit Seitenstand und Seite der Frage: Rücken danach Seiten, passen die Nummern nicht mehr
+      if (context) Object.assign(info, { span: context.span, pages: context.pages, spanPv: pv, spanPage: anchor.page });
       this.sql.exec(
         "INSERT INTO asks (id, doc, status, anchor, pv, effort, created, updated, info, v) " +
           "VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)",
-        askId, doc, JSON.stringify(anchor), Math.max(0, Math.trunc(Number(meta.pv) || 0)),
+        askId, doc, JSON.stringify(anchor), pv,
         doc === LERN_DOC ? LERN_EFFORT : EFFORTS.includes(meta.effort) ? meta.effort : EFFORTS[0],
-        Number(meta.created) || now, now, JSON.stringify(askInfo(doc, meta)), v,
+        Number(meta.created) || now, now, JSON.stringify(info), v,
       );
     });
     this.asksChanged(doc, v);
@@ -708,6 +720,7 @@ export class Store extends DurableObject {
   deleteAskImages(askId) {
     this.deleteBlob(`ask/${askId}/question`);
     this.deleteBlob(`ask/${askId}/page`);
+    this.deleteBlob(`ask/${askId}/pages`);
   }
 
   /// Nach dem Löschen oder Einfügen von Seiten: body {pv, anchors: {askId: anchor | null}}, null heißt, die Seite der
@@ -798,9 +811,9 @@ export class Store extends DurableObject {
     const meta = d ? JSON.parse(d.meta) : {};
     const image = (name) =>
       this.sql.exec("SELECT size, type FROM blobmeta WHERE key = ?", `ask/${askId}/${name}`).toArray()[0] || null;
-    const info = JSON.parse(row.info || "{}");
+    const info = JSON.parse(row.info || "{}"), anchor = JSON.parse(row.anchor);
     return json({
-      id: askId, claim, leaseUntil: now + lease, anchor: JSON.parse(row.anchor), pv: row.pv, effort: row.effort,
+      id: askId, claim, leaseUntil: now + lease, anchor, pv: row.pv, effort: row.effort,
       created: row.created, from: info.from || null,
       ...(row.doc === KARTEN_DOC ? { karten: { hinweis: info.hinweis || null } } : {}),
       ...(row.doc === LERN_DOC ? { lern: { wort: info.wort, satz: info.satz || null, versuch: info.versuch || 1, gelesen: info.gelesen || null } } : {}),
@@ -809,7 +822,13 @@ export class Store extends DurableObject {
         pagesVersion: meta.pagesVersion || 0, pdfVersion: meta.pdfVersion || 0,
         hasPDF: this.sql.exec("SELECT 1 FROM blobmeta WHERE key = ?", `pdf/${row.doc}`).toArray().length > 0,
       },
-      images: { question: image("question"), page: image("page") },
+      images: { question: image("question"), page: image("page"), pages: image("pages") },
+      // Seiten um die Frage (Nummern ab 0, siehe contextPart): span [erste, letzte] und pages, die beschriebenen davon
+      // außer der Seite der Frage, als PDF unter /api/asks/<id>/pages. Beides null, wenn die App sie nicht schickte
+      // oder die Seiten seither rückten (anderer Seitenstand oder andere Seite der Frage)
+      ...(Array.isArray(info.span) && Array.isArray(info.pages) && info.spanPv === row.pv &&
+          info.spanPage === anchor?.page && (!info.pages.length || image("pages"))
+        ? { span: info.span, pages: info.pages } : { span: null, pages: null }),
     });
   }
 
@@ -1174,6 +1193,26 @@ function cleanAnchor(a, detached = false) {
   if (!Number.isInteger(page) || page < (detached ? -1 : 0) || page > 100000) return null;
   if (![x, y, w, h].every((n) => Number.isFinite(n) && Math.abs(n) < 1e6) || w < 0 || h < 0) return null;
   return { page, x, y, w, h };
+}
+
+/// Die Seiten um eine neue Frage, wie sie in der App aussehen (mit Handschrift): meta.span [erste, letzte] (Nummern ab
+/// 0, höchstens 21 Seiten) ist der Bereich, den die App angesehen hat; meta.pages die Seiten darin mit Handschrift außer
+/// der Seite der Frage (höchstens MAX_CONTEXT_PAGES), je eine Seite im PDF pages (höchstens MAX_CONTEXT_BYTES). Ohne
+/// beschriebene Seiten: pages leer und kein PDF. Gibt { span, pages, bytes } zurück; fehlt etwas oder passt es nicht: null
+async function contextPart(part, list, span) {
+  if (!Array.isArray(span) || span.length !== 2 || !Array.isArray(list)) return null;
+  const [first, last] = span.map(Number), pages = list.map(Number);
+  if (!Number.isInteger(first) || !Number.isInteger(last) || first < 0 || last < first || last - first > 20 ||
+      last > 100000) return null;
+  if (pages.length > MAX_CONTEXT_PAGES || new Set(pages).size !== pages.length ||
+      !pages.every((n) => Number.isInteger(n) && n >= first && n <= last)) return null;
+  const file = part && typeof part !== "string" ? part : null;
+  if (!pages.length) return file ? null : { span: [first, last], pages, bytes: null };
+  if (!file || file.size > MAX_CONTEXT_BYTES) return null;
+  const bytes = await file.arrayBuffer();
+  const head = new Uint8Array(bytes, 0, Math.min(5, bytes.byteLength));
+  if (String.fromCharCode(...head) !== "%PDF-") return null;
+  return { span: [first, last], pages, bytes };
 }
 
 /// Was zu einer Frage gespeichert wird: das Gerät, bei Lernwörtern auch das Wort (der Helfer braucht es für den Hinweis)

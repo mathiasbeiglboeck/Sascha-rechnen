@@ -146,3 +146,123 @@ extension PageExport {
         }
     }
 }
+
+// MARK: Die Seiten um die Frage
+
+extension PageExport {
+    /// Bereich der Seiten um eine Frage auf Seite `page`, die Claude mitbekommt (wie der Helfer beim PDF): „gründlich“
+    /// bis zu sieben davor und zwei danach, sonst drei davor und eine danach
+    static func contextSpan(around page: Int, count: Int, effort: String) -> ClosedRange<Int> {
+        let (before, after) = effort == "thorough" ? (7, 2) : (3, 1)
+        let last = max(count - 1, 0), q = min(max(page, 0), last)
+        return max(q - before, 0)...min(q + after, last)
+    }
+
+    /// Schreibt die Seiten um die Frage auf Seite `q` neben ihre Bilder in `folder`, erst pages.pdf, dann pages.json
+    /// (AskContext), im Hintergrund. Legt den Ordner nicht an: Ist die Frage inzwischen gelöscht oder schon oben,
+    /// bleibt nichts liegen. Scheitert es, geht die Frage ohne die Seiten. „Schnell“ höchstens 2,5 MB, „gründlich“ 5:
+    /// Die Frage soll auch bei schwachem Netz rasch oben sein
+    static func writeContext(_ export: PageExport, span: ClosedRange<Int>, question q: Int, pv: Int, effort: String,
+                             to folder: URL) async {
+        do {
+            try await run { () throws -> Void in
+                let started = Date()
+                let maxBytes = effort == "thorough" ? 5_000_000 : 2_500_000
+                guard let made = export.indexed().contextPDF(span: span, question: q, maxBytes: maxBytes) else {
+                    #if DEBUG
+                    NSLog("Asks-Debug: Nachbarseiten %@: PDF zu groß, ohne sie", folder.lastPathComponent)
+                    #endif
+                    return
+                }
+                if let pdf = made.pdf {
+                    try pdf.write(to: folder.appendingPathComponent(AskContext.pdfName), options: .atomic)
+                }
+                let info = AskContext(pv: pv, page: q, span: [made.span.lowerBound, made.span.upperBound],
+                                      pages: made.pages)
+                try JSONEncoder().encode(info).write(to: folder.appendingPathComponent(AskContext.infoName),
+                                                     options: .atomic)
+                #if DEBUG
+                NSLog("Asks-Debug: Nachbarseiten %@: Bereich %ld–%ld, Seiten [%@], PDF %ld Bytes, %.0f ms",
+                      folder.lastPathComponent, made.span.lowerBound, made.span.upperBound,
+                      made.pages.map(String.init).joined(separator: " "), made.pdf?.count ?? 0,
+                      Date().timeIntervalSince(started) * 1000)
+                #else
+                _ = started
+                #endif
+            }
+        } catch {
+            #if DEBUG
+            NSLog("Asks-Debug: Nachbarseiten %@ nicht geschrieben: %@", folder.lastPathComponent,
+                  error.localizedDescription)
+            #endif
+        }
+    }
+
+    /// Die Seiten mit Tinte im Bereich `span` außer der Frage auf Seite `q` als ein PDF für Claude: je Seite ein JPEG
+    /// (contextJPEG), darüber ein Streifen „Seite N“. Würde es größer als `maxBytes`, rückt der Bereich von außen nach
+    /// innen (an beiden Enden gleich weit), bis es passt. Gibt den Bereich, die Seiten darin (ab 0) und das PDF zurück,
+    /// ohne Seiten mit Tinte kein PDF; nil, wenn das PDF unerwartet groß wird oder nur die Seite der Frage bliebe
+    func contextPDF(span: ClosedRange<Int>, question q: Int,
+                    maxBytes: Int) -> (span: ClosedRange<Int>, pages: [Int], pdf: Data?)? {
+        var range = span
+        var shots: [(page: Int, jpeg: Data, size: CGSize)] = []
+        var total = 0
+        // Von der Frage nach außen
+        let order = span.filter { $0 != q && frames.indices.contains($0) }
+            .sorted { (abs($0 - q), $0) < (abs($1 - q), $1) }
+        for i in order where hasInk(page: i) {
+            let shot = autoreleasepool { contextJPEG(page: i) }
+            if total + shot.jpeg.count > maxBytes {
+                let reach = abs(i - q) - 1
+                range = max(span.lowerBound, q - reach)...min(span.upperBound, q + reach)
+                shots.removeAll { !range.contains($0.page) }
+                break
+            }
+            shots.append((page: i, jpeg: shot.jpeg, size: shot.size))
+            total += shot.jpeg.count
+        }
+        // Bliebe nur die Seite der Frage, hieße das für Claude: Das Dokument hat nur sie
+        guard range.count > 1 || span.count == 1 else { return nil }
+        shots.sort { $0.page < $1.page }
+        guard !shots.isEmpty else { return (range, [], nil) }
+        let band: CGFloat = 44
+        let attributes: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: 22, weight: .semibold),
+                                                         .foregroundColor: UIColor.black]
+        let pdf = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 1200, height: 1700)).pdfData { c in
+            for shot in shots {
+                let size = shot.size
+                c.beginPage(withBounds: CGRect(x: 0, y: 0, width: size.width, height: size.height + band),
+                            pageInfo: [:])
+                UIColor(white: 0.9, alpha: 1).setFill()
+                c.fill(CGRect(x: 0, y: 0, width: size.width, height: band))
+                ("Seite \(shot.page + 1)" as NSString).draw(at: CGPoint(x: 16, y: 9), withAttributes: attributes)
+                // Das JPEG, wie es ist (Quartz übernimmt es so ins PDF, statt es neu zu kodieren)
+                if let source = CGDataProvider(data: shot.jpeg as CFData),
+                   let image = CGImage(jpegDataProviderSource: source, decode: nil, shouldInterpolate: true,
+                                       intent: .defaultIntent) {
+                    UIImage(cgImage: image).draw(in: CGRect(x: 0, y: band, width: size.width, height: size.height))
+                }
+            }
+        }
+        // Würde das JPEG doch neu kodiert, wäre das PDF viel größer: dann lieber ohne die Seiten
+        guard pdf.count <= maxBytes + maxBytes / 2 else { return nil }
+        return (range, shots.map(\.page), pdf)
+    }
+
+    /// Seite `i` für contextPDF: Hochformat 1200 Pixel breit (A4: 1200 × 1697), Querformat 1600, höchstens 2000 Pixel
+    /// lang. Kleiner als das Bild der Seite mit der Frage (askPageJPEG), Handschrift bleibt gut lesbar
+    private func contextJPEG(page i: Int) -> (jpeg: Data, size: CGSize) {
+        let frame = frames[i]
+        let s = min((frame.width > frame.height ? 1600 : 1200) / frame.width, 2000 / max(frame.width, frame.height))
+        let size = CGSize(width: (frame.width * s).rounded(), height: (frame.height * s).rounded())
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        format.preferredRange = .standard
+        let jpeg = UIGraphicsImageRenderer(size: size, format: format).jpegData(withCompressionQuality: 0.65) { c in
+            c.cgContext.scaleBy(x: s, y: s)
+            drawPage(i, in: c.cgContext, inkScale: s)
+        }
+        return (jpeg, size)
+    }
+}
