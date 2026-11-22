@@ -1,3 +1,4 @@
+import Charts
 import PencilKit
 import SwiftUI
 
@@ -8,6 +9,7 @@ struct LernView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var radierer = false
     @State private var bearbeiten = false
+    @State private var statistik = false
     /// Vorsprechen: nur das Wort (Standard) oder Wort, Beispielsatz, Wort
     @AppStorage(Sprecher.mitSatzKey) private var mitSatz = false
 
@@ -15,9 +17,12 @@ struct LernView: View {
         _model = StateObject(wrappedValue: LernModel(sync: sync))
     }
 
-    private static let papier = Color(red: 0.99, green: 0.98, blue: 0.94)
-    private static let gruen = Color(red: 0.16, green: 0.62, blue: 0.33)
-    private static let blau = Color(red: 0.18, green: 0.42, blue: 0.85)
+    static let papier = Color(red: 0.99, green: 0.98, blue: 0.94)
+    static let gruen = Color(red: 0.16, green: 0.62, blue: 0.33)
+    static let blau = Color(red: 0.18, green: 0.42, blue: 0.85)
+    /// Statistik: mit dem Tipp richtig (halb) und noch nicht richtig
+    static let gelb = Color(red: 0.96, green: 0.72, blue: 0.13)
+    static let orange = Color(red: 0.93, green: 0.43, blue: 0.24)
 
     var body: some View {
         ZStack {
@@ -31,6 +36,7 @@ struct LernView: View {
         .task { await model.refresh() }
         .onDisappear { model.sprecher.stop() }
         .sheet(isPresented: $bearbeiten) { LernWoerterSheet(model: model) }
+        .sheet(isPresented: $statistik) { LernStatistikView(model: model) }
         #if DEBUG
         .onOpenURL { url in debug(url) }
         #endif
@@ -69,13 +75,22 @@ struct LernView: View {
             model.drawing = PKDrawing(strokes: model.drawing.strokes + [stroke])
         }
         if has("fertig") { abgeben() }
+        if has("radierer") { radierer.toggle() }
+        if has("statistik") { statistik = true }
+        if has("zu") { statistik = false; bearbeiten = false }
         if has("ja"), case .bestaetigen(let a) = model.phase { model.bestaetigt(a) }
         if has("nein") { model.nichtBestaetigt() }
         if has("weiter") { model.weiter() }
         if has("nochmal") { model.nochmalVersuchen() }
         if let v = items.first(where: { $0.name == "selbst" })?.value { model.selbstGeprueft(richtig: v == "1") }
         if has("ende") { model.beenden() }
-        NSLog("Lern-Debug: vorab=%d", model.vorabAnzahl)
+        NSLog("Lern-Debug: vorab=%d radierer=%d", model.vorabAnzahl, radierer ? 1 : 0)
+        let heute = LernStatistik.zahlen(model.log, ab: Calendar.current.startOfDay(for: Date()))
+        let alle = LernStatistik.zahlen(model.log)
+        NSLog("Lern-Debug: reihenfolge=%@", model.reihenfolge.map(\.wort).joined(separator: ","))
+        NSLog("Lern-Debug: statistik heute=%d/%d/%d gesamt=%d/%d/%d tage=%d faecher=%@", heute.richtig, heute.halb, heute.falsch,
+              alle.richtig, alle.halb, alle.falsch, LernStatistik.uebungstage(model.log),
+              LernStatistik.faecher(model.words, model.karten).map { String($0) }.joined(separator: ","))
         NSLog("Lern-Debug: phase=%@ wort=%@ versuch=%d index=%d/%d sterne=%.1f dran=%d woerter=%d log=%d status=%@ stimme=%@",
               String(describing: model.phase), model.aktuell?.wort ?? "-", model.versuch, model.index, model.queue.count,
               model.sterne, model.anzahlDran, model.aktiveWoerter.count, model.log.count, model.status ?? "-",
@@ -86,45 +101,97 @@ struct LernView: View {
     // MARK: Start
 
     private var start: some View {
-        VStack(spacing: 20) {
-            HStack {
+        VStack(spacing: 0) {
+            HStack(spacing: 20) {
                 Button { dismiss() } label: { Label("Schließen", systemImage: "xmark") }
                 Spacer()
+                Button { statistik = true } label: { Label("Statistik", systemImage: "chart.bar.fill") }
                 Button { bearbeiten = true } label: { Label("Wörter", systemImage: "list.bullet") }
             }
             .font(.headline)
             .padding(.horizontal)
-            Spacer()
-            Text("Lernwörter").font(.system(size: 44, weight: .bold, design: .rounded))
-            let dran = model.anzahlDran
-            if model.aktiveWoerter.isEmpty {
-                Text("Noch keine Lernwörter da.\nPapa schickt sie an Claude, dann erscheinen sie hier.")
-                    .multilineTextAlignment(.center).font(.title3).foregroundStyle(.secondary)
-            } else {
-                Text(dran == 0 ? "Heute ist alles geübt. 🎉 Üben geht trotzdem."
-                     : dran == 1 ? "1 Wort ist heute dran." : "\(dran) Wörter sind heute dran.")
-                    .font(.title2.weight(.medium)).foregroundStyle(.secondary)
-                Text("Wie viele Wörter möchtest du üben?").font(.title3)
-                HStack(spacing: 20) {
-                    rundenKnopf(5)
-                    rundenKnopf(10)
+            ScrollView {
+                VStack(spacing: 20) {
+                    Text("Lernwörter").font(.system(size: 44, weight: .bold, design: .rounded)).padding(.top, 8)
+                    if model.aktiveWoerter.isEmpty {
+                        Text("Noch keine Lernwörter da.\nPapa schickt sie an Claude, dann erscheinen sie hier.")
+                            .multilineTextAlignment(.center).font(.title3).foregroundStyle(.secondary)
+                    } else {
+                        Text("Wie viele Wörter möchtest du üben?").font(.title2.weight(.medium))
+                        HStack(spacing: 20) {
+                            rundenKnopf(5)
+                            rundenKnopf(10)
+                        }
+                        Toggle(isOn: $mitSatz) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Mit Beispielsatz vorsprechen").font(.headline)
+                                Text(mitSatz ? "Wort, Satz, nochmal das Wort" : "Nur das Wort").font(.subheadline).foregroundStyle(.secondary)
+                            }
+                        }
+                        .frame(maxWidth: 360)
+                        ViewThatFits(in: .horizontal) {
+                            HStack(alignment: .top, spacing: 20) {
+                                naechsteKarte.frame(minWidth: 330)
+                                statistikKarte.frame(minWidth: 330)
+                            }
+                            VStack(spacing: 20) {
+                                naechsteKarte
+                                statistikKarte
+                            }
+                        }
+                        .frame(maxWidth: 900)
+                        .padding(.horizontal)
+                        .padding(.top, 8)
+                    }
+                    if let s = model.status {
+                        Text(s).font(.callout).foregroundStyle(.orange).multilineTextAlignment(.center).padding(.horizontal)
+                    }
+                    Text("Stimme: \(model.sprecher.stimme) (ändern unter „Wörter“)").font(.caption2).foregroundStyle(.tertiary)
                 }
-                Toggle(isOn: $mitSatz) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Mit Beispielsatz vorsprechen").font(.headline)
-                        Text(mitSatz ? "Wort, Satz, nochmal das Wort" : "Nur das Wort").font(.subheadline).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.bottom)
+            }
+        }
+        .padding(.top)
+    }
+
+    /// Die Wörter in der Reihenfolge, in der sie drankommen: blau die nächste Fünferrunde, grün bis zehn
+    private var naechsteKarte: some View {
+        let liste = model.reihenfolge
+        let k = model.karten
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("Als Nächstes dran").font(.headline)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(liste.enumerated()), id: \.element.id) { i, w in
+                        NaechstesWort(nummer: i + 1, wort: w.wort, fach: k[w.wort]?.fach ?? 0)
+                        if (i == 4 && liste.count > 5) || (i == 9 && liste.count > 10) { Divider() }
                     }
                 }
-                .frame(maxWidth: 360)
-                .padding(.top, 8)
             }
-            if let s = model.status {
-                Text(s).font(.callout).foregroundStyle(.orange).multilineTextAlignment(.center).padding(.horizontal)
-            }
-            Spacer()
-            Text("Stimme: \(model.sprecher.stimme) (ändern unter „Wörter“)").font(.caption2).foregroundStyle(.tertiary)
+            .frame(maxHeight: 330)
+            Text("Blau: die nächsten 5 Wörter, grün: bis 10").font(.caption).foregroundStyle(.secondary)
         }
-        .padding(.vertical)
+        .lernKarte()
+    }
+
+    /// Kurz: heute und insgesamt geübt, Anteil gleich richtig; „Mehr“ öffnet die Statistik
+    private var statistikKarte: some View {
+        let heute = LernStatistik.zahlen(model.log, ab: Calendar.current.startOfDay(for: Date()))
+        let alle = LernStatistik.zahlen(model.log)
+        let tage = LernStatistik.uebungstage(model.log)
+        return VStack(alignment: .leading, spacing: 14) {
+            Text("So viel hast du geübt").font(.headline)
+            if alle.summe == 0 {
+                Text("Noch nichts. Los geht's!").foregroundStyle(.secondary)
+            } else {
+                if heute.summe > 0 { ZahlenZeile(titel: "Heute", zahlen: heute) }
+                ZahlenZeile(titel: tage == 1 ? "Insgesamt, an 1 Tag" : "Insgesamt, an \(tage) Tagen", zahlen: alle)
+                Button { statistik = true } label: { Label("Mehr Statistik", systemImage: "chart.bar.fill") }
+                    .buttonStyle(.bordered)
+            }
+        }
+        .lernKarte()
     }
 
     // MARK: Üben
@@ -405,35 +472,35 @@ private struct Linien: View {
 }
 
 /// Schreibfläche: PencilKit mit schwarzem Stift oder Radierer; mit dem Finger schreiben geht, wenn am iPad nicht
-/// „Nur mit Apple Pencil zeichnen“ eingestellt ist
+/// „Nur mit Apple Pencil zeichnen“ eingestellt ist. Der Radierer nimmt nur weg, worüber er fährt (Teile eines
+/// Buchstabens), und zeigt dabei wie im Notizbuch einen kleinen Kreis
 struct LernCanvas: UIViewRepresentable {
     @Binding var drawing: PKDrawing
     var radierer: Bool
     var aktiv: Bool
+    /// So breit wischt der Radierer (Punkte); der Kreis zeigt genau diese Fläche
+    static let radiererBreite: CGFloat = 16
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
-    func makeUIView(context: Context) -> PKCanvasView {
-        let v = PKCanvasView()
-        v.backgroundColor = .clear
-        v.isOpaque = false
-        v.drawingPolicy = .default
-        v.isScrollEnabled = false
-        v.drawing = drawing
-        v.delegate = context.coordinator
+    func makeUIView(context: Context) -> LernCanvasView {
+        let v = LernCanvasView()
+        v.canvas.drawing = drawing
+        v.canvas.delegate = context.coordinator
         apply(v)
         return v
     }
 
-    func updateUIView(_ v: PKCanvasView, context: Context) {
+    func updateUIView(_ v: LernCanvasView, context: Context) {
         context.coordinator.parent = self
-        if v.drawing != drawing { v.drawing = drawing }
+        if v.canvas.drawing != drawing { v.canvas.drawing = drawing }
         apply(v)
     }
 
-    private func apply(_ v: PKCanvasView) {
-        v.tool = radierer ? PKEraserTool(.vector) : PKInkingTool(.pen, color: .black, width: 5)
-        v.isUserInteractionEnabled = aktiv
+    private func apply(_ v: LernCanvasView) {
+        v.canvas.tool = radierer ? PKEraserTool(.bitmap, width: Self.radiererBreite) : PKInkingTool(.pen, color: .black, width: 5)
+        v.canvas.isUserInteractionEnabled = aktiv
+        v.radierer = radierer && aktiv
     }
 
     final class Coordinator: NSObject, PKCanvasViewDelegate {
@@ -444,6 +511,72 @@ struct LernCanvas: UIViewRepresentable {
             DispatchQueue.main.async { if self.parent.drawing != d { self.parent.drawing = d } }
         }
     }
+}
+
+/// PencilKit-Leinwand mit dem Radierer-Kreis wie im Notizbuch (grauer Rand, halb durchsichtig weiß): Er läuft unter
+/// dem Pencil oder Finger mit, solange der Radierer gewählt ist, und mit einem Pencil, der schweben kann, schon darüber
+final class LernCanvasView: UIView, UIGestureRecognizerDelegate {
+    let canvas = PKCanvasView()
+    private let kreis = UIView()
+    private var beruehrt = false
+    var radierer = false {
+        didSet { if !radierer { kreis.isHidden = true } }
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        canvas.backgroundColor = .clear
+        canvas.isOpaque = false
+        canvas.drawingPolicy = .default
+        canvas.isScrollEnabled = false
+        canvas.frame = bounds
+        canvas.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        addSubview(canvas)
+
+        let d = LernCanvas.radiererBreite
+        kreis.frame = CGRect(x: 0, y: 0, width: d, height: d)
+        kreis.layer.cornerRadius = d / 2
+        kreis.layer.borderWidth = 1.5
+        kreis.layer.borderColor = UIColor(white: 0.35, alpha: 0.9).cgColor
+        kreis.backgroundColor = UIColor(white: 1, alpha: 0.35)
+        kreis.isUserInteractionEnabled = false
+        kreis.isHidden = true
+        addSubview(kreis)
+
+        let mit = Mitlaeufer(target: nil, action: nil)
+        mit.onTouch = { [weak self] t in self?.beruehrung(t) }
+        canvas.addGestureRecognizer(mit)
+        let hover = UIHoverGestureRecognizer(target: self, action: #selector(schwebt(_:)))
+        hover.delegate = self
+        canvas.addGestureRecognizer(hover)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func beruehrung(_ t: UITouch?) {
+        beruehrt = t != nil
+        zeige(t?.preciseLocation(in: self))
+    }
+
+    @objc private func schwebt(_ g: UIHoverGestureRecognizer) {
+        guard !beruehrt else { return }
+        switch g.state {
+        case .began, .changed: zeige(g.location(in: self))
+        default: zeige(nil)
+        }
+    }
+
+    private func zeige(_ p: CGPoint?) {
+        guard radierer, let p else {
+            kreis.isHidden = true
+            return
+        }
+        kreis.center = p
+        kreis.isHidden = false
+    }
+
+    func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
 }
 
 /// Wortliste ansehen und ändern: Fach je Wort, Wörter hinzufügen („Wort | Satz“ je Zeile), wischen zum Entfernen
@@ -533,5 +666,246 @@ private struct StimmenSection: View {
         } footer: {
             Text("Antippen zum Probehören. Schönere Stimmen am iPad laden: Settings › Accessibility › Spoken Content › Voices › German, dort „Enhanced“ oder „Premium“.")
         }
+    }
+}
+
+// MARK: - Startseite und Statistik
+
+private extension View {
+    /// Weiße Karte mit Schatten
+    func lernKarte() -> some View {
+        padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.white, in: RoundedRectangle(cornerRadius: 20))
+            .shadow(color: .black.opacity(0.07), radius: 9, y: 3)
+    }
+}
+
+/// Eine Zeile der Liste „Als Nächstes dran“: Nummer (blau bis 5, grün bis 10), Wort, Fach
+private struct NaechstesWort: View {
+    var nummer: Int
+    var wort: String
+    var fach: Int
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text("\(nummer)")
+                .font(.callout.weight(.bold).monospacedDigit())
+                .foregroundStyle(.white)
+                .frame(width: 30, height: 30)
+                .background(farbe, in: Circle())
+            Text(wort).font(.title3.weight(.medium))
+            Spacer(minLength: 8)
+            Fach(fach: fach)
+        }
+    }
+
+    private var farbe: Color {
+        nummer <= 5 ? LernView.blau : nummer <= 10 ? LernView.gruen : Color.gray.opacity(0.45)
+    }
+}
+
+/// Ein Balken, nach Anzahl in farbige Teile geteilt
+struct AnteilBalken: View {
+    struct Teil {
+        var anzahl: Int
+        var farbe: Color
+    }
+    var teile: [Teil]
+
+    /// Gleich richtig (grün), mit Tipp (gelb), noch üben (orange)
+    init(_ z: LernStatistik.Zahlen) {
+        teile = [Teil(anzahl: z.richtig, farbe: LernView.gruen), Teil(anzahl: z.halb, farbe: LernView.gelb),
+                 Teil(anzahl: z.falsch, farbe: LernView.orange)]
+    }
+
+    init(teile: [Teil]) { self.teile = teile }
+
+    var body: some View {
+        GeometryReader { g in
+            HStack(spacing: 0) {
+                ForEach(Array(teile.enumerated()), id: \.offset) { _, t in
+                    Rectangle().fill(t.farbe).frame(width: breite(t, g.size.width))
+                }
+            }
+        }
+        .background(Color.gray.opacity(0.15))
+        .clipShape(Capsule())
+    }
+
+    private func breite(_ t: Teil, _ gesamt: CGFloat) -> CGFloat {
+        let summe = teile.reduce(0) { $0 + $1.anzahl }
+        return summe == 0 ? 0 : gesamt * CGFloat(t.anzahl) / CGFloat(summe)
+    }
+}
+
+/// Geübte Wörter mit Balken und Anteil gleich richtig (Startseite)
+private struct ZahlenZeile: View {
+    var titel: String
+    var zahlen: LernStatistik.Zahlen
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(titel).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                Text(zahlen.summe == 1 ? "1 Wort" : "\(zahlen.summe) Wörter").font(.title3.weight(.bold).monospacedDigit())
+            }
+            AnteilBalken(zahlen).frame(height: 14)
+            Text("⭐ \(zahlen.richtig) gleich richtig · ½ \(zahlen.halb) mit Tipp · 🔁 \(zahlen.falsch) noch üben")
+                .font(.caption).foregroundStyle(.secondary)
+            if let a = zahlen.anteil {
+                Text("\(Int((a * 100).rounded())) % gleich richtig").font(.callout.weight(.semibold)).foregroundStyle(LernView.gruen)
+            }
+        }
+    }
+}
+
+/// Statistik: geübt heute, in den letzten 7 Tagen und insgesamt; Verlauf der letzten 14 Tage; wie gut die Wörter
+/// sitzen (Fächer der Lernkartei); welche noch schwer fallen. Zählt alle Geräte (das Protokoll am Server)
+struct LernStatistikView: View {
+    @ObservedObject var model: LernModel
+    @Environment(\.dismiss) private var dismiss
+
+    static let richtigText = "gleich richtig"
+    static let halbText = "mit Tipp"
+    static let falschText = "noch üben"
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 18) {
+                    kacheln
+                    karte("Die letzten 14 Tage") { verlauf }
+                    karte("So gut sitzen die Wörter") { faecher }
+                    schwierig
+                    Text("Jedes geschriebene Wort zählt einmal, auch beim Nochmal-Probieren. ⭐ gleich richtig, ½ mit dem Tipp richtig, 🔁 noch üben.")
+                        .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding()
+                .frame(maxWidth: 860)
+                .frame(maxWidth: .infinity)
+            }
+            .background(LernView.papier.ignoresSafeArea())
+            .navigationTitle("Statistik")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Fertig") { dismiss() } } }
+        }
+        .environment(\.locale, Locale(identifier: "de_AT"))
+    }
+
+    private var kacheln: some View {
+        let cal = Calendar.current
+        let heute = cal.startOfDay(for: Date())
+        let woche = cal.date(byAdding: .day, value: -6, to: heute) ?? heute
+        let tage = LernStatistik.uebungstage(model.log)
+        return HStack(alignment: .top, spacing: 14) {
+            Kachel(titel: "Heute", zahlen: LernStatistik.zahlen(model.log, ab: heute), unten: nil)
+            Kachel(titel: "Letzte 7 Tage", zahlen: LernStatistik.zahlen(model.log, ab: woche), unten: nil)
+            Kachel(titel: "Insgesamt", zahlen: LernStatistik.zahlen(model.log), unten: tage == 1 ? "an 1 Tag" : "an \(tage) Tagen")
+        }
+    }
+
+    private var verlauf: some View {
+        let tage = LernStatistik.tage(model.log)
+        return Chart {
+            ForEach(tage) { t in
+                BarMark(x: .value("Tag", t.tag, unit: .day), y: .value("Wörter", t.zahlen.richtig))
+                    .foregroundStyle(by: .value("Ergebnis", Self.richtigText))
+                BarMark(x: .value("Tag", t.tag, unit: .day), y: .value("Wörter", t.zahlen.halb))
+                    .foregroundStyle(by: .value("Ergebnis", Self.halbText))
+                BarMark(x: .value("Tag", t.tag, unit: .day), y: .value("Wörter", t.zahlen.falsch))
+                    .foregroundStyle(by: .value("Ergebnis", Self.falschText))
+            }
+        }
+        .chartForegroundStyleScale([Self.richtigText: LernView.gruen, Self.halbText: LernView.gelb, Self.falschText: LernView.orange])
+        .chartXAxis {
+            AxisMarks(values: .stride(by: .day, count: 2)) { _ in
+                AxisGridLine()
+                AxisValueLabel(format: .dateTime.day().month(.defaultDigits))
+            }
+        }
+        .chartLegend(position: .bottom)
+        .frame(height: 220)
+    }
+
+    private struct Gruppe: Identifiable {
+        var name: String
+        var anzahl: Int
+        var farbe: Color
+        var id: String { name }
+    }
+
+    private var faecher: some View {
+        let f = LernStatistik.faecher(model.words, model.karten)
+        let gruppen = [
+            Gruppe(name: "neu", anzahl: f[0], farbe: Color.gray.opacity(0.45)),
+            Gruppe(name: "noch üben", anzahl: f[1], farbe: LernView.orange),
+            Gruppe(name: "wird besser", anzahl: f[2] + f[3], farbe: LernView.gelb),
+            Gruppe(name: "sitzt", anzahl: f[4] + f[5], farbe: LernView.gruen),
+        ]
+        return VStack(alignment: .leading, spacing: 10) {
+            AnteilBalken(teile: gruppen.map { AnteilBalken.Teil(anzahl: $0.anzahl, farbe: $0.farbe) }).frame(height: 18)
+            HStack(spacing: 18) {
+                ForEach(gruppen) { g in
+                    HStack(spacing: 6) {
+                        Circle().fill(g.farbe).frame(width: 10, height: 10)
+                        Text("\(g.name): \(g.anzahl)").font(.callout)
+                    }
+                }
+            }
+            Text("Ist ein Wort gleich richtig, rückt es ein Fach weiter und kommt seltener dran. Nach einem Fehler beginnt es wieder vorne.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var schwierig: some View {
+        let schwer = LernStatistik.schwierig(model.words, model.karten)
+        if !schwer.isEmpty {
+            karte("Diese Wörter üben wir noch") {
+                ForEach(schwer) { s in
+                    HStack {
+                        Text(s.wort).font(.title3.weight(.medium))
+                        Spacer()
+                        Text("\(s.karte.richtig) von \(s.karte.versuche) gleich richtig").font(.callout).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private func karte<C: View>(_ titel: String, @ViewBuilder _ inhalt: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(titel).font(.headline)
+            inhalt()
+        }
+        .lernKarte()
+    }
+}
+
+/// Eine Kachel oben in der Statistik: Zahl der geübten Wörter, Balken, Anteil gleich richtig
+private struct Kachel: View {
+    var titel: String
+    var zahlen: LernStatistik.Zahlen
+    var unten: String?
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Text(titel).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+            Text("\(zahlen.summe)").font(.system(size: 40, weight: .bold, design: .rounded)).monospacedDigit()
+            Text(zahlen.summe == 1 ? "Wort geübt" : "Wörter geübt").font(.callout)
+            AnteilBalken(zahlen).frame(height: 10)
+            Text(prozent).font(.caption.weight(.semibold)).foregroundStyle(LernView.gruen)
+            if let unten { Text(unten).font(.caption).foregroundStyle(.secondary) }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity)
+        .background(.white, in: RoundedRectangle(cornerRadius: 18))
+        .shadow(color: .black.opacity(0.06), radius: 8, y: 2)
+    }
+
+    private var prozent: String {
+        guard let a = zahlen.anteil else { return "–" }
+        return "\(Int((a * 100).rounded())) % gleich richtig"
     }
 }

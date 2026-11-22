@@ -106,6 +106,87 @@ enum Lernkartei {
     }
 
     static func anzahlDran(_ words: [LernWort], _ log: [LernEvent]) -> Int { runde(words, log, size: 10_000).count }
+
+    /// Alle Wörter in der Reihenfolge, in der sie drankommen: die ersten fünf bzw. zehn sind die nächste Runde
+    static func reihenfolge(_ words: [LernWort], _ log: [LernEvent]) -> [LernWort] {
+        runde(words, log, size: 10_000, extra: true)
+    }
+}
+
+/// Zahlen für die Statistik. Jedes geschriebene Wort zählt einmal (auch beim „Nochmal probieren“ am Ende einer Runde):
+/// gleich richtig, mit dem Tipp richtig (halb) oder noch nicht
+enum LernStatistik {
+    struct Zahlen: Equatable {
+        var richtig = 0
+        var halb = 0
+        var falsch = 0
+        var summe: Int { richtig + halb + falsch }
+        /// Anteil gleich richtig, 0 bis 1 (nil ohne Versuche)
+        var anteil: Double? { summe == 0 ? nil : Double(richtig) / Double(summe) }
+
+        mutating func zaehle(_ e: LernEvent) {
+            switch e.ergebnis {
+            case "richtig": richtig += 1
+            case "zweiter": halb += 1
+            default: falsch += 1
+            }
+        }
+    }
+
+    struct Tag: Identifiable, Equatable {
+        let tag: Date
+        var zahlen = Zahlen()
+        var id: Date { tag }
+    }
+
+    /// Versuche ab `ab` (nil: alle)
+    static func zahlen(_ log: [LernEvent], ab: Date? = nil) -> Zahlen {
+        let grenze = ab?.timeIntervalSince1970 ?? -.infinity
+        var z = Zahlen()
+        for e in log where e.t >= grenze { z.zaehle(e) }
+        return z
+    }
+
+    /// Die letzten `anzahl` Tage bis heute, auch die ohne Üben (fürs Diagramm)
+    static func tage(_ log: [LernEvent], anzahl: Int = 14, now: Date = Date(), calendar: Calendar = .current) -> [Tag] {
+        let heute = calendar.startOfDay(for: now)
+        var tage = (0..<anzahl).reversed().compactMap { calendar.date(byAdding: .day, value: -$0, to: heute) }.map { Tag(tag: $0) }
+        var index: [Date: Int] = [:]
+        for (i, t) in tage.enumerated() { index[t.tag] = i }
+        for e in log {
+            if let i = index[calendar.startOfDay(for: Date(timeIntervalSince1970: e.t))] { tage[i].zahlen.zaehle(e) }
+        }
+        return tage
+    }
+
+    /// An wie vielen verschiedenen Tagen geübt wurde
+    static func uebungstage(_ log: [LernEvent], calendar: Calendar = .current) -> Int {
+        Set(log.map { calendar.startOfDay(for: Date(timeIntervalSince1970: $0.t)) }).count
+    }
+
+    /// Wie viele Wörter in welchem Fach liegen (0 = neu, noch nie geübt)
+    static func faecher(_ words: [LernWort], _ karten: [String: Lernkartei.Karte]) -> [Int] {
+        var f = Array(repeating: 0, count: 6)
+        for w in words where w.removed == nil { f[min(max(karten[w.wort]?.fach ?? 0, 0), 5)] += 1 }
+        return f
+    }
+
+    struct Schwer: Identifiable {
+        let wort: String
+        let karte: Lernkartei.Karte
+        var id: String { wort }
+    }
+
+    /// Wörter, die gerade noch schwer fallen (im ersten Fach), das mit dem kleinsten Anteil gleich richtig zuerst
+    static func schwierig(_ words: [LernWort], _ karten: [String: Lernkartei.Karte], anzahl: Int = 6) -> [Schwer] {
+        words.filter { $0.removed == nil }
+            .compactMap { w in karten[w.wort].flatMap { $0.fach == 1 && $0.versuche > 0 ? Schwer(wort: w.wort, karte: $0) : nil } }
+            .sorted { a, b in
+                let x = Double(a.karte.richtig) / Double(a.karte.versuche), y = Double(b.karte.richtig) / Double(b.karte.versuche)
+                return x != y ? x < y : a.karte.versuche > b.karte.versuche
+            }
+            .prefix(anzahl).map { $0 }
+    }
 }
 
 /// Vergleich wie am Mac: Unicode zusammengesetzt, Leerraum zusammengefasst, Groß- und Kleinschreibung zählt
@@ -269,6 +350,7 @@ final class LernModel: ObservableObject {
     var aktiveWoerter: [LernWort] { words.filter { $0.removed == nil } }
     var karten: [String: Lernkartei.Karte] { Lernkartei.karten(log) }
     var anzahlDran: Int { Lernkartei.anzahlDran(words, log) }
+    var reihenfolge: [LernWort] { Lernkartei.reihenfolge(words, log) }
     /// Wörter dieser Runde, die beim ersten Versuch nicht richtig waren: Am Ende kann Sascha sie nochmal probieren
     var nochmalWoerter: [LernWort] { queue.filter { ersteVersuche[$0.wort] != "richtig" } }
 

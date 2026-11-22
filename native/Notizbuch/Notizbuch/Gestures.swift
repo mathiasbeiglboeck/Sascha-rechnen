@@ -292,3 +292,47 @@ final class MarkTapGesture: UIGestureRecognizer {
         return super.canPrevent(preventedGestureRecognizer)
     }
 }
+
+/// Verfolgt eine Berührung, ohne sie je anzunehmen: PencilKit schreibt oder radiert ungestört (wie LassoTracker).
+/// Für den Radierer-Kreis der Lernwörter
+final class Mitlaeufer: UIGestureRecognizer {
+    /// Bei jeder Bewegung die Berührung, beim Abheben nil
+    var onTouch: ((UITouch?) -> Void)?
+    private var verfolgt: UITouch?
+
+    override init(target: Any?, action: Selector?) {
+        super.init(target: target, action: action)
+        cancelsTouchesInView = false
+        delaysTouchesBegan = false
+        delaysTouchesEnded = false
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard verfolgt == nil, let t = touches.first else { return }
+        verfolgt = t
+        onTouch?(t)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        if let t = verfolgt, touches.contains(t) { onTouch?(t) }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) { ende(touches) }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) { ende(touches) }
+
+    private func ende(_ touches: Set<UITouch>) {
+        guard let t = verfolgt, touches.contains(t) else { return }
+        verfolgt = nil
+        onTouch?(nil)
+        if state == .possible { state = .failed }
+    }
+
+    override func reset() {
+        super.reset()
+        if verfolgt != nil { onTouch?(nil) }
+        verfolgt = nil
+    }
+
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+}
