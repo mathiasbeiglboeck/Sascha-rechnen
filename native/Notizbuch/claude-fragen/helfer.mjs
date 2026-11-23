@@ -666,12 +666,22 @@ function filesSummary(job, files) {
   return parts.join(", ");
 }
 
+/// Wie viele Seiten das Dokument hat, für die erste Zeile eines Chats. Beim PDF zählt das PDF selbst (pageWindow).
+/// Sonst die Zahl vom Server, doch die kann der App nachhinken: Schreibt Mathias auf die letzte Seite, hängt die App eine
+/// leere an, und fragt er gleich, ist die neue Zahl oft noch nicht oben. Die Seiten um die Frage sind der Stand der App
+/// beim Fragen: Bis zur letzten davon gibt es Seiten, und ist es nur die Seite der Frage, hatte das Dokument nur sie
+function pageCount(job, files) {
+  if (files.total) return files.total;
+  if (files.span) return files.span[0] === files.span[1] ? 1 : Math.max(job.doc.pageCount || 0, files.span[1]);
+  return Math.max(job.doc.pageCount || 0, job.anchor.page + 1);
+}
+
 function prompt(job, files, fresh) {
   const kind = job.doc.kind === "pdf" ? "PDF" : "Notizbuch";
-  const pages = job.doc.pageCount ? ` mit ${seiten(job.doc.pageCount)}` : "";
   const doc = state.docs[job.doc.id] || {};
   const lines = [];
-  const total = files.total ? ` mit ${seiten(files.total)}` : pages;
+  const count = pageCount(job, files);
+  const total = count ? ` mit ${seiten(count)}` : "";
   if (fresh) {
     lines.push(`Dokument: „${job.doc.title || "ohne Titel"}“ (${kind}${total}).`);
     if (files.pdf && !files.window) lines.push(`Das ganze Dokument liegt in ${files.pdf}.`);

@@ -192,6 +192,35 @@ async function main() {
   ctxFile = Object.keys(c.sizes).find((f) => f.endsWith(`${a.id}/nachbarseiten.pdf`));
   ok(ctxFile && promptOf(c).includes(`- ${ctxFile}: Seite 2, wie sie in der App aussieht, oben mit ihrer Nummer beschriftet\nVon Seite 1 bis 4 ist außer der Seite der Frage nur auf Seite 2 etwas geschrieben, die übrigen sind leer.`), "one written page: singular", promptOf(c));
 
+  console.log("== page count in the first line: the server's may lag behind the app, the pages around the question do not");
+  {
+    // Auf die letzte Seite geschrieben und gleich gefragt: Die App hat eine leere Seite angehängt, der Server weiß es noch nicht
+    const nowP = Date.now() / 1000, grown = uuid(), single = uuid(), older = uuid(), long = uuid();
+    await api("PUT", `/api/library/${grown}`, { json: { id: grown, title: "Gerade angehängt", kind: "notebook", created: nowP, modified: nowP, pageCount: 1 } });
+    await api("PUT", `/api/library/${single}`, { json: { id: single, title: "Eine Seite", kind: "notebook", created: nowP, modified: nowP, pageCount: 2 } });
+    await api("PUT", `/api/library/${older}`, { json: { id: older, title: "Ältere App", kind: "notebook", created: nowP, modified: nowP, pageCount: 1 } });
+    await api("PUT", `/api/library/${long}`, { json: { id: long, title: "Lang", kind: "notebook", created: nowP, modified: nowP, pageCount: 20 } });
+    a = await createAsk(grown, "thorough", 0, { span: [0, 1], pages: [] });
+    ok(await waitFor(async () => (await askOf(grown, a.id)).status === "answered", 15000), "answered");
+    c = calls().filter((x) => x.args).at(-1);
+    ok(promptOf(c).startsWith("Dokument: „Gerade angehängt“ (Notizbuch mit 2 Seiten).\n") && /\nVon Seite 1 bis 2 ist außer der Seite der Frage nichts geschrieben\./.test(promptOf(c)), "server says 1 page, the app's range has 2: the first line says 2", promptOf(c));
+    // Nur die Seite der Frage im Bereich: Die App hatte nur sie, auch wenn der Server noch von einer zweiten weiß
+    a = await createAsk(single, "quick", 0, { span: [0, 0], pages: [] });
+    ok(await waitFor(async () => (await askOf(single, a.id)).status === "answered", 15000), "answered");
+    c = calls().filter((x) => x.args).at(-1);
+    ok(promptOf(c).startsWith("Dokument: „Eine Seite“ (Notizbuch mit 1 Seite).\n") && /\nDas Notizbuch hat nur diese eine Seite\./.test(promptOf(c)), "range of one page, server says 2: the first line says 1, like the note", promptOf(c));
+    // Ältere App ohne die Seiten um die Frage: wenigstens bis zur Seite der Frage
+    a = await createAsk(older, "quick", 2);
+    ok(await waitFor(async () => (await askOf(older, a.id)).status === "answered", 15000), "answered");
+    c = calls().filter((x) => x.args).at(-1);
+    ok(promptOf(c).startsWith("Dokument: „Ältere App“ (Notizbuch mit 3 Seiten).\n") && /die ganze Seite 3, die Frage darauf/.test(promptOf(c)), "no range, server says 1 page, question on page 3: at least 3", promptOf(c));
+    // Der Bereich endet vor dem Ende des Dokuments: Dann gilt die Zahl vom Server
+    a = await createAsk(long, "quick", 2, { span: [0, 3], pages: [] });
+    ok(await waitFor(async () => (await askOf(long, a.id)).status === "answered", 15000), "answered");
+    c = calls().filter((x) => x.args).at(-1);
+    ok(promptOf(c).startsWith("Dokument: „Lang“ (Notizbuch mit 20 Seiten).\n") && /\nVon Seite 1 bis 4 ist außer der Seite der Frage nichts geschrieben\./.test(promptOf(c)), "range ends before the server's last page: the server's 20", promptOf(c));
+  }
+
   console.log("== ∞ (question as JPEG: the printed question over the spot)");
   {
     const id = uuid();
