@@ -110,6 +110,9 @@ final class AskStore: ObservableObject {
     private var offline = Set<UUID>()
     /// Neue Fragen, deren Seiten ringsum noch entstehen (`add(_:_:preparing:)`): Bis dahin wartet ihr Hochladen
     private var preparing = Set<String>()
+    /// Dokumente, in denen eben eine Frage samt den Seiten um sie hinaufgeht: Darauf wartet `waitIdle` nicht, es holt
+    /// die Liste selbst
+    private var uploadingPages = Set<UUID>()
 
     init(store: DocumentStore, sync: SyncEngine) {
         self.store = store
@@ -287,7 +290,12 @@ final class AskStore: ObservableObject {
         running.insert(doc)
         retries[doc]?.cancel()
         retries[doc] = nil
+        // Hält die App wach, bis der Abgleich (samt Hochladen) fertig ist, auch wenn sie eben in den Hintergrund geht.
+        // Hier und nicht erst in der Aufgabe angelegt: `prepared` ruft das, kurz bevor die Leinwand ihre eigene
+        // Hintergrundzeit beendet, so bleibt keine Lücke
+        let background = BackgroundWork("Fragen an Claude abgleichen")
         Task { [weak self] in
+            defer { background.end() }
             guard let self else { return }
             repeat {
                 self.again.remove(doc)
@@ -304,8 +312,27 @@ final class AskStore: ObservableObject {
         // In kleinen Schritten: Meist ist der Abgleich fast gleichzeitig mit dem der Striche fertig, und die
         // Seitenänderung soll danach nicht noch auf einen ganzen Schritt warten
         while running.contains(doc), Date() < end {
+            // Geht eben eine Frage samt den Seiten um sie hinauf, nicht darauf warten (das dauert bei schlechtem Netz
+            // Sekunden, und solange ruht der Abgleich der Striche), sondern die Liste selbst holen. Kommt die Frage erst
+            // nach der Seitenänderung an, lehnt der Server ihre Stelle ab, und sie geht gleich mit der neuen Stelle
+            // noch einmal hinauf (dann ohne die Seiten). Nie eine ältere Liste als die schon übernommene
+            if uploadingPages.contains(doc) {
+                if let list = await fetchList(doc, until: end), list.v >= versions[doc] ?? 0 { apply(doc, list) }
+                return
+            }
             try? await Task.sleep(for: .milliseconds(5))
         }
+    }
+
+    /// Die Liste der Fragen eines Dokuments vom Server, wenn sie bis `end` kommt
+    private func fetchList(_ doc: UUID, until end: Date) async -> SyncEngine.AskList? {
+        let fetch = Task { try? await sync.fetchAsks(doc) }
+        let timeout = Task {
+            try? await Task.sleep(for: .seconds(max(end.timeIntervalSinceNow, 0)))
+            fetch.cancel()
+        }
+        defer { timeout.cancel() }
+        return await fetch.value
     }
 
     /// Schickt hinauf, was in anderen (auch geschlossenen) Dokumenten noch wartet: aus der Schleife der Bibliothek
@@ -430,10 +457,12 @@ final class AskStore: ObservableObject {
                 fail(doc, ask.id, "Die Bilder der Frage fehlen. Bitte noch einmal fragen.")
                 continue
             }
+            let context = Self.context(in: folder, for: ask)
             let list: SyncEngine.AskList
             do {
-                list = try await upload(doc, ask, question: question, page: page,
-                                        context: Self.context(in: folder, for: ask))
+                if context?.pdf != nil { uploadingPages.insert(doc) }
+                defer { uploadingPages.remove(doc) }
+                list = try await upload(doc, ask, question: question, page: page, context: context)
             } catch {
                 switch Self.classify(error) {
                 case .tooMany:
@@ -541,6 +570,12 @@ final class AskStore: ObservableObject {
                     merged.append(l)
                     continue
                 }
+                // Hier schon neuer als in dieser Liste (sie kam nach einer neueren an: Während eine Frage hinaufgeht,
+                // holt eine Seitenänderung die Liste selbst, `waitIdle`): bleibt, wie sie ist
+                if let lv = l.v, let rv = r.v, lv > rv {
+                    merged.append(l)
+                    continue
+                }
                 // Gelesen bleibt gelesen, solange die Antwort dieselbe ist
                 if r.isAnswered, l.isAnswered, l.answer == r.answer { r.seen = l.seen }
                 // Hier noch nicht hochgeladen, am Server aber schon (die Antwort aufs Hochladen ging verloren): Die
@@ -559,8 +594,11 @@ final class AskStore: ObservableObject {
         }
         for l in local where !remoteIDs.contains(l.id) {
             // Hier gestellt und nie am Server angekommen (wartet oder scheiterte): bleibt, bis sie oben ist oder
-            // gelöscht wird. Was der Server kannte und nicht mehr liefert, ist anderswo gelöscht
-            if l.v == nil, l.deleting != true {
+            // gelöscht wird, ebenso, was sich erst nach dieser Liste geändert hat (ohne `v` zählt als neuer). Auch zum
+            // Löschen vorgemerkt bleibt sie dann, bis `flush` das Löschen schickt: Ihr Hochladen kann noch unterwegs
+            // sein, und der Server merkt sich das Löschen. Was der Server kannte und nicht mehr liefert, ist anderswo
+            // gelöscht
+            if l.v ?? Int.max > remote.v {
                 merged.append(l)
             } else {
                 forgetImages(doc, l.id)

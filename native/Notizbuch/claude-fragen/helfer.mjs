@@ -36,6 +36,11 @@ const DEFAULTS = {
   vokabeln: { effort: "medium", model: null, minutes: 6 },
   // Rückfallabfrage, falls eine Meldung über den WebSocket verloren geht (Sekunden)
   pollSeconds: 300,
+  // Claude Code schickt bei jeder Anfrage den ganzen bisherigen Chat mit, samt allen Bildern und PDFs, und eine Frage
+  // braucht mehrere Anfragen: Würde eine Frage die Dateien, die die Fragen eines Chats mitbringen (Bilder, Seiten,
+  // PDF-Auszüge), über so viele MB bringen, beginnt sie einen neuen Chat (sonst lädt der Mac bei jeder Antwort ein
+  // Vielfaches davon hinauf). Ein kleines PDF, das jeder Chat ganz liest, zählt nicht mit. 0: jede Frage neu
+  chatMB: 8,
   // Nach einem Fehler am Mac: neuer Versuch nach so vielen Sekunden; am Nutzungslimit mindestens so lange Pause
   retrySeconds: 60,
   minPauseSeconds: 60,
@@ -625,7 +630,7 @@ function contextNote(job, files) {
     if (!files.span) return `Notizen aus der App siehst du zu dieser Frage nur auf der Seite der Frage; ${without}.`;
     const [a, b] = files.span;
     if (a === b) return `Notizen aus der App gibt es nur auf dieser Seite; ${without}.`;
-    const on = files.contextFile ? `${pageList(files.context, true)} und der Seite der Frage` : "auf der Seite der Frage";
+    const on = files.contextFile ? `auf der Seite der Frage und ${pageList(files.context, true)}` : "auf der Seite der Frage";
     return `Von Seite ${a} bis ${b} gibt es Notizen aus der App nur ${on}; ${without}. Notizen auf weiter entfernten ` +
       "Seiten siehst du zu dieser Frage nicht.";
   }
@@ -701,6 +706,39 @@ function prompt(job, files, fresh) {
   return lines.join("\n");
 }
 
+/// Ungefähr, wie viel diese Frage dem Chat an Dateien hinzufügt (Bytes): ihre Bilder und PDF-Auszüge. Ein kleines PDF
+/// (höchstens 10 Seiten) liest Claude ganz, in jedem Chat zum Dokument einmal: Das zählt nicht, ein neuer Chat bräuchte
+/// es ebenso. Nur wenn es sich im laufenden Chat geändert hat, kommt es ein zweites Mal dazu
+function questionBytes(dir, files, fresh, pdfChanged) {
+  const size = (file) => {
+    try {
+      return file ? fs.statSync(path.join(dir, file)).size : 0;
+    } catch {
+      return 0;
+    }
+  };
+  let bytes = size(files.question) + size(files.page) + size(files.window) + size(files.contextFile);
+  if (files.pdf && !files.window && files.total <= 10 && !fresh && pdfChanged) bytes += size(files.pdf);
+  return bytes;
+}
+
+/// Größe der Dateien in den Unterordnern von `dir` (eine Ebene), ohne den Unterordner `skip`
+function folderBytes(dir, skip) {
+  let sum = 0;
+  for (const sub of listDir(dir)) {
+    if (sub === skip) continue;
+    for (const name of listDir(path.join(dir, sub))) {
+      try {
+        sum += fs.statSync(path.join(dir, sub, name)).size;
+      } catch {}
+    }
+  }
+  return sum;
+}
+
+/// „0,8“ (MB)
+const mb = (bytes) => (bytes / 1e6).toFixed(1).replace(".", ",");
+
 async function askClaude(job, dir, files, level) {
   const bin = findClaude();
   if (!bin) {
@@ -709,9 +747,22 @@ async function askClaude(job, dir, files, level) {
   const caps = await claudeCaps(bin);
   const restricted = useRestricted(caps), web = useWeb(caps), sites = web ? fetchSites() : null;
   const doc = (state.docs[job.doc.id] = state.docs[job.doc.id] || {});
+  // Jede Anfrage schickt den ganzen bisherigen Chat mit (chatMB): Wird er mit dieser Frage zu groß, ein neuer
+  const budget = (typeof config.chatMB === "number" && config.chatMB >= 0 ? config.chatMB : DEFAULTS.chatMB) * 1e6;
+  if (doc.session && doc.chatBytes == null) {
+    // Chat aus einer früheren Fassung, die noch nicht zählte: geschätzt aus den Dateien der früheren Fragen
+    doc.chatBytes = folderBytes(path.join(dir, "fragen"), job.id);
+    log(job.id, `Chat ohne Zählung (frühere Fassung), geschätzt ${mb(doc.chatBytes)} MB`);
+  }
+  const adds = questionBytes(dir, files, false, doc.pdfChanged);
+  if (doc.session && doc.chatBytes + adds > budget) {
+    log(job.id, `Chat ${mb(doc.chatBytes)} MB + diese Frage ${mb(adds)} MB, mehr als ${mb(budget)} MB: neuer Chat`);
+    delete doc.session;
+  }
   for (let attempt = 0; attempt < 2; attempt++) {
     const fresh = !doc.session;
     const session = doc.session || randomUUID();
+    const bytes = questionBytes(dir, files, fresh, doc.pdfChanged);
     const args = [
       "-p", prompt(job, files, fresh),
       "--output-format", "json",
@@ -746,6 +797,7 @@ async function askClaude(job, dir, files, level) {
     }
     if (parsed.ok || parsed.sessionUsed) {
       doc.session = session;
+      doc.chatBytes = (fresh ? 0 : doc.chatBytes || 0) + bytes;
       doc.title = job.doc.title;
       doc.pdfChanged = false;
       saveState(state);
@@ -1086,7 +1138,7 @@ const AUTH = /not logged in|\/login|log ?in again|sign in again|failed to authen
 const TRANSIENT_AUTH = /another claude code process is refreshing|usually transient|signing in again won.t help|(disk|volume) is full|no space left/i;
 const LIMIT = /usage limit|limit reached|hit your [\w' ]*limit|rate.?limit|out of (extra )?usage/i;
 // Zu groß für eine Anfrage: Bytes (32 MB), Tokens, PDF-Seiten (100), Bilder (100, ab 21 höchstens 2000 Pixel)
-const CHAT_TOO_BIG = /request_too_large|request too large|exceeds the maximum size|api error: 413|prompt is too long|input is too long|context (limit|window)|maximum of \d+ pdf pages|pdf pages may be provided|many-image requests|too many (images|documents)/i;
+const CHAT_TOO_BIG = /request_too_large|request too large|exceeds the maximum size|api error: 413|prompt is too long|input is too long|context (limit|window)|maximum of \d+ pdf pages|pdf pages may be provided|pdf too large|many-image requests|too many (images|documents)/i;
 
 /// Wann ein Nutzungslimit endet: „…|1763305200“ (Unix-Zeit, ältere Fassungen) oder „resets 3:45pm“, „resets Mon 9am“
 /// (Ortszeit am Mac), sonst null. Eben vergangen (Minuten gerundet) heißt jetzt

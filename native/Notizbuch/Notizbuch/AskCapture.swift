@@ -160,14 +160,15 @@ extension PageExport {
 
     /// Schreibt die Seiten um die Frage auf Seite `q` neben ihre Bilder in `folder`, erst pages.pdf, dann pages.json
     /// (AskContext), im Hintergrund. Legt den Ordner nicht an: Ist die Frage inzwischen gelöscht oder schon oben,
-    /// bleibt nichts liegen. Scheitert es, geht die Frage ohne die Seiten. „Schnell“ höchstens 2 MB, „gründlich“ 4:
-    /// Die Frage soll auch bei schwachem Netz rasch oben sein, und der Server schreibt sie in einem Zug
+    /// bleibt nichts liegen. Scheitert es, geht die Frage ohne die Seiten. „Schnell“ höchstens 1,5 MB, „gründlich“ 3:
+    /// Die Frage soll auch bei schwachem Netz rasch oben sein, und während der Server sie schreibt, warten Antworten
+    /// an die anderen Geräte, die gerade dann hinausgehen
     static func writeContext(_ export: PageExport, span: ClosedRange<Int>, question q: Int, pv: Int, effort: String,
                              to folder: URL) async {
         do {
             try await run { () throws -> Void in
                 let started = Date()
-                let maxBytes = effort == "thorough" ? 4_000_000 : 2_000_000
+                let maxBytes = effort == "thorough" ? 3_000_000 : 1_500_000
                 guard let made = export.indexed().contextPDF(span: span, question: q, maxBytes: maxBytes) else {
                     #if DEBUG
                     NSLog("Asks-Debug: Nachbarseiten %@: PDF zu groß, ohne sie", folder.lastPathComponent)

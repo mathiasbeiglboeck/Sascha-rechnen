@@ -236,7 +236,7 @@ async function main() {
   c = calls().filter((x) => x.args).at(-1);
   ctxFile = Object.keys(c.sizes).find((f) => f.endsWith(`${a.id}/nachbarseiten.pdf`));
   ok(ctxFile && c.sizes[ctxFile] === 2500 && promptOf(c).includes(`- ${ctxFile}: die Seiten 1 und 4, wie sie in der App aussehen, jede oben mit ihrer Nummer beschriftet`), "pages PDF downloaded and named", { sizes: c.sizes, p: promptOf(c) });
-  ok(promptOf(c).includes("\nVon Seite 1 bis 4 gibt es Notizen aus der App nur auf den Seiten 1 und 4 und der Seite der Frage; dokument.pdf zeigt das PDF ohne die Notizen aus der App. Notizen auf weiter entfernten Seiten siehst du zu dieser Frage nicht.\n"), "PDF: where the notes are, the PDF has none", promptOf(c));
+  ok(promptOf(c).includes("\nVon Seite 1 bis 4 gibt es Notizen aus der App nur auf der Seite der Frage und auf den Seiten 1 und 4; dokument.pdf zeigt das PDF ohne die Notizen aus der App. Notizen auf weiter entfernten Seiten siehst du zu dieser Frage nicht.\n"), "PDF: where the notes are, the PDF has none", promptOf(c));
   ok(logText().includes(`${a.id} Unterlagen: Nachbarseiten 1, 4 (Bereich 1–4), ganzes PDF (6 Seiten)`), "log: pages and whole PDF", logText().split("\n").filter((l) => l.includes("Unterlagen")).slice(-1));
   a = await createAsk(doc, "quick", 1, { span: [0, 2], pages: [] });
   ok(await waitFor(async () => (await askOf(doc, a.id)).status === "answered", 15000), "answered");
@@ -299,7 +299,7 @@ async function main() {
   ok(last2[0].args.includes("--resume") && last2[1].args.includes("--session-id") && /Dokument: „Analysis/.test(last2[1].args[last2[1].args.indexOf("-p") + 1]), "resume failed → fresh session with full intro", last2.map((x) => x.args.slice(0, 2)));
 
   console.log("== chat too big for Claude (images and pages of many questions): new chat, no pause");
-  for (const message of ["Prompt is too long", "Context limit reached · /compact or /clear to continue", "API Error: 400 A maximum of 100 PDF pages may be provided.", "Request too large for the API's 32MB request limit"]) {
+  for (const message of ["Prompt is too long", "Context limit reached · /compact or /clear to continue", "API Error: 400 A maximum of 100 PDF pages may be provided.", "PDF too large (max 100 pages, 20MB). Try reading the file a different way (e.g., extract text with pdftotext).", "Request too large for the API's 32MB request limit"]) {
     setMode({ mode: "toobig", message });
     const runs = calls().filter((x) => x.args).length;
     a = await createAsk(doc, "quick", 1);
@@ -533,6 +533,55 @@ async function main() {
   ok(hgDone && /^Gescheitert: /.test(hgDone.note), "failed after the third try, with the reason", hgDone);
   const hgRuns = calls().filter((x) => x.args && x.mode === "huge").length;
   ok(hgRuns === 3, `Claude ran 3 times for it, not endlessly (${hgRuns})`);
+
+  console.log("== chat budget (chatMB): a question that would bring the chat over it starts a new one");
+  await restartWith(() => writeConfig({ chatMB: 1 }));
+  setMode({ mode: "ok" });
+  const nowD = Date.now() / 1000;
+  const sidOf = (x) => x.args[x.args.indexOf(x.args.includes("--resume") ? "--resume" : "--session-id") + 1];
+  const stateOf = (id) => JSON.parse(fs.readFileSync(path.join(HOME, "state.json"), "utf8")).docs[id];
+  // je Frage 4000 Bytes (Bild der Frage 1000, Seite 3000), mit Seiten um die Frage dazu deren PDF
+  async function budgetAsk(d, ctxBytes) {
+    const x = await createAsk(d, "quick", 1, ctxBytes ? { span: [0, 2], pages: [0], bytes: ctxBytes } : null);
+    const done = await waitFor(async () => (await askOf(d, x.id)).status === "answered", 15000, 100);
+    return { id: x.id, done, c: calls().filter((y) => y.args).at(-1) };
+  }
+  const bd = uuid();
+  await api("PUT", `/api/library/${bd}`, { json: { id: bd, title: "Budget", kind: "notebook", created: nowD, modified: nowD, pageCount: 3 } });
+  const bu1 = await budgetAsk(bd, 400000), bu2 = await budgetAsk(bd, 400000), bu3 = await budgetAsk(bd, 400000);
+  ok(bu1.done && bu2.done && bu3.done, "budget: three questions answered");
+  ok(bu1.c.args.includes("--session-id") && bu2.c.args.includes("--resume") && sidOf(bu2.c) === sidOf(bu1.c), "second question (0.8 MB in all) continues the chat", [bu1, bu2].map((b) => b.c.args.slice(0, 2)));
+  ok(bu3.c.args.includes("--session-id") && sidOf(bu3.c) !== sidOf(bu1.c) && /Dokument: „Budget“/.test(promptOf(bu3.c)), "the third would make 1.2 MB: new chat with the full intro", bu3.c.args.slice(0, 2));
+  ok(logText().includes(`${bu3.id} Chat 0,8 MB + diese Frage 0,4 MB, mehr als 1,0 MB: neuer Chat`) && !logText().split("\n").some((l) => l.includes(bu2.id) && l.includes("neuer Chat")), "logged with both sizes and the budget, only for the third", logText().split("\n").filter((l) => l.includes("neuer Chat")).slice(-2));
+  ok(stateOf(bd)?.chatBytes === 404000 && stateOf(bd).session === sidOf(bu3.c), "counting starts again with the new chat", stateOf(bd));
+
+  console.log("== chat budget: a chat from the older helper (not counted) is estimated from the files of its questions");
+  const lg = uuid();
+  await api("PUT", `/api/library/${lg}`, { json: { id: lg, title: "Alt", kind: "notebook", created: nowD, modified: nowD, pageCount: 3 } });
+  const lg1 = await budgetAsk(lg, 400000);
+  await restartWith(() => {
+    const st = JSON.parse(fs.readFileSync(path.join(HOME, "state.json"), "utf8"));
+    delete st.docs[lg].chatBytes;
+    fs.writeFileSync(path.join(HOME, "state.json"), JSON.stringify(st));
+  });
+  const lg2 = await budgetAsk(lg, 400000), lg3 = await budgetAsk(lg, 400000);
+  ok(lg1.done && lg2.done && lg3.done, "three questions answered");
+  ok(logText().includes(`${lg2.id} Chat ohne Zählung (frühere Fassung), geschätzt 0,4 MB`) && lg2.c.args.includes("--resume") && sidOf(lg2.c) === sidOf(lg1.c), "estimated from the first question's files (0.4 MB), the chat continues", lg2.c.args.slice(0, 2));
+  ok(lg3.c.args.includes("--session-id") && logText().includes(`${lg3.id} Chat 0,8 MB + diese Frage 0,4 MB`), "the estimate counts: the third starts a new chat (it would not, if an old chat counted as empty)", lg3.c.args.slice(0, 2));
+
+  console.log("== chat budget: a small PDF read whole does not count, only a changed one in a running chat");
+  setPages({ n: 6 });
+  const kd = uuid();
+  await api("PUT", `/api/library/${kd}`, { json: { id: kd, title: "Klein", kind: "pdf", created: nowD, modified: nowD, pageCount: 6, pdfVersion: 1 } });
+  await api("PUT", `/api/pdf/${kd}`, { body: new TextEncoder().encode("%PDF-1.4\n" + "k".repeat(600000)), headers: { "content-type": "application/pdf" } });
+  const kl1 = await budgetAsk(kd);
+  ok(kl1.done && kl1.c.sizes["dokument.pdf"] === 600009 && !/seiten-/.test(promptOf(kl1.c)) && stateOf(kd)?.chatBytes === 4000, "first question: the whole small PDF is not counted (4000 bytes)", { st: stateOf(kd), sizes: kl1.c.sizes });
+  await api("PUT", `/api/library/${kd}`, { json: { id: kd, title: "Klein", kind: "pdf", created: nowD, modified: nowD + 5, pageCount: 6, pdfVersion: 2 } });
+  await api("PUT", `/api/pdf/${kd}`, { body: new TextEncoder().encode("%PDF-1.4\n" + "n".repeat(600000)), headers: { "content-type": "application/pdf" } });
+  const kl2 = await budgetAsk(kd), kl3 = await budgetAsk(kd);
+  ok(kl2.done && kl2.c.args.includes("--resume") && /PDF wurde seit der letzten Frage geändert/.test(promptOf(kl2.c)) && kl3.done && kl3.c.args.includes("--resume") && stateOf(kd).chatBytes === 4000 + 604009 + 4000, "changed PDF in the running chat counts once (0.6 MB), the chat goes on", stateOf(kd));
+  setPages({ n: 30 });
+  await restartWith(() => writeConfig());
 
   console.log("== restart while Claude works: the question is handed back at once");
   setMode({ mode: "ok", delayMs: 8000 });
