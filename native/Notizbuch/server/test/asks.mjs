@@ -505,6 +505,54 @@ async function main() {
     await api("PUT", `/api/asks/${c3}/answer`, { json: { claim: cl.data.claim, markdown: "ok" } });
   }
 
+  console.log("== held for a newer page state (the PDF is still going up): woken when the page state arrives; age");
+  {
+    // Der Helfer stellt eine Frage zurück, deren Seitenstand der Server noch nicht hat; eine andere wartet aufs Nutzungslimit
+    const hd = await newDoc("Gehalten"), h1 = uuid(), h2 = uuid();
+    await createAsk(hd, h1, { anchor: anchor(1), pv: 200, created: Date.now() / 1000 - 3600 });
+    await createAsk(hd, h2, { anchor: anchor(2), pv: 0 });
+    const k1 = await api("POST", `/api/asks/${h1}/claim`, { json: {} });
+    ok(k1.status === 200 && typeof k1.data.age === "number" && k1.data.age >= 0 && k1.data.age < 10 && k1.data.created < Date.now() / 1000 - 3000,
+      "age counts from the arrival at the server, not from the device's created", { age: k1.data.age, created: k1.data.created });
+    const k2 = await api("POST", `/api/asks/${h2}/claim`, { json: {} });
+    await api("PUT", `/api/asks/${h1}/answer`, { json: { claim: k1.data.claim, release: true, retryAfter: 3600, count: false, note: "Das geänderte PDF ist noch nicht oben" } });
+    await api("PUT", `/api/asks/${h2}/answer`, { json: { claim: k2.data.claim, release: true, retryAfter: 3600, count: false, note: "Claude-Limit erreicht" } });
+    let o = await api("GET", "/api/asks/open");
+    ok(!o.data.asks.some((x) => x.id === h1 || x.id === h2), "both held", o.data);
+    // Ein Gerät ohne die Seitenänderung (älterer modified, alter Seitenstand) weckt nichts
+    const t0 = Date.now() / 1000, nHelper = helper.json().length;
+    await api("PUT", `/api/library/${hd}`, { json: { id: hd, title: "Gehalten", kind: "pdf", created: t0, modified: t0 + 1, pageCount: 5, pagesVersion: 0 } });
+    o = await api("GET", "/api/asks/open");
+    ok(!o.data.asks.some((x) => x.id === h1 || x.id === h2), "meta without a newer page state: still held", o.data);
+    // Der neue Seitenstand kommt (die App lädt ihn nach dem PDF hinauf)
+    await api("PUT", `/api/library/${hd}`, { json: { id: hd, title: "Gehalten", kind: "pdf", created: t0, modified: t0 + 2, pageCount: 6, pagesVersion: 200 } });
+    o = await api("GET", "/api/asks/open");
+    ok(o.data.asks.some((x) => x.id === h1) && !o.data.asks.some((x) => x.id === h2), "the question of the new page state is due at once, the one held for the limit is not", o.data);
+    await sleep(300);
+    ok(helper.json().slice(nHelper).filter((m) => m.type === "ask").length === 1, "helper told once", helper.json().slice(nHelper));
+    const mine = (await api("GET", `/api/doc/${hd}/asks`)).data.asks.find((x) => x.id === h1);
+    ok(mine.status === "open" && mine.note === "Das geänderte PDF ist noch nicht oben", "the app still sees it waiting until the helper takes it", mine);
+    // Eine weitere Seitenänderung ohne zurückgestellte Fragen sagt dem Helfer nichts
+    const nHelper2 = helper.json().length;
+    await api("PUT", `/api/library/${hd}`, { json: { id: hd, title: "Gehalten", kind: "pdf", created: t0, modified: t0 + 3, pageCount: 7, pagesVersion: 300 } });
+    await sleep(300);
+    ok(!helper.json().slice(nHelper2).some((m) => m.type === "ask"), "page change without held questions: helper not told", helper.json().slice(nHelper2));
+    // Kommt der Seitenstand zwischen Übernahme und Rückgabe, gibt es niemanden zu wecken: Die Rückgabe mit waitPv prüft selbst
+    const h3 = uuid();
+    await createAsk(hd, h3, { anchor: anchor(1), pv: 400 });
+    const k3 = await api("POST", `/api/asks/${h3}/claim`, { json: {} });
+    await api("PUT", `/api/library/${hd}`, { json: { id: hd, title: "Gehalten", kind: "pdf", created: t0, modified: t0 + 4, pageCount: 8, pagesVersion: 400 } });
+    await api("PUT", `/api/asks/${h3}/answer`, { json: { claim: k3.data.claim, release: true, retryAfter: 60, count: false, note: "Das geänderte PDF ist noch nicht oben", waitPv: 400 } });
+    o = await api("GET", "/api/asks/open");
+    ok(o.data.asks.some((x) => x.id === h3), "release waiting for a page state the doc already has: due at once", o.data);
+    // Wartet sie auf einen Seitenstand, den das Dokument noch nicht hat: bleibt zurückgestellt
+    const k3b = await api("POST", `/api/asks/${h3}/claim`, { json: {} });
+    await api("PUT", `/api/asks/${h3}/answer`, { json: { claim: k3b.data.claim, release: true, retryAfter: 60, count: false, waitPv: 500 } });
+    o = await api("GET", "/api/asks/open");
+    ok(!o.data.asks.some((x) => x.id === h3), "waiting for a newer page state: held", o.data);
+    for (const id of [h1, h2, h3]) await api("DELETE", `/api/doc/${hd}/asks/${id}`);
+  }
+
   // Aufräumen: Offene Fragen blieben sonst für den nächsten Lauf (oder den Helfer-Test) liegen
   for (const a of (await api("GET", `/api/doc/${doc}/asks`)).data.asks) await api("DELETE", `/api/doc/${doc}/asks/${a.id}`);
   r = await api("GET", "/api/asks/open");

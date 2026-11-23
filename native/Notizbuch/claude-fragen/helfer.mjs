@@ -41,6 +41,9 @@ const DEFAULTS = {
   // PDF-Auszüge), über so viele MB bringen, beginnt sie einen neuen Chat (sonst lädt der Mac bei jeder Antwort ein
   // Vielfaches davon hinauf). Ein kleines PDF, das jeder Chat ganz liest, zählt nicht mit. 0: jede Frage neu
   chatMB: 8,
+  // Kommt eine Frage zu einem PDF vor dem geänderten PDF an (pdfBehind): höchstens so lange darauf warten (Sekunden, seit
+  // die Frage am Server ist), dann mit dem PDF, das da ist. 0: nie warten
+  pdfWaitSeconds: 180,
   // Nach einem Fehler am Mac: neuer Versuch nach so vielen Sekunden; am Nutzungslimit mindestens so lange Pause
   retrySeconds: 60,
   minPauseSeconds: 60,
@@ -383,6 +386,24 @@ async function answer(ask) {
     } else if (vok) {
       result = await vokabelClaude(job, level);
     } else {
+      // Das PDF am Server ist noch vom Stand vor der Seitenänderung, nach der gefragt wurde (pdfBehind): erst ein
+      // wenig warten, anfangs 5 s, dann länger, höchstens pdfWaitSeconds, seit die Frage am Server ist (kommt der
+      // Seitenstand früher, weckt der Server den Helfer). Nicht, wenn die Seite der Frage gelöscht ist: Dann schneidet
+      // der Helfer nichts nach Seitennummern aus dem PDF
+      const now = Date.now() / 1000;
+      const age = typeof job.age === "number" ? job.age : now - Math.min(Number(job.created) || 0, now);
+      const most = typeof config.pdfWaitSeconds === "number" && config.pdfWaitSeconds >= 0
+        ? config.pdfWaitSeconds : DEFAULTS.pdfWaitSeconds;
+      if (job.anchor.page >= 0 && pdfBehind(job) && age < most) {
+        const wait = Math.ceil(Math.min(Math.max(5, age / 2), 60, most - age));
+        // waitPv: Kommt der Seitenstand an, bevor der Server diese Rückgabe hat, ist die Frage gleich wieder dran
+        await reply(ask.id, {
+          claim: job.claim, release: true, retryAfter: wait, count: false, note: "Das geänderte PDF ist noch nicht oben",
+          waitPv: Number(job.pv) || 0,
+        });
+        log(ask.id, `PDF am Server noch vor der letzten Seitenänderung, neuer Versuch in ${wait} s`);
+        return true;
+      }
       const dir = path.join(CHATS, job.doc.id);
       const files = await fetchFiles(job, dir);
       if (current.cancelled) return;
@@ -488,6 +509,13 @@ async function reply(id, body) {
 
 // ---------- Dateien für Claude ----------
 
+/// Ist die Frage von einem neueren Seitenstand als das PDF am Server? Fügt Mathias in einem PDF eine Seite ein oder
+/// löscht eine, lädt die App erst das neue PDF und danach den Seitenstand hinauf; eine Frage schickt sie, ohne darauf
+/// zu warten. Bis beides oben ist, hätte der Mac das alte PDF, dessen Seiten anders nummeriert sind als die der Frage
+function pdfBehind(job) {
+  return Boolean(job.doc.hasPDF) && (Number(job.pv) || 0) > (Number(job.doc.pagesVersion) || 0);
+}
+
 async function fetchFiles(job, dir) {
   const qdir = path.join(dir, "fragen", job.id);
   fs.mkdirSync(qdir, { recursive: true });
@@ -508,7 +536,11 @@ async function fetchFiles(job, dir) {
     saveState(state);
   }
   files.pdf = job.doc.hasPDF && fs.existsSync(pdf) ? "dokument.pdf" : null;
-  if (files.pdf && job.anchor.page >= 0) Object.assign(files, await pageWindow(job, pdf, qdir, dir));
+  // Das PDF am Server ist noch vor der Seitenänderung (länger gewartet, als pdfWaitSeconds erlaubt, oder die Seite
+  // der Frage ist gelöscht, dann wartet der Helfer nicht): das PDF, das da ist, aber kein Fenster daraus (es wäre um die
+  // falschen Seiten geschnitten), und Claude erfährt es
+  files.pdfOld = Boolean(files.pdf) && pdfBehind(job);
+  if (files.pdf && job.anchor.page >= 0 && !files.pdfOld) Object.assign(files, await pageWindow(job, pdf, qdir, dir));
   Object.assign(files, await contextPages(job, qdir, dir));
   return files;
 }
@@ -663,6 +695,7 @@ function filesSummary(job, files) {
   }
   if (files.window) parts.push(`PDF-Fenster ${files.first}–${files.last} von ${files.total}`);
   else if (files.pdf) parts.push(`ganzes PDF${files.total ? ` (${seiten(files.total)})` : ""}`);
+  if (files.pdfOld) parts.push("noch vom Stand vor der letzten Seitenänderung");
   return parts.join(", ");
 }
 
@@ -672,6 +705,8 @@ function filesSummary(job, files) {
 /// beim Fragen: Bis zur letzten davon gibt es Seiten, und ist es nur die Seite der Frage, hatte das Dokument nur sie
 function pageCount(job, files) {
   if (files.total) return files.total;
+  // Das PDF und die Zahl am Server sind noch vor der letzten Seitenänderung: lieber keine Zahl (außer der Bereich zeigt sie)
+  if (files.pdfOld) return files.span && files.span[0] === files.span[1] ? 1 : 0;
   if (files.span) return files.span[0] === files.span[1] ? 1 : Math.max(job.doc.pageCount || 0, files.span[1]);
   return Math.max(job.doc.pageCount || 0, job.anchor.page + 1);
 }
@@ -684,7 +719,7 @@ function prompt(job, files, fresh) {
   const total = count ? ` mit ${seiten(count)}` : "";
   if (fresh) {
     lines.push(`Dokument: „${job.doc.title || "ohne Titel"}“ (${kind}${total}).`);
-    if (files.pdf && !files.window) lines.push(`Das ganze Dokument liegt in ${files.pdf}.`);
+    if (files.pdf && !files.window) lines.push(`Das ${files.pdfOld ? "" : "ganze "}Dokument liegt in ${files.pdf}.`);
     if (files.window) {
       lines.push(`Das ganze Dokument liegt in ${files.pdf} (weitere Seiten mit Read und dem Parameter pages).`);
     }
@@ -707,6 +742,11 @@ function prompt(job, files, fresh) {
       : "wie sie in der App aussehen, jede oben mit ihrer Nummer beschriftet"));
   }
   lines.push(contextNote(job, files));
+  if (files.pdfOld) {
+    lines.push(`${files.pdf} ist noch der Stand vor der letzten Seitenänderung in der App (das neue PDF ist noch nicht ` +
+      "angekommen)" + (job.anchor.page >= 0
+      ? ": Seine Seitennummern können von denen hier abweichen. Es gelten die Seitennummern in dieser Nachricht." : "."));
+  }
   lines.push("");
   lines.push(
     job.effort === "thorough"
@@ -728,7 +768,8 @@ function questionBytes(dir, files, fresh, pdfChanged) {
     }
   };
   let bytes = size(files.question) + size(files.page) + size(files.window) + size(files.contextFile);
-  if (files.pdf && !files.window && files.total <= 10 && !fresh && pdfChanged) bytes += size(files.pdf);
+  // Ohne Fenster aus einem älteren PDF (pdfOld) ist seine Seitenzahl unbekannt: lieber mitzählen
+  if (files.pdf && !files.window && (files.total <= 10 || files.pdfOld) && !fresh && pdfChanged) bytes += size(files.pdf);
   return bytes;
 }
 

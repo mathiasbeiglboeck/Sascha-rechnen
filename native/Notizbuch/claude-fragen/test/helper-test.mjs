@@ -41,12 +41,13 @@ async function api(method, p, { json, body, headers } = {}) {
 }
 const PNG = () => { const b = new Uint8Array(1000); b.set([0x89, 0x50, 0x4e, 0x47]); return b; };
 const JPG = () => { const b = new Uint8Array(3000); b.set([0xff, 0xd8, 0xff, 0xe0]); return b; };
-// ctx: die Seiten um die Frage wie von der App ({ span, pages, bytes }: Bereich und beschriebene Seiten ab 0, das PDF)
+// ctx: die Seiten um die Frage wie von der App ({ span, pages, bytes }: Bereich und beschriebene Seiten ab 0, das PDF),
+// dazu wahlweise pv (Seitenstand der Frage) und created (Zeitpunkt des Fragens, Sekunden)
 const CTX_PDF = (n) => { const b = new Uint8Array(n); b.set([0x25, 0x50, 0x44, 0x46, 0x2d]); return b; };
 async function createAsk(doc, effort = "quick", page = 1, ctx = null) {
   const id = uuid();
   const f = new FormData();
-  f.append("meta", JSON.stringify({ anchor: { page, x: 10, y: 20, w: 100, h: 30 }, pv: 0, effort, created: Date.now() / 1000, from: "iPad", ...(ctx ? { span: ctx.span, pages: ctx.pages } : {}) }));
+  f.append("meta", JSON.stringify({ anchor: { page, x: 10, y: 20, w: 100, h: 30 }, pv: ctx?.pv || 0, effort, created: ctx?.created || Date.now() / 1000, from: "iPad", ...(ctx?.span ? { span: ctx.span, pages: ctx.pages } : {}) }));
   f.append("question", new Blob([PNG()], { type: "image/png" }), "question.png");
   f.append("page", new Blob([JPG()], { type: "image/jpeg" }), "page.jpg");
   if (ctx?.bytes) f.append("pages", new Blob([CTX_PDF(ctx.bytes)], { type: "application/pdf" }), "pages.pdf");
@@ -221,6 +222,37 @@ async function main() {
     ok(promptOf(c).startsWith("Dokument: „Lang“ (Notizbuch mit 20 Seiten).\n") && /\nVon Seite 1 bis 4 ist außer der Seite der Frage nichts geschrieben\./.test(promptOf(c)), "range ends before the server's last page: the server's 20", promptOf(c));
   }
 
+  console.log("== PDF changed in the app, the question arrives first: the helper waits for the new PDF");
+  {
+    const sk = uuid(), nowS = Date.now() / 1000;
+    await api("PUT", `/api/library/${sk}`, { json: { id: sk, title: "Skript", kind: "pdf", created: nowS, modified: nowS, pageCount: 3, pdfVersion: 1, pagesVersion: 100 } });
+    await api("PUT", `/api/pdf/${sk}`, { body: new TextEncoder().encode("%PDF-1.4\n" + "a".repeat(3000)), headers: { "content-type": "application/pdf" } });
+    const runs = calls().filter((x) => x.args).length;
+    // Die Uhr des iPads geht eine Stunde nach: Es zählt, seit wann die Frage am Server ist
+    a = await createAsk(sk, "quick", 3, { span: [0, 3], pages: [], pv: 200, created: Date.now() / 1000 - 3600 });
+    const held = await waitFor(async () => { const x = await askOf(sk, a.id); return x.status === "open" && x.note ? x : null; }, 10000, 50);
+    ok(held && held.note === "Das geänderte PDF ist noch nicht oben" && calls().filter((x) => x.args).length === runs && !fs.existsSync(path.join(HOME, "chats", sk, "dokument.pdf")), "released with a note, Claude not asked, old PDF not fetched", held);
+    ok(await waitFor(() => logText().includes(`${a.id} PDF am Server noch vor der letzten Seitenänderung, neuer Versuch in 5 s`), 3000, 20), "log: tries again in 5 s", logText().split("\n").slice(-3));
+    // Jetzt kommen das neue PDF und danach der Seitenstand, wie die App sie hinauflädt
+    const newer = new TextEncoder().encode("%PDF-1.4\n" + "b".repeat(4000));
+    await api("PUT", `/api/pdf/${sk}`, { body: newer, headers: { "content-type": "application/pdf" } });
+    const metaAt = Date.now();
+    await api("PUT", `/api/library/${sk}`, { json: { id: sk, title: "Skript", kind: "pdf", created: nowS, modified: nowS + 1, pageCount: 4, pdfVersion: 2, pagesVersion: 200 } });
+    const done = await waitFor(async () => { const x = await askOf(sk, a.id); return x.status === "answered" ? x : null; }, 20000, 50);
+    // Ohne Wecken käme der Helfer erst nach seinen 5 s (und 1 s für die Abfrage) wieder
+    ok(done && done.note === null && Date.now() - metaAt < 4000, `answered ${Date.now() - metaAt} ms after the page state arrived (the server wakes the helper), note gone`, done);
+    c = calls().filter((x) => x.args).at(-1);
+    ok(fs.statSync(path.join(HOME, "chats", sk, "dokument.pdf")).size === newer.length && /seiten-\d+-\d+\.pdf/.test(promptOf(c)) && !/vor der letzten Seitenänderung/.test(promptOf(c)), "Claude got the new PDF and its window, no warning", promptOf(c));
+    // Die Seite der Frage ist gelöscht (sie rückte auf -1): Dann wartet der Helfer nicht, Claude erfährt nur, dass das PDF älter ist
+    const cuts = calls().filter((x) => x.osascript).length;
+    a = await createAsk(sk, "quick", 1, { pv: 300 });
+    ok(await waitFor(async () => { const x = await askOf(sk, a.id); return x.status === "open" && x.note; }, 10000, 50), "held: page state 300 not at the server yet");
+    await api("PATCH", `/api/doc/${sk}/asks`, { json: { pv: 300, anchors: { [a.id]: { page: -1, x: 10, y: 20, w: 100, h: 30 } } } });
+    ok(await waitFor(async () => (await askOf(sk, a.id)).status === "answered", 15000), "page deleted meanwhile: answered at the next try, no more waiting");
+    c = calls().filter((x) => x.args).at(-1);
+    ok(promptOf(c).includes("\ndokument.pdf ist noch der Stand vor der letzten Seitenänderung in der App (das neue PDF ist noch nicht angekommen).\n") && !/Seitennummern/.test(promptOf(c)) && /seite\.jpg: die ganze Seite, die Frage/.test(promptOf(c)) && calls().filter((x) => x.osascript).length === cuts, "told the PDF is older, nothing about page numbers (there are none), no window", promptOf(c));
+  }
+
   console.log("== ∞ (question as JPEG: the printed question over the spot)");
   {
     const id = uuid();
@@ -352,13 +384,13 @@ async function main() {
   await sleep(1000);
   ok((await askOf(doc, a.id)).status === "open", "open while the helper is down");
   // its page is deleted meanwhile (undo still possible): page -1
-  const pm = await api("PATCH", `/api/doc/${doc}/asks`, { json: { pv: 5, anchors: { [a.id]: { page: -1, x: 10, y: 20, w: 100, h: 30 } } } });
+  const pm = await api("PATCH", `/api/doc/${doc}/asks`, { json: { pv: 0, anchors: { [a.id]: { page: -1, x: 10, y: 20, w: 100, h: 30 } } } });
   ok(pm.data.asks.find((x) => x.id === a.id).anchor.page === -1, "moved to page -1");
   const osaBefore = calls().filter((x) => x.osascript).length;
   startHelper();
   ok(await waitFor(async () => (await askOf(doc, a.id)).status === "answered", 15000), "answered after restart");
   c = calls().filter((x) => x.args).at(-1);
-  ok(/frage\.png: die handgeschriebene Frage\n- \S+seite\.jpg: die ganze Seite, die Frage/.test(promptOf(c)) && calls().filter((x) => x.osascript).length === osaBefore, "deleted page: whole page without number, no window", promptOf(c));
+  ok(/frage\.png: die handgeschriebene Frage\n- \S+seite\.jpg: die ganze Seite, die Frage/.test(promptOf(c)) && calls().filter((x) => x.osascript).length === osaBefore && !/vor der letzten Seitenänderung/.test(promptOf(c)), "deleted page: whole page without number, no window", promptOf(c));
   ok(/Seite gelöscht/.test(logText()), "log says the page was deleted");
 
   async function restartWith(fn, env) {
@@ -394,6 +426,20 @@ async function main() {
   ok(r.done && optOf(r.c, "--tools") === "Read" && !r.c.args.some((x) => /allowed/i.test(x)) && r.c.args.includes("--restricted") && r.c.args[r.c.args.indexOf("--permission-mode") + 1] === "dontAsk", "tools Read only, nothing pre-allowed", r.c.args);
   ok(/keine Links/.test(systemOf(r.c)) && !/Internet/.test(systemOf(r.c)), "system prompt without the internet", systemOf(r.c));
   ok(/Internet aus \(config\)/.test(logText()), "log says internet off by config");
+
+  console.log("== config pdfWaitSeconds: 0: a question to a changed PDF goes on at once, with the PDF there is");
+  await restartWith(() => { setHelp("new"); writeConfig({ pdfWaitSeconds: 0 }); });
+  {
+    const sk2 = uuid(), nowW = Date.now() / 1000;
+    await api("PUT", `/api/library/${sk2}`, { json: { id: sk2, title: "Skript 2", kind: "pdf", created: nowW, modified: nowW, pageCount: 20, pdfVersion: 1, pagesVersion: 100 } });
+    await api("PUT", `/api/pdf/${sk2}`, { body: new TextEncoder().encode("%PDF-1.4\n" + "c".repeat(3000)), headers: { "content-type": "application/pdf" } });
+    const cuts = calls().filter((x) => x.osascript).length;
+    const w = await createAsk(sk2, "quick", 9, { span: [6, 10], pages: [], pv: 300 });
+    ok(await waitFor(async () => (await askOf(sk2, w.id)).status === "answered", 15000), "answered at once");
+    const cw = calls().filter((x) => x.args).at(-1);
+    ok(promptOf(cw).startsWith("Dokument: „Skript 2“ (PDF).\nDas Dokument liegt in dokument.pdf.\n") && promptOf(cw).includes("\nVon Seite 7 bis 11 gibt es Notizen aus der App nur auf der Seite der Frage; dokument.pdf zeigt das PDF ohne die Notizen aus der App. Notizen auf weiter entfernten Seiten siehst du zu dieser Frage nicht.\ndokument.pdf ist noch der Stand vor der letzten Seitenänderung in der App (das neue PDF ist noch nicht angekommen): Seine Seitennummern können von denen hier abweichen. Es gelten die Seitennummern in dieser Nachricht.\n") && !/seiten-\d+-\d+\.pdf/.test(promptOf(cw)) && calls().filter((x) => x.osascript).length === cuts, "old PDF: no page count, not „das ganze“, no window cut from it, Claude is told", promptOf(cw));
+    ok(logText().includes(`${w.id} Unterlagen: Nachbarseiten keine beschrieben (Bereich 7–11), ganzes PDF, noch vom Stand vor der letzten Seitenänderung`), "log says so", logText().split("\n").filter((l) => l.includes("Unterlagen")).slice(-1));
+  }
 
   console.log("== denied tools are logged with the answer");
   setMode({ mode: "denied" });

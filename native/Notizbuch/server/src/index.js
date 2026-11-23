@@ -295,8 +295,21 @@ export class Store extends DurableObject {
       // Mit dem neuen Seitenstand: Wer ihn schon hat (das Gerät, das die Seiten geändert hat), muss nichts tun
       const pagesVersion = Number(result.pagesVersion) || 0, pdfVersion = Number(result.pdfVersion) || 0;
       this.broadcast(id, { type: "pages", pagesVersion, pdfVersion });
+      this.wakeHeldAsks(id, Number(before.pagesVersion) || 0, pagesVersion);
     }
     return result;
+  }
+
+  /// Der Helfer stellt eine Frage zurück, wenn sie von einem neueren Seitenstand ist als das Dokument hier: Die App lädt
+  /// nach einer Seitenänderung erst das neue PDF und dann den Seitenstand hinauf, schickt Fragen aber, ohne darauf zu
+  /// warten. Kommt der Seitenstand (von `from` auf `to`), sind solche Fragen gleich wieder dran, und der Helfer erfährt es
+  wakeHeldAsks(doc, from, to) {
+    if (!(to > from)) return;
+    const now = Date.now() / 1000;
+    const where = "doc = ? AND status = 'open' AND lease > ? AND pv > ? AND pv <= ?";
+    if (!this.sql.exec(`SELECT 1 FROM asks WHERE ${where} LIMIT 1`, doc, now, from, to).toArray().length) return;
+    this.sql.exec(`UPDATE asks SET lease = ? WHERE ${where}`, now, doc, now, from, to);
+    this.broadcast(null, { type: "ask" }, "helper");
   }
 
   /// body: { since, add: [{ id, data }], remove: [id] }  →  { seq, changes: [{ id, data | null }] }
@@ -593,6 +606,8 @@ export class Store extends DurableObject {
       if (context?.bytes) this.writeBlob(`ask/${askId}/pages`, context.bytes, "application/pdf");
       v = this.nextAsksV();
       const info = askInfo(doc, meta);
+      // Wann die Frage hier ankam (die Uhr des Geräts kann falsch gehen, und es kann sie lange zurückgehalten haben)
+      info.arrived = now;
       // Mit Seitenstand und Seite der Frage: Rücken danach Seiten, passen die Nummern nicht mehr
       if (context) Object.assign(info, { span: context.span, pages: context.pages, spanPv: pv, spanPage: anchor.page });
       this.sql.exec(
@@ -815,6 +830,8 @@ export class Store extends DurableObject {
     return json({
       id: askId, claim, leaseUntil: now + lease, anchor, pv: row.pv, effort: row.effort,
       created: row.created, from: info.from || null,
+      // Seit wie vielen Sekunden die Frage am Server liegt (ältere Fragen: seit dem Fragen auf dem Gerät)
+      age: Math.max(0, now - (Number(info.arrived) || Number(row.created) || now)),
       ...(row.doc === KARTEN_DOC ? { karten: { hinweis: info.hinweis || null } } : {}),
       ...(row.doc === LERN_DOC ? { lern: { wort: info.wort, satz: info.satz || null, versuch: info.versuch || 1, gelesen: info.gelesen || null } } : {}),
       doc: {
@@ -851,7 +868,14 @@ export class Store extends DurableObject {
     if (row.status === "answered" || row.status === "failed") return json({ ok: true, v: row.v });
     if (body.release) {
       const now = Date.now() / 1000;
-      const retryAfter = Math.min(Math.max(Number(body.retryAfter) || 0, 0), 86400);
+      let retryAfter = Math.min(Math.max(Number(body.retryAfter) || 0, 0), 86400);
+      // Der Helfer wartet auf den Seitenstand waitPv (das geänderte PDF, siehe wakeHeldAsks). Kam er zwischen seiner
+      // Übernahme und dieser Rückgabe an, weckt ihn nichts mehr: dann gleich wieder dran
+      const waitPv = Number(body.waitPv) || 0;
+      if (waitPv > 0) {
+        const d = this.sql.exec("SELECT meta FROM docs WHERE id = ?", row.doc).toArray()[0];
+        if (d && (Number(JSON.parse(d.meta).pagesVersion) || 0) >= waitPv) retryAfter = 0;
+      }
       // Gibt ein Helfer dieselbe Frage immer wieder gleich zurück (etwa nach einem Fehler am Mac), zählt das wie eine
       // abgelaufene Frist: Nach MAX_ASK_RETRIES gibt der Server auf, statt sie endlos kreisen zu lassen (jede Runde
       // schreibt Zeilen). Nicht bei langen Pausen und nicht bei count: false (der Helfer sagt, es liegt nicht an
