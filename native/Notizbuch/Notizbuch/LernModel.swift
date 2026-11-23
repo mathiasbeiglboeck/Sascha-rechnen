@@ -323,6 +323,10 @@ final class LernModel: ObservableObject {
     @Published private(set) var sterne: Double = 0
     @Published private(set) var ersteVersuche: [String: String] = [:]
     @Published var drawing = PKDrawing()
+    /// Tipp-Modus: was Sascha auf der Lern-Tastatur getippt hat
+    @Published private(set) var getippt = ""
+    /// Großschreibtaste: gilt für den nächsten Buchstaben
+    @Published var gross = false
     /// Was bei „richtig“ dasteht (und gesprochen wird)
     @Published private(set) var lobText = ""
     /// Was der Mac zuletzt gelesen hat (für die Auflösung)
@@ -474,6 +478,8 @@ final class LernModel: ObservableObject {
         versuch = 1
         gelesen = []
         drawing = PKDrawing()
+        getippt = ""
+        gross = false
         phase = .schreiben
         if let w = aktuell { sprecher.diktiere(w) }
     }
@@ -515,6 +521,47 @@ final class LernModel: ObservableObject {
                 self.sprecher.sprich(["So schreibt man es. Vergleiche selbst."], langsam: false)
             }
         }
+    }
+
+    // MARK: Tastatur
+    //
+    // Statt mit dem Stift tippt Sascha auf einer vereinfachten Tastatur. Das Getippte ist genau, der Mac muss nichts
+    // lesen: „Fertig“ prüft sofort. Weicht es ab, holt der Mac im Hintergrund den Tipp zur Regel wie beim Schreiben
+
+    /// Schalter auf der Startseite: mit der Tastatur statt mit dem Stift
+    static let tastaturKey = "lernTastatur"
+
+    func tippe(_ zeichen: String) {
+        guard phase == .schreiben, getippt.count < 40 else { return }
+        // ß hat keinen Großbuchstaben („SS“ wäre ein anderes Wort)
+        getippt += gross && zeichen != "ß" ? zeichen.uppercased() : zeichen
+        gross = false
+    }
+
+    func loesche() {
+        guard phase == .schreiben, !getippt.isEmpty else { return }
+        getippt.removeLast()
+    }
+
+    func allesWeg() {
+        guard phase == .schreiben else { return }
+        getippt = ""
+        gross = false
+    }
+
+    #if DEBUG
+    func setzeGetippt(_ s: String) { getippt = s }
+    #endif
+
+    /// „Fertig“ im Tipp-Modus
+    func fertigGetippt() {
+        let text = lernNorm(getippt)
+        guard let w = aktuell, phase == .schreiben, !text.isEmpty else { return }
+        gross = false
+        let a = LernAntwort(gelesen: text, richtig: lernNorm(text) == lernNorm(w.wort), hinweis: nil)
+        // Der Tipp braucht ein Bild für die Frage am Server: das Getippte als Bild
+        if let png = LernView.textBild(text) { holeTipp(a, bild: png, wort: w) }
+        bestaetigt(a)
     }
 
     // MARK: Vorab lesen
@@ -640,6 +687,8 @@ final class LernModel: ObservableObject {
         vorabVerwerfen()
         versuch = 2
         drawing = PKDrawing()
+        getippt = ""
+        gross = false
         phase = .schreiben
         if let w = aktuell { sprecher.diktiere(w) }
     }

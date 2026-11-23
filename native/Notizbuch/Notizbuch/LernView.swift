@@ -12,6 +12,8 @@ struct LernView: View {
     @State private var statistik = false
     /// Vorsprechen: nur das Wort (Standard) oder Wort, Beispielsatz, Wort
     @AppStorage(Sprecher.mitSatzKey) private var mitSatz = false
+    /// Mit der Lern-Tastatur tippen statt mit dem Stift schreiben
+    @AppStorage(LernModel.tastaturKey) private var tastatur = false
 
     init(sync: SyncEngine) {
         _model = StateObject(wrappedValue: LernModel(sync: sync))
@@ -76,6 +78,11 @@ struct LernView: View {
         }
         if has("fertig") { abgeben() }
         if has("radierer") { radierer.toggle() }
+        if let v = items.first(where: { $0.name == "tastatur" })?.value { tastatur = v == "1" }
+        if let v = items.first(where: { $0.name == "tippe" })?.value { model.setzeGetippt(v) }
+        if let v = items.first(where: { $0.name == "taste" })?.value {
+            if v == "gross" { model.gross.toggle() } else if v == "loesche" { model.loesche() } else { model.tippe(v) }
+        }
         if has("statistik") { statistik = true }
         if has("zu") { statistik = false; bearbeiten = false }
         if has("ja"), case .bestaetigen(let a) = model.phase { model.bestaetigt(a) }
@@ -84,7 +91,8 @@ struct LernView: View {
         if has("nochmal") { model.nochmalVersuchen() }
         if let v = items.first(where: { $0.name == "selbst" })?.value { model.selbstGeprueft(richtig: v == "1") }
         if has("ende") { model.beenden() }
-        NSLog("Lern-Debug: vorab=%d radierer=%d", model.vorabAnzahl, radierer ? 1 : 0)
+        NSLog("Lern-Debug: vorab=%d radierer=%d tastatur=%d getippt=%@ gross=%d", model.vorabAnzahl, radierer ? 1 : 0,
+              tastatur ? 1 : 0, model.getippt, model.gross ? 1 : 0)
         let heute = LernStatistik.zahlen(model.log, ab: Calendar.current.startOfDay(for: Date()))
         let alle = LernStatistik.zahlen(model.log)
         NSLog("Lern-Debug: reihenfolge=%@", model.reihenfolge.map(\.wort).joined(separator: ","))
@@ -122,6 +130,12 @@ struct LernView: View {
                             rundenKnopf(5)
                             rundenKnopf(10)
                         }
+                        Picker("Schreiben mit", selection: $tastatur) {
+                            Label("Mit dem Stift", systemImage: "pencil").tag(false)
+                            Label("Mit der Tastatur", systemImage: "keyboard").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 360)
                         Toggle(isOn: $mitSatz) {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Mit Beispielsatz vorsprechen").font(.headline)
@@ -216,38 +230,11 @@ struct LernView: View {
             .tint(Self.blau)
 
             if model.phase == .schreiben {
-                Text(model.versuch > 1 ? "Zweiter Versuch – du schaffst das!" : "Schreib nur das eine Wort.")
+                Text(model.versuch > 1 ? "Zweiter Versuch – du schaffst das!" : tastatur ? "Tippe nur das eine Wort." : "Schreib nur das eine Wort.")
                     .font(.headline).foregroundStyle(model.versuch > 1 ? Self.blau : .secondary)
             }
 
-            LernCanvas(drawing: $model.drawing, radierer: radierer, aktiv: model.phase == .schreiben)
-                .onChange(of: model.drawing) { _, _ in model.zeichnungGeaendert() }
-                .frame(height: 300)
-                .background(Linien())
-                .clipShape(RoundedRectangle(cornerRadius: 16))
-                .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.black.opacity(0.12)))
-                .padding(.horizontal)
-
-            if model.phase == .schreiben {
-                HStack(spacing: 14) {
-                    Button { radierer.toggle() } label: {
-                        Label(radierer ? "Stift" : "Radierer", systemImage: radierer ? "pencil" : "eraser")
-                    }
-                    .buttonStyle(.bordered)
-                    Button { model.drawing = PKDrawing(); radierer = false } label: {
-                        Label("Alles weg", systemImage: "trash")
-                    }
-                    .buttonStyle(.bordered)
-                    Spacer()
-                    Button { abgeben() } label: {
-                        Label("Fertig", systemImage: "checkmark").font(.title2.weight(.bold)).padding(.horizontal, 10)
-                    }
-                    .buttonStyle(.borderedProminent).tint(Self.gruen)
-                    .disabled(model.drawing.strokes.isEmpty)
-                }
-                .font(.title3)
-                .padding(.horizontal)
-            }
+            if tastatur { tippen } else { schreiben }
 
             karte.padding(.horizontal)
             Spacer(minLength: 0)
@@ -255,8 +242,82 @@ struct LernView: View {
         .padding(.vertical)
     }
 
+    /// Tipp-Modus: das Getippte groß auf den Heftlinien, darunter die Lern-Tastatur
+    @ViewBuilder private var tippen: some View {
+        let aktiv = model.phase == .schreiben
+        HStack(spacing: 2) {
+            Text(model.getippt.isEmpty ? " " : model.getippt)
+                .font(.system(size: 56, weight: .medium, design: .rounded))
+                .lineLimit(1)
+                .minimumScaleFactor(0.4)
+            if aktiv { Schreibmarke() }
+        }
+        .padding(.horizontal, 28)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: 165)
+        .background(Linien())
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.black.opacity(0.12)))
+        .padding(.horizontal)
+
+        if aktiv {
+            LernTastatur(model: model,
+                         leertaste: model.aktiveWoerter.contains { $0.wort.contains(" ") },
+                         bindestrich: model.aktiveWoerter.contains { $0.wort.contains("-") })
+                .padding(.horizontal)
+            HStack(spacing: 14) {
+                Button { model.allesWeg() } label: { Label("Alles weg", systemImage: "trash") }
+                    .buttonStyle(.bordered)
+                Spacer()
+                Button { abgeben() } label: {
+                    Label("Fertig", systemImage: "checkmark").font(.title2.weight(.bold)).padding(.horizontal, 10)
+                }
+                .buttonStyle(.borderedProminent).tint(Self.gruen)
+                .disabled(lernNorm(model.getippt).isEmpty)
+            }
+            .font(.title3)
+            .padding(.horizontal)
+        }
+    }
+
+    /// Stift-Modus: Schreibfläche mit Radierer
+    @ViewBuilder private var schreiben: some View {
+        LernCanvas(drawing: $model.drawing, radierer: radierer, aktiv: model.phase == .schreiben)
+            .onChange(of: model.drawing) { _, _ in model.zeichnungGeaendert() }
+            .frame(height: 300)
+            .background(Linien())
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.black.opacity(0.12)))
+            .padding(.horizontal)
+
+        if model.phase == .schreiben {
+            HStack(spacing: 14) {
+                Button { radierer.toggle() } label: {
+                    Label(radierer ? "Stift" : "Radierer", systemImage: radierer ? "pencil" : "eraser")
+                }
+                .buttonStyle(.bordered)
+                Button { model.drawing = PKDrawing(); radierer = false } label: {
+                    Label("Alles weg", systemImage: "trash")
+                }
+                .buttonStyle(.bordered)
+                Spacer()
+                Button { abgeben() } label: {
+                    Label("Fertig", systemImage: "checkmark").font(.title2.weight(.bold)).padding(.horizontal, 10)
+                }
+                .buttonStyle(.borderedProminent).tint(Self.gruen)
+                .disabled(model.drawing.strokes.isEmpty)
+            }
+            .font(.title3)
+            .padding(.horizontal)
+        }
+    }
+
     private func abgeben() {
         radierer = false
+        if tastatur {
+            model.fertigGetippt()
+            return
+        }
         guard let png = Self.bild(model.drawing) else { return }
         model.fertig(image: png)
     }
@@ -447,6 +508,122 @@ struct LernView: View {
             ink.draw(in: CGRect(origin: .zero, size: b.size))
         }
         return img.pngData()
+    }
+}
+
+extension LernView {
+    /// Getipptes als PNG (für die Frage nach dem Tipp am Server, die ein Bild braucht)
+    static func textBild(_ text: String) -> Data? {
+        let font = UIFont.systemFont(ofSize: 64, weight: .medium)
+        let attr = NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: UIColor.black])
+        let b = attr.boundingRect(with: CGSize(width: 4000, height: 200), options: [.usesLineFragmentOrigin], context: nil)
+        let size = CGSize(width: ceil(b.width) + 48, height: ceil(b.height) + 48)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let img = UIGraphicsImageRenderer(size: size, format: format).image { ctx in
+            UIColor.white.setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+            attr.draw(at: CGPoint(x: 24, y: 24))
+        }
+        return img.pngData()
+    }
+}
+
+/// Blinkende Schreibmarke hinter dem Getippten
+private struct Schreibmarke: View {
+    @State private var an = true
+    var body: some View {
+        Rectangle()
+            .fill(LernView.blau)
+            .frame(width: 3, height: 54)
+            .opacity(an ? 1 : 0)
+            .onAppear { withAnimation(.easeInOut(duration: 0.55).repeatForever()) { an = false } }
+    }
+}
+
+/// Vereinfachte Tastatur wie eine echte deutsche (QWERTZ), aber nur mit den Tasten, die es für die Lernwörter
+/// braucht: Buchstaben, Umlaute, ß, Großschreibtaste, Löschen; Leertaste und Bindestrich nur, wenn ein Wort der Liste
+/// sie braucht. Die Großschreibtaste gilt für den nächsten Buchstaben, groß schreiben muss Sascha selbst
+struct LernTastatur: View {
+    @ObservedObject var model: LernModel
+    var leertaste: Bool
+    var bindestrich: Bool
+
+    private static let reihe1 = ["q", "w", "e", "r", "t", "z", "u", "i", "o", "p", "ü", "ß"]
+    private static let reihe2 = ["a", "s", "d", "f", "g", "h", "j", "k", "l", "ö", "ä"]
+    private static let reihe3 = ["y", "x", "c", "v", "b", "n", "m"]
+    private static let abstand: CGFloat = 7
+    private static let hoehe: CGFloat = 62
+
+    var body: some View {
+        GeometryReader { g in
+            let b = min(78, (g.size.width - 11 * Self.abstand) / 12)
+            VStack(spacing: Self.abstand) {
+                HStack(spacing: Self.abstand) {
+                    ForEach(Self.reihe1, id: \.self) { buchstabe($0, b) }
+                }
+                HStack(spacing: Self.abstand) {
+                    ForEach(Self.reihe2, id: \.self) { buchstabe($0, b) }
+                }
+                HStack(spacing: Self.abstand) {
+                    grossTaste(b)
+                    ForEach(Self.reihe3, id: \.self) { buchstabe($0, b) }
+                    if bindestrich { taste("-", breite: b) { model.tippe("-") } }
+                    loeschTaste(b)
+                }
+                if leertaste {
+                    taste("Leertaste", breite: b * 5, schrift: .title3.weight(.medium)) { model.tippe(" ") }
+                }
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .frame(height: Self.hoehe * (leertaste ? 4 : 3) + Self.abstand * (leertaste ? 3 : 2))
+    }
+
+    private func buchstabe(_ b: String, _ breite: CGFloat) -> some View {
+        let anzeige = model.gross && b != "ß" ? b.uppercased() : b
+        return taste(anzeige, breite: breite) { model.tippe(b) }
+    }
+
+    private func grossTaste(_ b: CGFloat) -> some View {
+        Button { model.gross.toggle() } label: {
+            Image(systemName: model.gross ? "shift.fill" : "shift")
+                .font(.title2.weight(.semibold))
+                .frame(width: b * 1.5, height: Self.hoehe)
+        }
+        .buttonStyle(TastenStil(an: model.gross))
+        .accessibilityLabel("Großschreiben")
+    }
+
+    private func loeschTaste(_ b: CGFloat) -> some View {
+        Button { model.loesche() } label: {
+            Image(systemName: "delete.left")
+                .font(.title2.weight(.semibold))
+                .frame(width: b * 1.5, height: Self.hoehe)
+        }
+        .buttonStyle(TastenStil(an: false))
+        .accessibilityLabel("Löschen")
+    }
+
+    private func taste(_ text: String, breite: CGFloat, schrift: Font = .system(size: 30, weight: .medium, design: .rounded),
+                       _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(text).font(schrift).frame(width: breite, height: Self.hoehe)
+        }
+        .buttonStyle(TastenStil(an: false))
+    }
+}
+
+/// Taste: weiß mit Schatten, gedrückt grau; die Großschreibtaste blau, solange sie gilt
+private struct TastenStil: ButtonStyle {
+    var an: Bool
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(an ? Color.white : Color.primary)
+            .background(an ? LernView.blau : configuration.isPressed ? Color(white: 0.82) : Color.white,
+                        in: RoundedRectangle(cornerRadius: 10))
+            .shadow(color: .black.opacity(0.18), radius: 0, y: 1.5)
     }
 }
 
