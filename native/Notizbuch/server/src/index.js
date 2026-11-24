@@ -207,6 +207,8 @@ export class Store extends DurableObject {
       if (area === "library" && id && method === "PUT") return json(this.putMeta(id, await request.json()));
 
       if (area === "doc" && id && sub === "sync" && method === "POST") return json(this.syncDoc(id, await request.json()));
+      // Der Helfer am Mac liest die Striche eines Dokuments in Stücken nach (nur lesen, siehe strokesPage)
+      if (area === "doc" && id && sub === "strokes" && method === "GET") return json(this.strokesPage(id, url.searchParams));
 
       if (area === "pdf" && id && method === "PUT") {
         const bytes = await request.arrayBuffer();
@@ -363,6 +365,61 @@ export class Store extends DurableObject {
     this.broadcast(doc, { type: "changes", changes: [], seq: last }, `app:${doc}`);
     // Browser bekommen die Striche mit (nach einer Seitenänderung sind es alle Striche darunter auf einmal)
     inParts(changes, (part) => this.broadcast(doc, { type: "changes", changes: part }, `guest:${doc}`));
+  }
+
+  /// ?since=N&limit=L&lite=1  →  { top, low, last, more, meta, changes: [{ id, seq, data | null }] }
+  /// Für den Helfer am Mac: die Striche eines Dokuments nach Nummer N, in Stücken (er zeichnet daraus weitere Seiten zum
+  /// Nachlesen). Nur lesen: schreibt nichts, zählt keine Nummer hoch, meldet nichts über die WebSockets, ändert keine
+  /// Metadaten. Liest die zurückgegebenen Zeilen und höchstens vier weitere (höchste und niedrigste Nummer, Metadaten,
+  /// die erste Zeile, die nicht mehr mitkommt), an der Zeichengrenze fünf (der Zeiger liest eine Zeile voraus). top und
+  /// low: höchste und niedrigste Nummer des Dokuments (0 ohne Striche). Ist N > 0 und low größer als N (oder top kleiner
+  /// als N), wurden seine Striche seit N gelöscht (Dokument gelöscht, dann neu angelegt oder zurückgeholt): Nur dabei
+  /// verschwinden Zeilen, und die Nummern zählen über alle Dokumente. Dann alles ab 0 neu holen.
+  /// Höchstens L Zeilen (1 bis 1000, ohne Angabe 500), deren data zusammen höchstens 1.000.000 Zeichen hat, aber immer
+  /// mindestens eine; more: Es fehlen noch welche, weiter ab last (Nummer der letzten, ohne Zeilen N). meta: was der
+  /// Helfer von den Metadaten braucht, null für ein unbekanntes Dokument. Ist since oder limit keine Zahl (oder 0), gilt
+  /// die Vorgabe, sonst kommt sie in den erlaubten Bereich
+  strokesPage(doc, params) {
+    const MAX_CHARS = 1000000;
+    const since = Math.min(Math.max(Math.trunc(Number(params.get("since"))) || 0, 0), Number.MAX_SAFE_INTEGER);
+    const limit = Math.min(Math.max(Math.trunc(Number(params.get("limit"))) || 500, 1), 1000);
+    // lite=1: ohne das PencilKit-Original pk (Base64, der Großteil der Daten), über den Schlüssel gesucht: Der Browser
+    // hängt dx und dy dahinter an (shifted in viewer.html). Es fällt samt einem Komma daneben weg; Base64 und Swifts \/
+    // enthalten kein Anführungszeichen. Sieht der Strich anders aus, bleibt er, wie er ist
+    const lite = params.get("lite") === "1";
+    const withoutPK = (s) => {
+      const i = s.indexOf('"pk":"'), j = i < 0 ? -1 : s.indexOf('"', i + 6);
+      if (j < 0 || s[j - 1] === "\\") return s;
+      if (s[i - 1] === "," && (s[j + 1] === "," || s[j + 1] === "}")) return s.slice(0, i - 1) + s.slice(j + 1);
+      if (s[i - 1] === "{" && s[j + 1] === ",") return s.slice(0, i) + s.slice(j + 2);
+      return s;
+    };
+    const top = this.sql.exec("SELECT MAX(seq) AS m FROM strokes WHERE doc = ?", doc).one().m || 0;
+    // Eigene Abfrage: Über den Index liest MIN wie MAX je eine Zeile, beide in einer Abfrage lesen alle Zeilen
+    const low = this.sql.exec("SELECT MIN(seq) AS m FROM strokes WHERE doc = ?", doc).one().m || 0;
+    const row = this.sql.exec("SELECT meta FROM docs WHERE id = ?", doc).toArray()[0];
+    const m = row ? JSON.parse(row.meta) : null;
+    const meta = m && {
+      kind: m.kind || "notebook", pageCount: Number(m.pageCount) || 0, pagesVersion: Number(m.pagesVersion) || 0,
+      pdfVersion: Number(m.pdfVersion) || 0, layoutVersion: Number(m.layoutVersion) || null, deleted: !!m.deleted,
+    };
+    // Eine Zeile mehr als erlaubt zeigt, ob noch welche fehlen. Gelesen wird nur, was die Schleife abholt (und eine
+    // Zeile voraus)
+    const changes = [];
+    let chars = 0, more = false;
+    for (const r of this.sql.exec(
+      "SELECT id, data, alive, seq FROM strokes WHERE doc = ? AND seq > ? ORDER BY seq LIMIT ?", doc, since, limit + 1,
+    )) {
+      const data = r.alive ? (lite && typeof r.data === "string" ? withoutPK(r.data) : r.data) : null;
+      const n = data ? data.length : 0;
+      if (changes.length === limit || (changes.length && chars + n > MAX_CHARS)) {
+        more = true;
+        break;
+      }
+      changes.push({ id: r.id, seq: r.seq, data });
+      chars += n;
+    }
+    return { top, low, last: changes.length ? changes[changes.length - 1].seq : since, more, meta, changes };
   }
 
   /// Was ein Gast seit seinem Stand `since` verpasst hat (über den Index, nur die Zeilen danach). Haben sich

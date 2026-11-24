@@ -1,10 +1,18 @@
 #!/usr/bin/env node
 // Ersatz für claude in Tests des Helfers: schreibt jeden Aufruf nach $FAKE_STATE/calls.jsonl und antwortet je nach
 // $FAKE_STATE/mode.json ({"mode": "ok" | "rich" | "denied" | "limit" | "limit-old" | "error" | "auth" | "authexpired" |
-// "refreshlock" | "maxturns" | "huge" | "toobig", "delayMs": …}). "rich" antwortet mit Formeln, Liste, Code und Quellen
-// (Links), zum Ansehen der Karte in der App; "denied" antwortet, meldet aber abgelehnte Werkzeuge; "toobig" scheitert nur
-// beim Fortsetzen eines Chats (--resume) mit mode.message (Standard „Prompt is too long“), ein neuer Chat antwortet.
-// `claude auth status` sagt angemeldet (Exit 0), wenn $FAKE_STATE/auth.json {"loggedIn": true} enthält
+// "refreshlock" | "maxturns" | "noresult" | "huge" | "toobig", "delayMs": …}). "rich" antwortet mit Formeln, Liste, Code
+// und Quellen (Links), zum Ansehen der Karte in der App; "denied" antwortet, meldet aber abgelehnte Werkzeuge; "toobig"
+// scheitert nur beim Fortsetzen eines Chats (--resume) mit mode.message (Standard „Prompt is too long“), ein neuer Chat
+// antwortet; "noresult" hört ohne Zeile result und ohne Meldung auf (wie abgestürzt).
+// `claude auth status` sagt angemeldet (Exit 0), wenn $FAKE_STATE/auth.json {"loggedIn": true} enthält.
+// Fragen mit --output-format stream-json: erst eine Zeile system/init, dann je gelesener Datei ein Read (assistant mit
+// tool_use, absolute Pfade, mehrere auf einmal in einer Zeile) und sein Ergebnis (user mit tool_result, is_error bei einer
+// fehlenden Datei), zuletzt result. Was gelesen wird, steht in mode.json: "readWeitere": [3, 9] (weitere/seite-3.pdf …
+// neben der Frage), "readDokument": "4-6" (dokument.pdf mit pages), "readFail": [9] (diese weiteren Seiten scheitern, wie
+// eine zu große Datei); "bigLines": n und "bigLineMB": m schicken davor n
+// Ergebnis-Zeilen von je m MB (wie Base64 eines großen PDFs). Jeder Aufruf hält in calls.jsonl auch fest, was in
+// weitere/ neben der Frage liegt (Name, Größe, nlink, Verweis), sonst null
 const fs = require("fs"), path = require("path");
 const DIR = process.env.FAKE_STATE || path.join(require("os").tmpdir(), "betternotes-fake");
 fs.mkdirSync(DIR, { recursive: true });
@@ -17,11 +25,14 @@ if (args[0] === "auth" && args[1] === "status") {
   process.exit(a.loggedIn ? 0 : 1);
 }
 if (args[0] === "--help") {
-  // help.json: { "version": "new" | "old" } – new lists --restricted and dontAsk, old neither
+  // help.json: { "version": "new" | "old", "stream": false } – new lists --restricted and dontAsk, old neither; both
+  // know stream-json, unless stream is false
   let h = { version: "new" };
   try { h = JSON.parse(fs.readFileSync(path.join(DIR, "help.json"), "utf8")); } catch {}
   fs.appendFileSync(path.join(DIR, "calls.jsonl"), JSON.stringify({ help: h.version, envKeys: Object.keys(process.env).filter((k) => /NOTIZBUCH|BETTERNOTES/i.test(k)) }) + "\n");
   const lines = ["Usage: claude [options] [command] [prompt]", "  -p, --print   Print response and exit"];
+  lines.push(h.stream === false ? '  --output-format <format>  Output format (only works with --print): "text" (default) or "json"'
+    : '  --output-format <format>  Output format (only works with --print): "text" (default), "json" (single result), or "stream-json" (realtime streaming) (choices: "text", "json", "stream-json")');
   if (h.version === "new") {
     lines.push('  --permission-mode <mode>  Permission mode (choices: "acceptEdits", "bypassPermissions", "default", "dontAsk", "plan")');
     lines.push("  --restricted   Restrict file tools to the working directories");
@@ -46,9 +57,20 @@ const streamText = stdinMsg?.message?.content?.find?.((c) => c.type === "text")?
 const streamImage = stdinMsg?.message?.content?.find?.((c) => c.type === "image");
 const pArg = get("-p");
 const prompt = (pArg && !pArg.startsWith("--") ? pArg : "") || streamText || "";
-const files = [...prompt.matchAll(/(fragen\/[^\s:]+|dokument\.pdf)/g)].map((m) => m[1]);
+// Dateien, die die Nachricht nennt (ohne den Platzhalter seite-<Nummer>.pdf der weiteren Seiten)
+const files = [...prompt.matchAll(/(fragen\/[^\s:]+|dokument\.pdf)/g)].map((m) => m[1]).filter((f) => !f.includes("<"));
 const sizes = Object.fromEntries(files.map((f) => [f, fs.existsSync(f) ? fs.statSync(f).size : -1]));
-const rec = { t: Date.now(), args, stream: !!stdinMsg, imageBytes: streamImage ? Buffer.from(streamImage.source.data, "base64").length : 0, streamPrompt: streamText || null, cwd: process.cwd(), envKeys: Object.keys(process.env).filter((k) => /NOTIZBUCH|BETTERNOTES/i.test(k)), stdinTTY: process.stdin.isTTY || false, mode: mode.mode, sizes, pid: process.pid };
+// Der Ordner der Frage (aus dem Bild der Frage in der Nachricht) und was in weitere/ daneben liegt
+const qdir = (prompt.match(/(fragen\/[^\s:/]+)\/frage\.(?:png|jpg)/) || [])[1] || null;
+const weitereDir = qdir ? path.join(process.cwd(), qdir, "weitere") : null;
+let weitere = null;
+try {
+  weitere = fs.readdirSync(weitereDir).sort().map((name) => {
+    const st = fs.lstatSync(path.join(weitereDir, name));
+    return { name, size: st.size, nlink: st.nlink, symlink: st.isSymbolicLink(), file: st.isFile() };
+  });
+} catch {}
+const rec = { t: Date.now(), args, stream: !!stdinMsg, imageBytes: streamImage ? Buffer.from(streamImage.source.data, "base64").length : 0, streamPrompt: streamText || null, cwd: process.cwd(), envKeys: Object.keys(process.env).filter((k) => /NOTIZBUCH|BETTERNOTES/i.test(k)), stdinTTY: process.stdin.isTTY || false, mode: mode.mode, sizes, weitere, pid: process.pid };
 fs.appendFileSync(path.join(DIR, "calls.jsonl"), JSON.stringify(rec) + "\n");
 if (mode.noStream && stdinMsg) { process.stderr.write("Error: stream-json input not supported\n"); process.exit(1); }
 const resume = get("--resume"), sid = get("--session-id");
@@ -61,6 +83,37 @@ const session = resume || sid;
 fs.writeFileSync(path.join(sessions, session), "x");
 process.on("SIGTERM", () => { fs.appendFileSync(path.join(DIR, "calls.jsonl"), JSON.stringify({ killed: process.pid }) + "\n"); process.exit(143); });
 const out = (o) => { process.stdout.write(JSON.stringify(o) + "\n"); };
+// stream-json einer Frage (nicht Lernwörter oder Vokabeln): zuerst system/init, wie Claude Code beim Start
+const streaming = get("--output-format") === "stream-json";
+const lernish = /Buchstabe für Buchstabe|Vokabelliste|Gesucht war/.test(prompt);
+const init = () => {
+  if (streaming && !lernish) out({ type: "system", subtype: "init", cwd: process.cwd(), session_id: session, tools: String(get("--tools") || "").split(","), mcp_servers: [], model: "fake", permissionMode: get("--permission-mode") || "default", apiKeySource: "none" });
+};
+// Die Reads aus mode.json (readWeitere, readDokument) samt Ergebnissen, dann die langen Zeilen (bigLines)
+const readLines = () => {
+  const reads = [];
+  for (const n of mode.readWeitere || []) if (weitereDir) reads.push({ input: { file_path: path.join(weitereDir, `seite-${n}.pdf`) }, fail: (mode.readFail || []).includes(n) });
+  if (mode.readDokument) reads.push({ input: { file_path: path.join(process.cwd(), "dokument.pdf"), pages: String(mode.readDokument) } });
+  if (reads.length) {
+    const uses = reads.map((r, i) => ({ type: "tool_use", id: `toolu_fake${i}`, name: "Read", input: r.input }));
+    out({ type: "assistant", message: { id: "msg_fake1", type: "message", role: "assistant", model: "fake", content: uses }, parent_tool_use_id: null, session_id: session });
+    for (const [i, u] of uses.entries()) {
+      let content, isError = false;
+      try {
+        if (reads[i].fail) throw new Error("File content (31.2MB) exceeds maximum allowed size (20MB).");
+        content = [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: fs.readFileSync(u.input.file_path).toString("base64") } }];
+      } catch (e) {
+        content = reads[i].fail ? e.message : "File does not exist.";
+        isError = true;
+      }
+      out({ type: "user", message: { role: "user", content: [{ tool_use_id: u.id, type: "tool_result", content, ...(isError ? { is_error: true } : {}) }] }, parent_tool_use_id: null, session_id: session });
+    }
+  }
+  if (mode.bigLines) {
+    const data = "A".repeat(Math.round((mode.bigLineMB || 10) * 1e6));
+    for (let i = 0; i < mode.bigLines; i++) out({ type: "user", message: { role: "user", content: [{ tool_use_id: "toolu_big", type: "tool_result", content: [{ type: "document", source: { type: "base64", media_type: "application/pdf", data } }] }] }, parent_tool_use_id: null, session_id: session });
+  }
+};
 // Lernwörter: mit stream-json erst die Antwort als assistant-Zeile, dann (wie Claude Code) nach mode.summaryMs eine
 // Zusammenfassung und erst danach result
 const lernOut = (t) => {
@@ -70,6 +123,7 @@ const lernOut = (t) => {
   setTimeout(() => { out({ type: "system", subtype: "post_turn_summary" }); done(); }, mode.summaryMs || 0);
 };
 const finish = () => {
+  if (mode.mode !== "error") init();
   if (mode.mode === "limit") {
     // Wie Claude Code heute: Ende in Ortszeit (hier vor zwei Minuten, also gleich wieder frei)
     const t = new Date(Date.now() - 120000), h = t.getHours();
@@ -107,6 +161,16 @@ const finish = () => {
   if (mode.mode === "maxturns") {
     out({ type: "result", subtype: "error_max_turns", is_error: true, session_id: session });
     process.exit(1);
+  }
+  // "noresult": bricht ab wie abgestürzt, ohne Zeile result und ohne Meldung; mit stream-json davor die Reads und eine
+  // Zeile mit Text aus einer Seite
+  if (mode.mode === "noresult") {
+    if (streaming) {
+      readLines();
+      out({ type: "assistant", message: { id: "msg_fake3", type: "message", role: "assistant", model: "fake", content: [{ type: "text", text: "Auf Seite 1 steht: Geheimnis aus dem Heft" }] }, parent_tool_use_id: null, session_id: session });
+    }
+    process.stdout.write("", () => process.exit(1));
+    return;
   }
   const rich = [
     "**Kurz:** Die Ableitung ist $f'(x) = 2x\\sin x + x^2\\cos x$ (Produktregel).",
@@ -146,6 +210,10 @@ const finish = () => {
   }
   // "huge": eine Antwort über der Grenze des Servers (200 000 Zeichen), die er mit 413 ablehnt
   const text = mode.mode === "rich" ? rich : mode.mode === "huge" ? "x".repeat(210000) : `Antwort (${get("--effort")}) auf ${files.join(", ")}: $x^2$`;
+  if (streaming) {
+    readLines();
+    out({ type: "assistant", message: { id: "msg_fake2", type: "message", role: "assistant", model: "fake", content: [{ type: "text", text }] }, parent_tool_use_id: null, session_id: session });
+  }
   // Erst beenden, wenn alles geschrieben ist: Eine lange Antwort passt nicht auf einmal in die Pipe
   process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: text, session_id: session }) + "\n", () => process.exit(0));
 };

@@ -2,7 +2,8 @@
 // statt Claude Code + fake-osascript statt macOS. Läuft auch unter Linux:
 //   cd native/Notizbuch/server && npx wrangler dev --ip 127.0.0.1 --port 8791 --var SECRET:testkey --persist-to <leerer Ordner>
 //   BASE=http://127.0.0.1:8791 KEY=testkey node native/Notizbuch/claude-fragen/test/helper-test.mjs
-import { spawn } from "node:child_process";
+// Die weiteren Seiten zum Nachlesen brauchen für PDFs poppler (pdfinfo, pdftoppm, pdfimages; macOS: brew install poppler)
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -62,6 +63,45 @@ async function waitFor(fn, ms, step = 100) {
   return null;
 }
 
+/// Zwischen Helfer und Server: reicht alles durch (auch den WebSocket) und merkt sich jede Anfrage („GET /api/…“ in
+/// seen). intercept(req) kann stattdessen [Status, Inhalt] liefern (Text oder JSON); er lässt sich später austauschen
+async function startProxy(intercept = () => null) {
+  const p = { seen: [], intercept };
+  const server = http.createServer(async (req, res) => {
+    p.seen.push(`${req.method} ${req.url}`);
+    const own = p.intercept(req);
+    if (own) {
+      const [status, body] = own;
+      res.writeHead(status, { "content-type": typeof body === "string" ? "text/plain" : "application/json" })
+        .end(typeof body === "string" ? body : JSON.stringify(body));
+      return;
+    }
+    const chunks = [];
+    for await (const x of req) chunks.push(x);
+    const skip = new Set(["host", "connection", "content-length", "transfer-encoding"]);
+    const up = await fetch(BASE + req.url, { method: req.method, headers: Object.fromEntries(Object.entries(req.headers).filter(([k]) => !skip.has(k))), body: chunks.length ? Buffer.concat(chunks) : undefined });
+    res.writeHead(up.status, Object.fromEntries([...up.headers].filter(([k]) => !skip.has(k) && k !== "content-encoding")));
+    res.end(Buffer.from(await up.arrayBuffer()));
+  });
+  server.on("upgrade", (req, socket, head) => {
+    const target = new URL(BASE);
+    const up = net.connect(Number(target.port), target.hostname, () => {
+      up.write(`${req.method} ${req.url} HTTP/1.1\r\n${Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join("\r\n")}\r\n\r\n`);
+      if (head.length) up.write(head);
+      socket.pipe(up).pipe(socket);
+    });
+    up.on("error", () => socket.destroy());
+    socket.on("error", () => up.destroy());
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  p.url = `http://127.0.0.1:${server.address().port}`;
+  p.close = () => {
+    server.close();
+    server.closeAllConnections?.();
+  };
+  return p;
+}
+
 let helper = null;
 const setHelp = (version) => fs.writeFileSync(path.join(FAKE, "help.json"), JSON.stringify({ version }));
 const setPages = (cfg) => fs.writeFileSync(path.join(FAKE, "pages.json"), JSON.stringify(cfg));
@@ -74,10 +114,13 @@ const optOf = (c, f) => (c.args.includes(f) && String(c.args[c.args.indexOf(f) +
 // Endet der Test vorzeitig (abgebrochen, Zeitlimit), darf der Helfer nicht weiterlaufen
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => { helper?.kill("SIGTERM"); process.exit(130); });
 process.on("exit", () => helper?.kill("SIGTERM"));
-function startHelper(env = {}) {
+// script: ein anderes helfer.mjs (die Kopie ohne weitere-seiten.mjs). KEY dieses Tests bekommt der Helfer nicht mit: Er
+// liest den Schlüssel aus config.json, und so fiele er auf, wenn er doch in der Umgebung eines Programms landete
+function startHelper(env = {}, script = HELFER) {
   const out = fs.openSync(path.join(TMP, "helfer.out"), "a");
-  helper = spawn(process.execPath, [HELFER], {
-    env: { ...process.env, BETTERNOTES_HELFER_HOME: HOME, BETTERNOTES_HELFER_ECHO: "1", BETTERNOTES_HELFER_OSASCRIPT: FAKE_OSASCRIPT, FAKE_STATE: FAKE, NOTIZBUCH_KEY: "must-not-leak", NOTIZBUCH_URL: "x", ...env },
+  const { KEY: _key, ...outer } = process.env;
+  helper = spawn(process.execPath, [script], {
+    env: { ...outer, BETTERNOTES_HELFER_HOME: HOME, BETTERNOTES_HELFER_ECHO: "1", BETTERNOTES_HELFER_OSASCRIPT: FAKE_OSASCRIPT, FAKE_STATE: FAKE, NOTIZBUCH_KEY: "must-not-leak", NOTIZBUCH_URL: "x", ...env },
     stdio: ["ignore", out, out],
   });
 }
@@ -116,7 +159,7 @@ async function main() {
   let c = calls().filter((x) => x.args).at(-1);
   const sid = c.args[c.args.indexOf("--session-id") + 1];
   ok(c.args.includes("--session-id") && !c.args.includes("--resume"), "first call starts a new session", c.args);
-  ok(c.args[c.args.indexOf("--effort") + 1] === "medium" && optOf(c, "--tools") === "Read,WebSearch,WebFetch" && c.args.includes("--strict-mcp-config") && c.args[c.args.indexOf("--output-format") + 1] === "json", "flags: effort medium, tools Read + web search + web pages, strict mcp, json", c.args);
+  ok(c.args[c.args.indexOf("--effort") + 1] === "medium" && optOf(c, "--tools") === "Read,WebSearch,WebFetch" && c.args.includes("--strict-mcp-config") && c.args[c.args.indexOf("--output-format") + 1] === "stream-json" && c.args.includes("--verbose"), "flags: effort medium, tools Read + web search + web pages, strict mcp, stream-json", c.args);
   const allowed = String(optOf(c, "--allowedTools")).split(",");
   ok(c.args[c.args.indexOf("--permission-mode") + 1] === "dontAsk" && c.args.includes("--restricted") && c.args.filter((x) => /allowed/i.test(x)).length === 1 && allowed[0] === "WebSearch" && allowed.slice(1).every((x) => /^WebFetch\(domain:[^,() ]+\)$/.test(x)) && allowed.includes("WebFetch(domain:*.wikipedia.org)") && allowed.includes("WebFetch(domain:arxiv.org)") && allowed.length > 5, "flags: dontAsk, restricted; pre-allowed only the search and whole pages from the reference sites, never WebFetch for every site", c.args);
   ok(/Ganze Seiten \(WebFetch\) kannst du nur auf diesen Seiten lesen: \*\.wikipedia\.org, arxiv\.org, /.test(systemOf(c)), "system prompt names the sites Claude may read", systemOf(c));
@@ -136,7 +179,7 @@ async function main() {
   ok(win && c.sizes[win] > 0 && /PDF mit 30 Seiten/.test(promptText) && /seiten-1-4\.pdf: die Seiten 1 bis 4 des Dokuments/.test(promptText) && /weitere Seiten mit Read und dem Parameter pages/.test(promptText), "window file present and named in the prompt", { sizes: c.sizes, promptText });
   ok(promptText.includes(`\nNotizen aus der App siehst du zu dieser Frage nur auf der Seite der Frage; dokument.pdf und ${win} zeigen das PDF ohne die Notizen aus der App.\n`) && !/nachbarseiten/.test(promptText), "old app (no pages around the question): notes only on the question's page, both PDFs without them", promptText);
   ok(logText().includes(`${a.id} Unterlagen: ohne Nachbarseiten (nicht mitgeschickt oder Seiten seither gerückt), PDF-Fenster 1–4 von 30`), "log lists what Claude got", logText().split("\n").filter((l) => l.includes("Unterlagen")));
-  ok(/Lies dann die weiteren Dateien, die die Nachricht zur Frage nennt, und bei einem PDF, soweit es für die Antwort hilft, weitere Seiten aus dokument\.pdf\. Rate keine Dateinamen/.test(systemOf(c)) && !/mehr vom Dokument/.test(systemOf(c)), "system prompt: read the files the message names, no guessing file names", systemOf(c));
+  ok(/Lies dann die übrigen Dateien, die die Nachricht zur Frage nennt \(die Seiten zum Nachlesen nur nach Bedarf, siehe den nächsten Punkt\), und bei einem PDF, soweit es für die Antwort hilft, weitere Seiten aus dokument\.pdf\. Rate keine Dateinamen/.test(systemOf(c)) && !/mehr vom Dokument/.test(systemOf(c)), "system prompt: read the other files the message names (the pages to look up only as needed), no guessing file names", systemOf(c));
   ok(/Bilder von Seiten zu früheren Fragen zeigen den Stand von damals/.test(systemOf(c)), "system prompt: page images of earlier questions are from back then", systemOf(c));
   ok(answered.answer.startsWith("Antwort (medium)"), "answer text stored", answered.answer);
   ok(!fs.readFileSync(path.join(HOME, "helfer.log"), "utf8").includes(KEY), "key never in the log");
@@ -392,13 +435,14 @@ async function main() {
   c = calls().filter((x) => x.args).at(-1);
   ok(/frage\.png: die handgeschriebene Frage\n- \S+seite\.jpg: die ganze Seite, die Frage/.test(promptOf(c)) && calls().filter((x) => x.osascript).length === osaBefore && !/vor der letzten Seitenänderung/.test(promptOf(c)), "deleted page: whole page without number, no window", promptOf(c));
   ok(/Seite gelöscht/.test(logText()), "log says the page was deleted");
+  ok(logText().includes(`${a.id} Unterlagen: ohne Nachbarseiten (Seite gelöscht), ganzes PDF, weitere Seiten aus: Seite der Frage gelöscht`), "deleted page: no further pages to read", logText().split("\n").filter((l) => l.includes(a.id)));
 
-  async function restartWith(fn, env) {
+  async function restartWith(fn, env, script) {
     helper.kill("SIGTERM");
     await sleep(500);
     fn();
     const before = logText().split("\n").length;
-    startHelper(env);
+    startHelper(env, script);
     await waitFor(() => logText().split("\n").slice(before - 1).some((l) => l.includes("verbunden")), 10000);
   }
   async function askOnce(effort = "quick") {
@@ -439,6 +483,7 @@ async function main() {
     const cw = calls().filter((x) => x.args).at(-1);
     ok(promptOf(cw).startsWith("Dokument: „Skript 2“ (PDF).\nDas Dokument liegt in dokument.pdf.\n") && promptOf(cw).includes("\nVon Seite 7 bis 11 gibt es Notizen aus der App nur auf der Seite der Frage; dokument.pdf zeigt das PDF ohne die Notizen aus der App. Notizen auf weiter entfernten Seiten siehst du zu dieser Frage nicht.\ndokument.pdf ist noch der Stand vor der letzten Seitenänderung in der App (das neue PDF ist noch nicht angekommen): Seine Seitennummern können von denen hier abweichen. Es gelten die Seitennummern in dieser Nachricht.\n") && !/seiten-\d+-\d+\.pdf/.test(promptOf(cw)) && calls().filter((x) => x.osascript).length === cuts, "old PDF: no page count, not „das ganze“, no window cut from it, Claude is told", promptOf(cw));
     ok(logText().includes(`${w.id} Unterlagen: Nachbarseiten keine beschrieben (Bereich 7–11), ganzes PDF, noch vom Stand vor der letzten Seitenänderung`), "log says so", logText().split("\n").filter((l) => l.includes("Unterlagen")).slice(-1));
+    ok(logText().includes(`${w.id} Unterlagen: Nachbarseiten keine beschrieben (Bereich 7–11), ganzes PDF, noch vom Stand vor der letzten Seitenänderung, weitere Seiten aus: PDF zu alt`), "old PDF: no further pages to read (their numbers would not match)", logText().split("\n").filter((l) => l.includes("Unterlagen")).slice(-1));
   }
 
   console.log("== denied tools are logged with the answer");
@@ -471,31 +516,8 @@ async function main() {
   {
     // Zwischen Helfer und Server: reicht alles durch (auch den WebSocket), nur das PDF der Seiten scheitert
     let failed = 0;
-    const proxy = http.createServer(async (req, res) => {
-      if (/^\/api\/asks\/[^/]+\/pages$/.test(req.url)) {
-        failed++;
-        res.writeHead(500, { "content-type": "text/plain" }).end("kaputt");
-        return;
-      }
-      const chunks = [];
-      for await (const x of req) chunks.push(x);
-      const skip = new Set(["host", "connection", "content-length", "transfer-encoding"]);
-      const up = await fetch(BASE + req.url, { method: req.method, headers: Object.fromEntries(Object.entries(req.headers).filter(([k]) => !skip.has(k))), body: chunks.length ? Buffer.concat(chunks) : undefined });
-      res.writeHead(up.status, Object.fromEntries([...up.headers].filter(([k]) => !skip.has(k) && k !== "content-encoding")));
-      res.end(Buffer.from(await up.arrayBuffer()));
-    });
-    proxy.on("upgrade", (req, socket, head) => {
-      const target = new URL(BASE);
-      const up = net.connect(Number(target.port), target.hostname, () => {
-        up.write(`${req.method} ${req.url} HTTP/1.1\r\n${Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join("\r\n")}\r\n\r\n`);
-        if (head.length) up.write(head);
-        socket.pipe(up).pipe(socket);
-      });
-      up.on("error", () => socket.destroy());
-      socket.on("error", () => up.destroy());
-    });
-    await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
-    await restartWith(() => writeConfig({ url: `http://127.0.0.1:${proxy.address().port}` }));
+    const proxy = await startProxy((req) => (/^\/api\/asks\/[^/]+\/pages$/.test(req.url) ? (failed++, [500, "kaputt"]) : null));
+    await restartWith(() => writeConfig({ url: proxy.url }));
     a = await createAsk(nb, "quick", 2, { span: [0, 3], pages: [1], bytes: 600 });
     ok(await waitFor(async () => (await askOf(nb, a.id)).status === "answered", 15000), "answered without the pages");
     c = calls().filter((x) => x.args).at(-1);
@@ -503,7 +525,6 @@ async function main() {
     ok(logText().includes(`${a.id} Nachbarseiten nicht geladen: HTTP 500`) && logText().includes(`${a.id} Unterlagen: Nachbarseiten nicht geladen`), "logged", logText().split("\n").filter((l) => l.includes(a.id)));
     await restartWith(() => writeConfig());
     proxy.close();
-    proxy.closeAllConnections?.();
   }
 
   // Der Helfer sucht auch in /opt/homebrew/bin und /usr/local/bin: Liegt dort ein echtes claude, fiele der Test darauf
@@ -671,6 +692,7 @@ async function main() {
   startHelper();
   ok(await waitFor(async () => (await askOf(doc, rs.id)).status === "answered", 15000, 200), `answered right after the restart (${((Date.now() - tRestart) / 1000).toFixed(1)} s), not after its 20-minute lease`);
 
+  await weitereTests(restartWith);
   await vokabelTests();
   await lernTests();
   helper.kill("SIGTERM");
@@ -813,4 +835,515 @@ async function vokabelTests() {
   await api("DELETE", `/api/karten/foto/${id}`);
   setMode({ mode: "ok" });
   await sleep(300);
+}
+
+// ---------- Weitere Seiten zum Nachlesen ----------
+
+// Notizbuchseite i (ab 0) liegt bei y = 6 + i · (A4H + 6), 768 breit (PageLayout); ein PDF stapelt seine Seiten ebenso
+const A4H = 768 * 297 / 210, GAP = 6;
+const pageTop = (i) => GAP + i * (A4H + GAP);
+const round2 = (v) => Math.round(v * 100) / 100;
+/// Ein Strich wie aus der App (StrokeCodec: Schlüssel sortiert, zehn Werte je Punkt: x, y, Zeit, Breite, Höhe, Deckkraft,
+/// Druck, Azimut, Neigung, Zweitskala; pk, „/“ als „\/“) oder wie aus dem Browser (neun Werte, ohne pk). top: Oberkante
+/// der Seite, x und y darin
+function inkStroke({ top, x = 120, y = 150, n = 14, browser = false, c = [0, 0, 0, 1], ink = "com.apple.ink.pen" }) {
+  const p = Array.from({ length: n }, (_, k) => {
+    const q = [round2(x + k * 9), round2(top + y + Math.sin(k / 2) * 8), round2(k * 0.012), 2.4];
+    return browser ? [...q, 2.4, 1, 1, 0, 1.571] : [...q, 2.4, 1, 0.42, 0.8, 1.1, 1];
+  });
+  return browser ? JSON.stringify({ c, ink, p })
+    : JSON.stringify({ c, ink, p, pk: Buffer.from(`PKDrawing ${x}/${y}?>`).toString("base64") }).replace(/\//g, "\\/");
+}
+/// Striche hinauf wie die App (POST /api/doc/<id>/sync); list: [[id, data], …]
+const syncAdd = async (doc, list) => {
+  const r = await api("POST", `/api/doc/${doc}/sync`, { json: { since: 0, add: list.map(([id, data]) => ({ id, data })), remove: [] } });
+  if (r.status !== 200) throw new Error("sync " + r.status);
+};
+const syncRemove = (doc, ids) => api("POST", `/api/doc/${doc}/sync`, { json: { since: 0, add: [], remove: ids } });
+/// Ein kleines echtes PDF mit diesen Seitengrößen (pt; [842, 595] ist Querformat), jede Seite mit Rahmen und Balken
+function makePDF(sizes, mark = 0) {
+  const objs = [null, "<< /Type /Catalog /Pages 2 0 R >>",
+    `<< /Type /Pages /Kids [${sizes.map((_, i) => `${3 + 2 * i} 0 R`).join(" ")}] /Count ${sizes.length} >>`];
+  sizes.forEach(([w, h], i) => {
+    const content = `0.2 0.3 ${0.5 + mark / 10} rg 40 40 ${w - 80} ${30 + 10 * i} re f 0 0 0 RG 4 w 20 20 ${w - 40} ${h - 40} re S`;
+    objs.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${w} ${h}] /Contents ${4 + 2 * i} 0 R >>`);
+    objs.push(`<< /Length ${content.length} >>\nstream\n${content}\nendstream`);
+  });
+  let out = "%PDF-1.4\n";
+  const at = [];
+  for (let k = 1; k < objs.length; k++) {
+    at[k] = out.length;
+    out += `${k} 0 obj\n${objs[k]}\nendobj\n`;
+  }
+  const xref = out.length;
+  out += `xref\n0 ${objs.length}\n0000000000 65535 f \n${at.slice(1).map((o) => `${String(o).padStart(10, "0")} 00000 n \n`).join("")}`;
+  return Buffer.from(`${out}trailer\n<< /Size ${objs.length} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`, "latin1");
+}
+/// Breite und Höhe eines JPEG (aus der SOF-Marke)
+function jpegSize(buf) {
+  for (let i = 2; i + 9 < buf.length;) {
+    if (buf[i] !== 0xff) return null;
+    const m = buf[i + 1];
+    if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) return { w: buf.readUInt16BE(i + 7), h: buf.readUInt16BE(i + 5) };
+    i += 2 + buf.readUInt16BE(i + 2);
+  }
+  return null;
+}
+/// Alle Dateien unter dir (ohne Verweisen zu folgen), mit lstat
+function walk(dir) {
+  const out = [];
+  const go = (d) => {
+    let list = [];
+    try {
+      list = fs.readdirSync(d, { withFileTypes: true });
+    } catch {}
+    for (const e of list) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) go(p);
+      else out.push({ file: p, st: fs.lstatSync(p) });
+    }
+  };
+  go(dir);
+  return out;
+}
+const pdfinfo = (file) => execFileSync("pdfinfo", [file], { encoding: "utf8" });
+const hasPoppler = (() => {
+  try {
+    execFileSync("pdfinfo", ["-v"], { stdio: "ignore" });
+    execFileSync("pdftoppm", ["-v"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+async function weitereTests(restartWith) {
+  console.log("== weitere Seiten zum Nachlesen: setup (proxy counts the server calls, osascript logged in full)");
+  const proxy = await startProxy();
+  // osascript über eine Hülle, die jeden Aufruf ganz festhält (argv; welche Umgebungswerte den Schlüssel enthalten)
+  const OSA_LOG = path.join(FAKE, "osascript-argv.jsonl");
+  const osaWrapper = path.join(TMP, "osascript-protokoll");
+  fs.writeFileSync(osaWrapper, `#!/usr/bin/env node
+const fs = require("fs"), { spawnSync } = require("child_process");
+const secret = (v) => [${JSON.stringify(KEY)}, "must-not-leak"].some((s) => String(v).includes(s));
+const leak = Object.keys(process.env).filter((k) => secret(process.env[k]));
+fs.appendFileSync(${JSON.stringify(OSA_LOG)}, JSON.stringify({ argv: process.argv.slice(2), leak }) + "\\n");
+const r = spawnSync(${JSON.stringify(FAKE_OSASCRIPT)}, process.argv.slice(2), { stdio: "inherit" });
+process.exit(r.status ?? 1);
+`, { mode: 0o755 });
+  const env = { BETTERNOTES_HELFER_OSASCRIPT: osaWrapper };
+  const cfg = (extra = {}) => writeConfig({ url: proxy.url, ...extra });
+  await restartWith(() => cfg(), env);
+  const stateDoc = (id) => JSON.parse(fs.readFileSync(path.join(HOME, "state.json"), "utf8")).docs[id];
+  const unterlagen = (id) => (logText().split("\n").find((l) => l.includes(`${id} Unterlagen: `)) || "").split(`${id} Unterlagen: `)[1];
+  const logOf = (id) => logText().split("\n").filter((l) => l.includes(id));
+  const getsOf = (doc) => proxy.seen.filter((u) => u.startsWith(`GET /api/doc/${doc}/strokes?`));
+  const cacheOf = (doc) => fs.readdirSync(path.join(HOME, "seitenbilder", doc)).filter((f) => f.endsWith(".pdf"));
+  const bgCalls = () => calls().filter((x) => x.bg && x.bg.pdf === "dokument.pdf");
+  /// Eine Frage stellen und auf die Antwort warten; c: der Aufruf von Claude dazu
+  async function ask(doc, effort, page, ctx, mode) {
+    if (mode) setMode(mode);
+    const x = await createAsk(doc, effort, page, ctx);
+    const done = await waitFor(async () => (await askOf(doc, x.id))?.status === "answered", 20000, 100);
+    const c = calls().filter((y) => y.args && promptOf(y)?.includes(`fragen/${x.id}/`)).at(-1) || null;
+    return { id: x.id, done: Boolean(done), c, p: c ? promptOf(c) : "" };
+  }
+  const now = Date.now() / 1000;
+
+  console.log("== weitere Seiten: notebook, the other written pages are offered as files");
+  // Geschrieben auf den Seiten 1, 2, 4, 7 (die Frage), 9 und 12; die App zeigt 4 bis 9 (darin 4 und 9 beschrieben)
+  const nb = uuid();
+  await api("PUT", `/api/library/${nb}`, { json: { id: nb, title: "Weitere", kind: "notebook", created: now, modified: now, pageCount: 12 } });
+  await syncAdd(nb, [
+    [uuid(), inkStroke({ top: pageTop(0) })],
+    [uuid(), inkStroke({ top: pageTop(1), browser: true, c: [0.2, 0.4, 1, 1] })],
+    [uuid(), inkStroke({ top: pageTop(3), x: 200 })],
+    [uuid(), inkStroke({ top: pageTop(6), x: 300 })],
+    [uuid(), inkStroke({ top: pageTop(8), x: 250, browser: true })],
+    [uuid(), inkStroke({ top: pageTop(11), x: 180 })],
+    [uuid(), inkStroke({ top: pageTop(11), x: 100, y: 300, ink: "com.apple.ink.marker", c: [1, 0.85, 0, 0.5] })],
+  ]);
+  const ctx = { span: [3, 8], pages: [3, 8], bytes: 2000 };
+  const MORE_NB = "weitere beschriebene Seiten zum Nachlesen, je Seite eine Datei, oben mit ihrer Nummer beschriftet, für";
+  const DRAWN_NB = "Der Mac zeichnet sie aus den Strichen am Server nach: Ganz frisch Geschriebenes kann fehlen, und die Striche sehen etwas anders aus als in der App.";
+  const moreNB = (id, pages, extra = "") => `- fragen/${id}/weitere/seite-<Nummer>.pdf: ${MORE_NB} ${pages}. ${DRAWN_NB}${extra}`;
+  const NEAR = "Von Seite 4 bis 9 ist außer der Seite der Frage nur auf den Seiten 4 und 9 etwas geschrieben, die übrigen sind leer.";
+  const NOTE_TODAY = `${NEAR} Weitere Seiten hast du zu dieser Frage nicht: Such nicht nach anderen Dateien, und braucht die Frage eine Seite, die du nicht siehst, sag das kurz.`;
+  const noteMore = (on, x = "") => `${NEAR} Sonst ist im Notizbuch nur ${on} etwas geschrieben; alle anderen Seiten sind leer.${x} Such nicht nach anderen Dateien.`;
+  const nbPrompt = (id, { fresh = false, more = null, note }) => [
+    ...(fresh ? ["Dokument: „Weitere“ (Notizbuch mit 12 Seiten).", "", "Frage:"] : ["Neue Frage zum selben Dokument („Weitere“):"]),
+    `- fragen/${id}/frage.png: die handgeschriebene Frage`,
+    `- fragen/${id}/seite.jpg: die ganze Seite 7, die Frage darauf farbig umrandet`,
+    `- fragen/${id}/nachbarseiten.pdf: die Seiten 4 und 9, wie sie in der App aussehen, jede oben mit ihrer Nummer beschriftet`,
+    ...(more ? [more] : []), note, "", "Antworte knapp: das Wesentliche in wenigen Sätzen.",
+  ].join("\n");
+  // Claude liest die Seiten 1 und 12 (und versucht dokument.pdf, das es im Notizbuch nicht gibt)
+  let q = await ask(nb, "quick", 6, ctx, { mode: "ok", readWeitere: [1, 12], readDokument: "4-6" });
+  ok(q.done && q.p === nbPrompt(q.id, { fresh: true, more: moreNB(q.id, "die Seiten 1, 2 und 12"), note: noteMore("auf den Seiten 1, 2 und 12") }), "message: the file line for pages 1, 2 and 12 after the app's pages, then where else something is written", q.p);
+  ok(q.c.args[q.c.args.indexOf("--output-format") + 1] === "stream-json" && q.c.args.includes("--verbose") && optOf(q.c, "--max-turns") === "40", "stream-json (the helper sees what Claude reads), 40 turns", q.c.args);
+  ok(unterlagen(q.id) === "Nachbarseiten 4, 9 (Bereich 4–9), weitere Seiten 1, 2, 12 (3 neu gezeichnet)", "log: which pages, three drawn", unterlagen(q.id));
+  const listing = q.c.weitere || [];
+  ok(listing.map((f) => f.name).join(",") === "seite-1.pdf,seite-12.pdf,seite-2.pdf" && listing.every((f) => f.file && !f.symlink && f.nlink === 1 && f.size > 1000), "while Claude runs: one file per page, copies (nlink 1, no links)", listing);
+  const qdir = path.join(HOME, "chats", nb, "fragen", q.id);
+  ok(fs.readdirSync(path.join(qdir, "weitere")).sort().join(",") === "seite-1.pdf,seite-12.pdf", "afterwards only what Claude read is left (seite-2.pdf deleted)", fs.readdirSync(path.join(qdir, "weitere")));
+  ok(logOf(q.id).some((l) => l.endsWith(`${q.id} weitere Seiten gelesen: 1, 12 (0,0 MB)`)), "log: pages read", logOf(q.id));
+  let st = stateDoc(nb);
+  const sizeOf = (list, n) => list.find((f) => f.name === `seite-${n}.pdf`)?.size;
+  ok(st.chatBytes === 1000 + 3000 + 2000 + sizeOf(listing, 1) + sizeOf(listing, 12) && st.chatPages === 2, "chat counts the question's files and the two pages read (dokument.pdf does not exist here: nothing)", { st, listing });
+  const cached = (key) => path.join(HOME, "seitenbilder", nb, `${key}.pdf`);
+  ok(Object.keys(st.gelesen || {}).join(",") === "1,12" && fs.existsSync(cached(st.gelesen[1])) && fs.readFileSync(cached(st.gelesen[1])).equals(fs.readFileSync(path.join(qdir, "weitere", "seite-1.pdf"))) && fs.statSync(cached(st.gelesen[1])).nlink === 1, "state: pages read with their drawn version; the copy equals the drawn page, no hard link", st.gelesen);
+  ok(fs.existsSync(path.join(HOME, "spiegel", nb, "striche.ndjson")) && fs.existsSync(path.join(HOME, "spiegel", nb, "stand.json")) && !walk(path.join(HOME, "chats")).some((f) => /spiegel|seitenbilder|striche\.ndjson|hintergrund\.js/.test(f.file)), "copy of the strokes and drawn pages outside chats/", walk(path.join(HOME, "spiegel")).map((f) => f.file));
+  if (hasPoppler) {
+    const info = pdfinfo(path.join(qdir, "weitere", "seite-12.pdf"));
+    ok(/^Pages:\s+1$/m.test(info) && /^Page size:\s+1200 x 1741 pts/m.test(info), "seite-12.pdf: one page, 1200 × 1741 (page and band, like the app's pages)", info);
+  }
+  ok(systemOf(q.c).includes("Rate keine Dateinamen: Es gibt nur die Dateien, die die Nachricht zur Frage nennt.\n- Nennt die Nachricht weitere Seiten zum Nachlesen (seite-<Nummer>.pdf), entscheidest du selbst, ob du welche brauchst: Baut die Frage auf etwas auf, das woanders im Dokument steht (eine Definition, eine Bezeichnung, eine frühere Rechnung oder Skizze, „siehe oben“), lies gezielt die Seiten, auf denen es stehen dürfte, mehrere auf einmal; weißt du nicht, wo, beginne mit den Seiten vor der Frage. Geht es ohne, lies keine, und nie mehr, als die Nachricht erlaubt.\n- Antworte") && systemOf(q.c).includes("Bilder von Seiten zu früheren Fragen zeigen den Stand von damals, ebenso Seiten, die du früher nachgelesen hast; seither können Seiten dazugekommen, weggefallen oder verschoben sein."), "system prompt: Claude decides itself, reads on purpose, never more than allowed", systemOf(q.c));
+
+  console.log("== weitere Seiten: the next question fetches only what changed and draws only the changed page");
+  const gets0 = getsOf(nb).length, cache0 = cacheOf(nb).length, seen0 = st.gelesen;
+  await syncAdd(nb, [[uuid(), inkStroke({ top: pageTop(11), x: 400, y: 600 })]]);
+  q = await ask(nb, "quick", 6, ctx, { mode: "ok", readWeitere: [1, 12] });
+  const gets = getsOf(nb).slice(gets0);
+  ok(q.done && gets.length === 1 && /since=[1-9]\d*&/.test(gets[0]), "one call to the server, from where the copy stood", gets);
+  ok(unterlagen(q.id) === "Nachbarseiten 4, 9 (Bereich 4–9), weitere Seiten 1, 2, 12 (1 neu gezeichnet)" && cacheOf(nb).length === cache0 + 1, "only page 12 drawn again", [unterlagen(q.id), cacheOf(nb).length]);
+  ok(q.p === nbPrompt(q.id, { more: moreNB(q.id, "die Seiten 1, 2 und 12", " Seit du sie in diesem Chat nachgelesen hast, unverändert: Seite 1; geändert: Seite 12."), note: noteMore("auf den Seiten 1, 2 und 12") }), "same chat: which pages read before are unchanged, which changed", q.p);
+  st = stateDoc(nb);
+  ok(st.gelesen[1] === seen0[1] && st.gelesen[12] !== seen0[12] && st.chatPages === 4, "state: page 1 the same, page 12 the new version, 4 pages in the chat", st);
+
+  console.log("== weitere Seiten: nothing else written: the message exactly as without them");
+  const solo = uuid();
+  await api("PUT", `/api/library/${solo}`, { json: { id: solo, title: "Nur hier", kind: "notebook", created: now, modified: now, pageCount: 5 } });
+  await syncAdd(solo, [[uuid(), inkStroke({ top: pageTop(0) })], [uuid(), inkStroke({ top: pageTop(2), browser: true })]]);
+  const soloCtx = { span: [0, 4], pages: [0], bytes: 900 };
+  const soloPrompt = (id) => [
+    "Dokument: „Nur hier“ (Notizbuch mit 5 Seiten).", "", "Frage:",
+    `- fragen/${id}/frage.png: die handgeschriebene Frage`,
+    `- fragen/${id}/seite.jpg: die ganze Seite 3, die Frage darauf farbig umrandet`,
+    `- fragen/${id}/nachbarseiten.pdf: Seite 1, wie sie in der App aussieht, oben mit ihrer Nummer beschriftet`,
+    "Von Seite 1 bis 5 ist außer der Seite der Frage nur auf Seite 1 etwas geschrieben, die übrigen sind leer. Weitere Seiten hast du zu dieser Frage nicht: Such nicht nach anderen Dateien, und braucht die Frage eine Seite, die du nicht siehst, sag das kurz.",
+    "", "Antworte knapp: das Wesentliche in wenigen Sätzen.",
+  ].join("\n");
+  q = await ask(solo, "quick", 2, soloCtx, { mode: "ok" });
+  ok(q.done && q.p === soloPrompt(q.id) && optOf(q.c, "--max-turns") === "30" && q.c.weitere === null, "message as today, 30 turns, no folder", q.p);
+  ok(unterlagen(q.id) === "Nachbarseiten 1 (Bereich 1–5)", "log as today", unterlagen(q.id));
+  const soloWith = { p: q.p.replaceAll(q.id, "<id>"), system: systemOf(q.c) };
+
+  console.log("== weitere Seiten: the app's pages did not come (older app, download failed): the helper offers them too");
+  q = await ask(nb, "quick", 6, null, { mode: "ok" });
+  const ALL = "die Seiten 1, 2, 4, 9 und 12";
+  const oldApp = (id, extra) => ["Neue Frage zum selben Dokument („Weitere“):", `- fragen/${id}/frage.png: die handgeschriebene Frage`,
+    `- fragen/${id}/seite.jpg: die ganze Seite 7, die Frage darauf farbig umrandet`, moreNB(id, ALL, extra),
+    "Außer der Seite der Frage ist im Notizbuch nur auf den Seiten 1, 2, 4, 9 und 12 etwas geschrieben; alle anderen Seiten sind leer. Such nicht nach anderen Dateien.",
+    "", "Antworte knapp: das Wesentliche in wenigen Sätzen."].join("\n");
+  const SAME = " Seit du sie in diesem Chat nachgelesen hast, unverändert: die Seiten 1 und 12.";
+  ok(q.done && q.p === oldApp(q.id, SAME), "older app: all written pages but the question's, said without a range", q.p);
+  ok(unterlagen(q.id) === "ohne Nachbarseiten (nicht mitgeschickt oder Seiten seither gerückt), weitere Seiten 1, 2, 4, 9, 12 (2 neu gezeichnet)", "log: 4 and 9 drawn now", unterlagen(q.id));
+  proxy.intercept = (req) => (/^\/api\/asks\/[^/]+\/pages$/.test(req.url) ? [500, "kaputt"] : null);
+  q = await ask(nb, "quick", 6, ctx, { mode: "ok" });
+  proxy.intercept = () => null;
+  ok(q.done && q.p === oldApp(q.id, SAME) && unterlagen(q.id) === "Nachbarseiten nicht geladen, weitere Seiten 1, 2, 4, 9, 12", "download of the app's pages failed: the same", [q.p, unterlagen(q.id)]);
+
+  console.log("== weitere Seiten: the question's page state differs from the server's: none, texts as today");
+  let g = getsOf(nb).length;
+  q = await ask(nb, "quick", 6, { ...ctx, pv: 777 }, { mode: "ok" });
+  ok(q.done && q.p === nbPrompt(q.id, { note: NOTE_TODAY }) && optOf(q.c, "--max-turns") === "30" && q.c.weitere === null && unterlagen(q.id) === "Nachbarseiten 4, 9 (Bereich 4–9), weitere Seiten aus: Seitenstand anders", "page numbers would not match: none", [q.p, unterlagen(q.id)]);
+
+  console.log("== weitere Seiten: server without the strokes route: none, logged once, asked again after 10 minutes or a restart");
+  proxy.intercept = (req) => (req.method === "GET" && /^\/api\/doc\/[^/]+\/strokes\?/.test(req.url) ? [404, { error: "Unbekannte Adresse" }] : null);
+  g = getsOf(nb).length;
+  q = await ask(nb, "quick", 6, ctx, { mode: "ok" });
+  const q404 = await ask(nb, "quick", 6, ctx);
+  proxy.intercept = () => null;
+  ok(q.done && q404.done && [q, q404].every((x) => x.p === nbPrompt(x.id, { note: NOTE_TODAY }) && unterlagen(x.id) === "Nachbarseiten 4, 9 (Bereich 4–9), weitere Seiten aus: Server ohne Route"), "texts as today", [unterlagen(q.id), unterlagen(q404.id)]);
+  ok(getsOf(nb).length === g + 1 && logText().split("\n").filter((l) => l.includes("Weitere Seiten: Der Server kennt die Striche-Abfrage noch nicht (Server-Update nötig), neuer Versuch alle 10 Minuten")).length === 1, "one call (404), then none; logged once", getsOf(nb).slice(g));
+  // Server-Update da, der Helfer neu gestartet (Einrichten): Die Pause steht nicht im Zustand, er fragt gleich wieder
+  await restartWith(() => {
+    cfg({ morePages: { quick: 2 }, morePagesSeconds: { quick: 0 } });
+    const s = JSON.parse(fs.readFileSync(path.join(HOME, "state.json"), "utf8"));
+    ok(!JSON.stringify(s.weitere || {}).includes("offUntil"), "the pause is not kept in the state (a restart asks again at once)", s.weitere);
+  }, env);
+
+  console.log("== weitere Seiten: at most morePages; a page not drawn in time is not offered, then drawn when idle");
+  await syncAdd(nb, [[uuid(), inkStroke({ top: pageTop(9), x: 333 })]]);
+  q = await ask(nb, "quick", 6, ctx, { mode: "ok" });
+  const AT_MOST_2 = " Lies davon höchstens 2; findest du darin nicht, was die Frage braucht, sag das kurz.";
+  ok(q.done && q.p === nbPrompt(q.id, { more: moreNB(q.id, "die Seiten 1, 2 und 12", `${AT_MOST_2}${SAME}`), note: noteMore("auf den Seiten 1, 2, 10 und 12", " Seite 10 gibt es zu dieser Frage nicht zum Nachlesen; braucht die Frage diese Seite, sag das kurz.") }), "page 10 not ready by the deadline: said so; at most 2 to read, and to say so if they lack what the question needs", q.p);
+  ok(unterlagen(q.id) === "Nachbarseiten 4, 9 (Bereich 4–9), weitere Seiten 1, 2, 12, nicht bereit 10", "log: not ready", unterlagen(q.id));
+  ok(await waitFor(() => logText().includes(`Weitere Seiten: 1 Seite von ${nb.slice(0, 8)} vorgezeichnet`), 15000, 100), "drawn afterwards while nothing is open");
+  q = await ask(nb, "quick", 6, ctx, { mode: "ok" });
+  ok(q.done && q.p === nbPrompt(q.id, { more: moreNB(q.id, "die Seiten 1, 2, 10 und 12", `${AT_MOST_2}${SAME}`), note: noteMore("auf den Seiten 1, 2, 10 und 12") }) && unterlagen(q.id) === "Nachbarseiten 4, 9 (Bereich 4–9), weitere Seiten 1, 2, 10, 12", "next question: page 10 there (still no time to draw)", [q.p, unterlagen(q.id)]);
+  {
+    // Zwei Seiten nicht rechtzeitig gezeichnet: der Satz dazu in der Mehrzahl
+    const mz = uuid();
+    await api("PUT", `/api/library/${mz}`, { json: { id: mz, title: "Mehrzahl", kind: "notebook", created: now, modified: now, pageCount: 6 } });
+    await syncAdd(mz, [0, 2, 4].map((i) => [uuid(), inkStroke({ top: pageTop(i), x: 100 + 30 * i })]));
+    const m1 = await ask(mz, "quick", 0, null, { mode: "ok" });
+    ok(m1.done && m1.c.weitere === null && await waitFor(() => logText().includes(`Weitere Seiten: 2 Seiten von ${mz.slice(0, 8)} vorgezeichnet`), 15000, 100), "nothing drawn in time: nothing offered, both pages drawn when idle", logOf(m1.id));
+    await syncAdd(mz, [3, 5].map((i) => [uuid(), inkStroke({ top: pageTop(i), x: 100 + 30 * i })]));
+    const m2 = await ask(mz, "quick", 0, null, { mode: "ok" });
+    ok(m2.done && m2.p === ["Neue Frage zum selben Dokument („Mehrzahl“):", `- fragen/${m2.id}/frage.png: die handgeschriebene Frage`,
+      `- fragen/${m2.id}/seite.jpg: die ganze Seite 1, die Frage darauf farbig umrandet`, moreNB(m2.id, "die Seiten 3 und 5"),
+      "Außer der Seite der Frage ist im Notizbuch nur auf den Seiten 3 bis 6 etwas geschrieben; alle anderen Seiten sind leer. Die Seiten 4 und 6 gibt es zu dieser Frage nicht zum Nachlesen; braucht die Frage eine davon, sag das kurz. Such nicht nach anderen Dateien.",
+      "", "Antworte knapp: das Wesentliche in wenigen Sätzen."].join("\n") && unterlagen(m2.id) === "ohne Nachbarseiten (nicht mitgeschickt oder Seiten seither gerückt), weitere Seiten 3, 5, nicht bereit 4, 6", "pages 4 and 6 not ready: said in the plural", [m2.p, unterlagen(m2.id)]);
+  }
+
+  console.log("== weitere Seiten: off in config.json: texts as today, no call to the server");
+  await restartWith(() => cfg({ morePages: { quick: 0, thorough: 0 } }), env);
+  g = getsOf(nb).length;
+  q = await ask(nb, "quick", 6, ctx, { mode: "ok" });
+  ok(q.done && q.p === nbPrompt(q.id, { note: NOTE_TODAY }) && optOf(q.c, "--max-turns") === "30" && q.c.weitere === null && getsOf(nb).length === g, "message as today, nothing fetched", q.p);
+  ok(unterlagen(q.id) === "Nachbarseiten 4, 9 (Bereich 4–9), weitere Seiten aus (config)", "log: off", unterlagen(q.id));
+
+  console.log("== weitere Seiten: daily limit of rows read at the server reached: none");
+  await restartWith(() => cfg({ mirrorRowsPerDay: 1 }), env);
+  g = getsOf(nb).length;
+  q = await ask(nb, "quick", 6, ctx, { mode: "ok" });
+  ok(q.done && q.p === nbPrompt(q.id, { note: NOTE_TODAY }) && unterlagen(q.id) === "Nachbarseiten 4, 9 (Bereich 4–9), weitere Seiten aus: Tageslimit erreicht" && getsOf(nb).length === g, "texts as today, no call", [unterlagen(q.id), getsOf(nb).slice(g)]);
+  await restartWith(() => cfg(), env);
+
+  console.log("== weitere Seiten: a page inserted in the app, its strokes being moved: pages from there withheld");
+  {
+    // Die App lädt nach dem Einfügen jeden Strich darunter eine Seite tiefer mit neuer ID hinauf und löscht die alten
+    // erst mit dem letzten Stück: eine Weile beide („Zwillinge“)
+    const tw = uuid(), pv = Date.now();
+    await api("PUT", `/api/library/${tw}`, { json: { id: tw, title: "Zwillinge", kind: "notebook", created: now, modified: now, pageCount: 7, pagesVersion: pv } });
+    const old = [[uuid(), 3, 150], [uuid(), 3, 420], [uuid(), 4, 200], [uuid(), 4, 520]];
+    await syncAdd(tw, [[uuid(), inkStroke({ top: pageTop(0), x: 90 })], [uuid(), inkStroke({ top: pageTop(1), x: 260, browser: true })],
+      ...old.map(([id, i, x]) => [id, inkStroke({ top: pageTop(i), x })])]);
+    await syncAdd(tw, old.map(([, i, x]) => [uuid(), inkStroke({ top: pageTop(i + 1), x })]));
+    const twPrompt = (id, fresh, more, note) => [
+      ...(fresh ? ["Dokument: „Zwillinge“ (Notizbuch mit 7 Seiten).", "", "Frage:"] : ["Neue Frage zum selben Dokument („Zwillinge“):"]),
+      `- fragen/${id}/frage.png: die handgeschriebene Frage`, `- fragen/${id}/seite.jpg: die ganze Seite 1, die Frage darauf farbig umrandet`,
+      more, note, "", "Antworte knapp: das Wesentliche in wenigen Sätzen."].join("\n");
+    q = await ask(tw, "quick", 0, { pv }, { mode: "ok" });
+    ok(q.done && q.p === twPrompt(q.id, true, moreNB(q.id, "Seite 2"), "Bis Seite 3 ist außer der Seite der Frage nur auf Seite 2 etwas geschrieben; ab Seite 4 werden die Seiten nach einer Seitenänderung gerade neu abgeglichen, von dort gibt es diesmal nichts zum Nachlesen. Such nicht nach anderen Dateien."), "only page 2, and from page 4 on nothing this time", q.p);
+    ok(unterlagen(q.id) === "ohne Nachbarseiten (nicht mitgeschickt oder Seiten seither gerückt), weitere Seiten 2 (1 neu gezeichnet), im Abgleich ab 4", "log: being matched from page 4", unterlagen(q.id));
+    await syncRemove(tw, old.map(([id]) => id));
+    q = await ask(tw, "quick", 0, { pv }, { mode: "ok" });
+    ok(q.done && q.p === twPrompt(q.id, false, moreNB(q.id, "die Seiten 2, 5 und 6"), "Außer der Seite der Frage ist im Notizbuch nur auf den Seiten 2, 5 und 6 etwas geschrieben; alle anderen Seiten sind leer. Such nicht nach anderen Dateien.") && unterlagen(q.id) === "ohne Nachbarseiten (nicht mitgeschickt oder Seiten seither gerückt), weitere Seiten 2, 5, 6 (2 neu gezeichnet)", "old copies removed: pages 2, 5 and 6 at their new place", [q.p, unterlagen(q.id)]);
+  }
+
+  if (!hasPoppler) {
+    console.log("== skipped: weitere Seiten of a PDF (pdfinfo/pdftoppm missing)");
+  } else {
+    console.log("== weitere Seiten: PDF with a landscape page: the PDF page under the notes, cached per PDF version");
+    setPages({ n: 4 });
+    const pd = uuid();
+    const sizes = [[595, 842], [595, 842], [842, 595], [595, 842]];
+    const meta = { id: pd, title: "Skript quer", kind: "pdf", created: now, modified: now, pageCount: 4, pdfVersion: 1 };
+    await api("PUT", `/api/library/${pd}`, { json: meta });
+    await api("PUT", `/api/pdf/${pd}`, { body: makePDF(sizes, 0), headers: { "content-type": "application/pdf" } });
+    const hs = sizes.map(([w, h]) => 768 * h / w);
+    const ptop = (i) => GAP + hs.slice(0, i).reduce((s, h) => s + h + GAP, 0);
+    await syncAdd(pd, [[uuid(), inkStroke({ top: ptop(0) })], [uuid(), inkStroke({ top: ptop(2), x: 300, y: 100 })],
+      [uuid(), inkStroke({ top: ptop(2), x: 60, y: 220, ink: "com.apple.ink.marker", c: [1, 0.9, 0, 0.5] })], [uuid(), inkStroke({ top: ptop(3), browser: true })]]);
+    const MORE_PDF = "weitere Seiten mit Notizen aus der App zum Nachlesen, je Seite eine Datei mit der PDF-Seite und den Notizen darauf, oben mit ihrer Nummer beschriftet, für die Seiten 3 und 4. Der Mac zeichnet die Notizen aus den Strichen am Server nach: Ganz frisch Geschriebenes kann fehlen, und die Striche sehen etwas anders aus als in der App.";
+    const pdCtx = { span: [0, 1], pages: [] };
+    const pdNote = "Von Seite 1 bis 2 gibt es Notizen aus der App nur auf der Seite der Frage; dokument.pdf zeigt das PDF ohne die Notizen aus der App.";
+    const bg0 = bgCalls().length;
+    // Claude liest Seite 3, Seite 4 scheitert (zählt nicht), und Seiten 1 bis 3 aus dokument.pdf
+    q = await ask(pd, "quick", 0, pdCtx, { mode: "ok", readWeitere: [3, 4], readFail: [4], readDokument: "1-3" });
+    ok(q.done && q.p === ["Dokument: „Skript quer“ (PDF mit 4 Seiten).", "Das ganze Dokument liegt in dokument.pdf.", "", "Frage:",
+      `- fragen/${q.id}/frage.png: die handgeschriebene Frage`, `- fragen/${q.id}/seite.jpg: die ganze Seite 1, die Frage darauf farbig umrandet`,
+      `- fragen/${q.id}/weitere/seite-<Nummer>.pdf: ${MORE_PDF}`, `${pdNote} Weiter weg gibt es Notizen aus der App nur auf den Seiten 3 und 4.`,
+      "", "Antworte knapp: das Wesentliche in wenigen Sätzen."].join("\n"), "message: PDF pages with the notes, where else there are notes", q.p);
+    ok(unterlagen(q.id) === "Nachbarseiten keine beschrieben (Bereich 1–2), ganzes PDF (4 Seiten), weitere Seiten 3, 4 (2 neu gezeichnet)", "log", unterlagen(q.id));
+    const vdir = (v) => path.join(HOME, "seitenbilder", pd, `v${v}`);
+    const hoehen = JSON.parse(fs.readFileSync(path.join(vdir(1), "hoehen.json"), "utf8"));
+    ok(hoehen.heights.length === 4 && hoehen.heights.every((h, i) => Math.abs(h - hs[i]) < 0.5) && hoehen.pages[2].w === 842 && hoehen.pages[2].h === 595, "page heights from the PDF (landscape page 3: 768 · 595/842)", hoehen);
+    const bg2 = fs.readFileSync(path.join(vdir(1), "bg-2.jpg")), bg3 = fs.readFileSync(path.join(vdir(1), "bg-3.jpg"));
+    // 595 × 842 pt ist bei 768 Breite 1086,8 hoch, bei 1200 Pixeln Breite 1698
+    ok(JSON.stringify(jpegSize(bg2)) === JSON.stringify({ w: 1600, h: 1131 }) && JSON.stringify(jpegSize(bg3)) === JSON.stringify({ w: 1200, h: 1698 }), "backgrounds exactly as big as the page area (landscape 1600 × 1131, portrait 1200 × 1698)", [jpegSize(bg2), jpegSize(bg3)]);
+    const page3 = path.join(HOME, "chats", pd, "fragen", q.id, "weitere", "seite-3.pdf");
+    const images = execFileSync("pdfimages", ["-list", page3], { encoding: "utf8" });
+    ok(/^Page size:\s+1600 x 1175 pts/m.test(pdfinfo(page3)) && fs.readFileSync(page3).includes(bg2) && /\s1600\s+1131\s+\S+\s+\d+\s+\d+\s+jpeg\s/.test(images), "seite-3.pdf: landscape page with band, the background JPEG embedded unchanged", [pdfinfo(page3), images]);
+    ok(!fs.existsSync(path.join(HOME, "chats", pd, "fragen", q.id, "weitere", "seite-4.pdf")), "seite-4.pdf (its read failed) deleted");
+    const bgs = bgCalls().slice(bg0);
+    ok(bgs.length === 2 && bgs[0].bg.mode === "hoehen" && bgs[1].bg.mode === "bilder" && bgs[1].bg.specs.join(" ") === "2:1600:1131 3:1200:1698" && bgs.every((x) => x.envKeys.length === 0), "osascript: heights once, both backgrounds in one call, clean environment", bgs);
+    st = stateDoc(pd);
+    ok(st.chatBytes === 4000 + 450000 + fs.statSync(page3).size && st.chatPages === 4 && Object.keys(st.gelesen).join(",") === "3", "chat: 3 pages from dokument.pdf (150 KB each) and seite-3.pdf counted, the failed read of seite-4.pdf not", st);
+    ok(logOf(q.id).some((l) => /weitere Seiten gelesen: 3 \(\d+,\d MB\)$/.test(l)), "log: page 3 read", logOf(q.id));
+    q = await ask(pd, "quick", 0, pdCtx, { mode: "ok" });
+    ok(q.done && unterlagen(q.id) === "Nachbarseiten keine beschrieben (Bereich 1–2), ganzes PDF (4 Seiten), weitere Seiten 3, 4" && bgCalls().length === bg0 + 2 && q.p.includes(`${MORE_PDF} Seit du sie in diesem Chat nachgelesen hast, unverändert: Seite 3.\n`), "next question: nothing drawn, osascript not asked", [unterlagen(q.id), q.p]);
+    // Neue PDF-Fassung: neue Höhen und Hintergründe, die alten weg
+    await api("PUT", `/api/pdf/${pd}`, { body: makePDF(sizes, 3), headers: { "content-type": "application/pdf" } });
+    await api("PUT", `/api/library/${pd}`, { json: { ...meta, modified: now + 5, pdfVersion: 2 } });
+    q = await ask(pd, "quick", 0, pdCtx, { mode: "ok" });
+    ok(q.done && unterlagen(q.id) === "Nachbarseiten keine beschrieben (Bereich 1–2), ganzes PDF (4 Seiten), weitere Seiten 3, 4 (2 neu gezeichnet)" && !fs.existsSync(vdir(1)) && fs.existsSync(path.join(vdir(2), "hoehen.json")) && fs.existsSync(path.join(vdir(2), "bg-2.jpg")) && bgCalls().length === bg0 + 4, "new PDF version: drawn again from new backgrounds, the old ones gone", [unterlagen(q.id), fs.readdirSync(path.join(HOME, "seitenbilder", pd))]);
+    ok(q.p.startsWith("Das PDF wurde seit der letzten Frage geändert; dokument.pdf ist neu.\n") && q.p.includes(`${MORE_PDF} Seit du sie in diesem Chat nachgelesen hast, geändert: Seite 3.\n`), "Claude is told page 3 changed since it read it", q.p);
+
+    // Notizen auf Seite 4 nicht bereit (hier scheitert ihr Hintergrund): Es fehlen nur die Notizen, nicht die PDF-Seite
+    fs.writeFileSync(path.join(FAKE, "bg.json"), JSON.stringify({ failPages: [3] }));
+    fs.rmSync(path.join(vdir(2), "bg-3.jpg"));
+    await syncAdd(pd, [[uuid(), inkStroke({ top: ptop(3), x: 400, y: 300 })]]);
+    q = await ask(pd, "quick", 0, pdCtx, { mode: "ok" });
+    fs.rmSync(path.join(FAKE, "bg.json"));
+    ok(q.done && q.p.includes(`\n${pdNote} Weiter weg gibt es Notizen aus der App nur auf den Seiten 3 und 4. Die Notizen auf Seite 4 gibt es zu dieser Frage nicht zum Nachlesen (die PDF-Seite selbst steht in dokument.pdf); braucht die Frage diese Notizen, sag das kurz.\n`) && unterlagen(q.id) === "Nachbarseiten keine beschrieben (Bereich 1–2), ganzes PDF (4 Seiten), weitere Seiten 3, nicht bereit 4", "PDF: notes on page 4 not ready: only the notes are missing, the PDF page is in dokument.pdf", [q.p, unterlagen(q.id)]);
+
+    console.log("== weitere Seiten: the PDF background does not work on this Mac: none for PDFs, notebooks still");
+    fs.writeFileSync(path.join(FAKE, "bg.json"), JSON.stringify({ fail: true }));
+    await restartWith(() => cfg(), env);
+    q = await ask(pd, "quick", 0, pdCtx, { mode: "ok" });
+    ok(q.done && unterlagen(q.id) === "Nachbarseiten keine beschrieben (Bereich 1–2), ganzes PDF (4 Seiten), weitere Seiten aus: PDF-Hintergrund geht nicht" && q.p.includes(`\n${pdNote} Notizen auf weiter entfernten Seiten siehst du zu dieser Frage nicht.\n`) && q.c.weitere === null, "PDF: texts as today", [unterlagen(q.id), q.p]);
+    ok(logText().includes("Weitere Seiten: PDF-Hintergrund geht nicht (execution error: PDFKit kaputt (-2700)), bei PDFs ohne weitere Seiten"), "log says why", logText().split("\n").filter((l) => l.includes("PDF-Hintergrund")).slice(-1));
+    q = await ask(nb, "quick", 6, ctx, { mode: "ok" });
+    ok(q.done && unterlagen(q.id) === "Nachbarseiten 4, 9 (Bereich 4–9), weitere Seiten 1, 2, 10, 12", "notebook in the same run: pages offered", unterlagen(q.id));
+    fs.rmSync(path.join(FAKE, "bg.json"));
+    setPages({ n: 30 });
+  }
+
+  console.log("== weitere Seiten: room in the chat (chatMB): too little for two pages → new chat; not even for one → none");
+  {
+    const pl = uuid();
+    await api("PUT", `/api/library/${pl}`, { json: { id: pl, title: "Platz", kind: "notebook", created: now, modified: now, pageCount: 4 } });
+    await syncAdd(pl, [0, 1, 2, 3].map((i) => [uuid(), inkStroke({ top: pageTop(i), x: 100 + 40 * i, browser: i === 2 })]));
+    const a1 = await ask(pl, "quick", 3, null, { mode: "ok", readWeitere: [1, 3] });
+    const sizes = (a1.c?.weitere || []).map((f) => f.size).sort((x, y) => x - y);
+    const s1 = stateDoc(pl);
+    ok(a1.done && sizes.length === 3 && s1.chatBytes === 4000 + sizeOf(a1.c.weitere, 1) + sizeOf(a1.c.weitere, 3) && s1.chatPages === 2, "first question: the two pages read counted", { s1, w: a1.c?.weitere });
+    const median = sizes[1];
+    await restartWith(() => cfg({ chatMB: (s1.chatBytes + 4000 + 1.5 * median) / 1e6 }), env);
+    const b1 = await ask(pl, "quick", 3, null, { mode: "ok" });
+    ok(b1.done && b1.c.args.includes("--session-id") && b1.p.startsWith("Dokument: „Platz“ (Notizbuch mit 4 Seiten).\n") && b1.p.includes(moreNB(b1.id, "die Seiten 1 bis 3")) && !b1.p.includes("Lies davon") && logOf(b1.id).some((l) => l.includes("zu wenig Platz für weitere Seiten, neuer Chat")), "room for one page in the running chat: new chat, all three offered", [b1.p, logOf(b1.id)]);
+    await restartWith(() => cfg({ chatMB: (4000 + 0.5 * median) / 1e6 }), env);
+    const c1 = await ask(pl, "quick", 3, null, { mode: "ok" });
+    ok(c1.done && c1.p === ["Dokument: „Platz“ (Notizbuch mit 4 Seiten).", "", "Frage:", `- fragen/${c1.id}/frage.png: die handgeschriebene Frage`,
+      `- fragen/${c1.id}/seite.jpg: die ganze Seite 4, die Frage darauf farbig umrandet`,
+      "Zu dieser Frage hast du vom Notizbuch nur diese eine Seite. Such nicht nach anderen Dateien, und braucht die Frage eine Seite, die du nicht siehst, sag das kurz.",
+      "", "Antworte knapp: das Wesentliche in wenigen Sätzen."].join("\n") && optOf(c1.c, "--max-turns") === "30" && c1.c.weitere === null, "not even room for one in a new chat: none, texts as today", c1.p);
+    ok(logOf(c1.id).some((l) => l.endsWith(`${c1.id} weitere Seiten aus: kein Platz im Chat`)) && !fs.existsSync(path.join(HOME, "chats", pl, "fragen", c1.id, "weitere")), "logged, folder removed", logOf(c1.id));
+    // chatMB 0 heißt jede Frage ein neuer Chat, nicht keine weiteren Seiten: Nachgelesen wird wie mit 8 MB
+    await restartWith(() => cfg({ chatMB: 0 }), env);
+    const d1 = await ask(pl, "quick", 3, null, { mode: "ok", readWeitere: [1] });
+    const d2 = await ask(pl, "quick", 3, null, { mode: "ok" });
+    ok([d1, d2].every((x) => x.done && x.c.args.includes("--session-id") && x.p.includes(moreNB(x.id, "die Seiten 1 bis 3")) && !x.p.includes("Lies davon")), "chatMB 0: each question in a new chat, the pages offered as usual", [d1.p, d2.p]);
+    // morePages 1: Ein neuer Chat brächte nicht mehr; im laufenden ist Platz für die eine erlaubte Seite
+    await restartWith(() => cfg({ morePages: { quick: 1 } }), env);
+    const e1 = await ask(pl, "quick", 3, null, { mode: "ok" });
+    const e2 = await ask(pl, "quick", 3, null, { mode: "ok" });
+    ok(e1.done && e2.done && e2.c.args.includes("--resume") && e2.p.includes(moreNB(e2.id, "die Seiten 1 bis 3", " Lies davon höchstens eine; findest du darin nicht, was die Frage braucht, sag das kurz.")) && !logOf(e2.id).some((l) => l.includes("zu wenig Platz")), "morePages 1: the next question continues the chat, at most one page", [e2.c.args, e2.p, logOf(e2.id)]);
+    // Nur eine Seite angeboten, und sie passt noch in den laufenden Chat (zwei passten nicht): kein neuer Chat
+    const one = uuid();
+    await api("PUT", `/api/library/${one}`, { json: { id: one, title: "Eine", kind: "notebook", created: now, modified: now, pageCount: 2 } });
+    await syncAdd(one, [0, 1].map((i) => [uuid(), inkStroke({ top: pageTop(i), x: 120 + 40 * i })]));
+    await restartWith(() => cfg(), env);
+    const f1 = await ask(one, "quick", 0, null, { mode: "ok" });
+    const size1 = sizeOf(f1.c?.weitere || [], 2);
+    await restartWith(() => cfg({ chatMB: (stateDoc(one).chatBytes + 4000 + 1.5 * size1) / 1e6 }), env);
+    const f2 = await ask(one, "quick", 0, null, { mode: "ok" });
+    ok(f1.done && f2.done && size1 > 0 && f2.c.args.includes("--resume") && f2.p.includes(moreNB(f2.id, "Seite 2")) && !f2.p.includes("Lies davon") && !logOf(f2.id).some((l) => l.includes("zu wenig Platz")), "one page offered, room for it in the running chat: the chat continues", [size1, f2.c?.args, f2.p, logOf(f2.id)]);
+    await restartWith(() => cfg(), env);
+  }
+
+  console.log("== weitere Seiten: stream-json lines of many MB (the content of files read): little memory, answered");
+  {
+    setMode({ mode: "ok" });
+    await ask(nb, "quick", 6, ctx);
+    const hwm = () => {
+      try {
+        return Number(/VmHWM:\s+(\d+) kB/.exec(fs.readFileSync(`/proc/${helper.pid}/status`, "utf8"))[1]) * 1024;
+      } catch {
+        return null;
+      }
+    };
+    const h1 = hwm();
+    q = await ask(nb, "quick", 6, ctx, { mode: "ok", bigLines: 3, bigLineMB: 100 });
+    const h2 = hwm();
+    ok(q.done && (await askOf(nb, q.id)).answer.startsWith("Antwort (medium)"), "answered after three lines of 100 MB");
+    if (h1 && h2) ok(h2 - h1 < 100e6, `the helper's memory peak grew by ${((h2 - h1) / 1e6).toFixed(1)} MB (less than one line)`, { h1, h2 });
+    else console.log("  (memory not measured: no /proc)");
+    setMode({ mode: "ok" });
+  }
+
+  console.log("== weitere Seiten: Claude stops without a result line (crash): the error shows nothing of the stream");
+  {
+    // Davor liest Claude eine weitere Seite und schreibt Text daraus: Davon darf nichts in die App oder ins Protokoll
+    setMode({ mode: "noresult", readWeitere: [1] });
+    const x = await createAsk(nb, "quick", 6, ctx);
+    const failed = await waitFor(async () => { const a = await askOf(nb, x.id); return a?.status === "failed" ? a : null; }, 20000, 200);
+    setMode({ mode: "ok" });
+    ok(failed && failed.note === "Claude am Mac: Exit 1", "retried once, then failed with „Claude am Mac: Exit 1“", failed);
+    ok(logOf(x.id).filter((l) => l.endsWith("Claude am Mac: Exit 1")).length === 2 && !logOf(x.id).some((l) => /Geheimnis|"type"|tool_/.test(l)), "log: the same, no line of the stream", logOf(x.id));
+  }
+
+  console.log("== weitere Seiten: Claude Code without stream-json: none, json as before");
+  fs.writeFileSync(path.join(FAKE, "help.json"), JSON.stringify({ version: "new", stream: false }));
+  await restartWith(() => cfg(), env);
+  q = await ask(nb, "quick", 6, ctx, { mode: "ok" });
+  ok(q.done && q.p === nbPrompt(q.id, { note: NOTE_TODAY }) && q.c.args[q.c.args.indexOf("--output-format") + 1] === "json" && !q.c.args.includes("--verbose") && optOf(q.c, "--max-turns") === "30" && q.c.weitere === null && unterlagen(q.id) === "Nachbarseiten 4, 9 (Bereich 4–9), weitere Seiten aus: Claude Code zu alt", "texts as today, json", [unterlagen(q.id), q.c.args]);
+  setHelp("new");
+
+  console.log("== weitere Seiten: helfer.mjs without weitere-seiten.mjs next to it: everything as before");
+  {
+    const ohne = path.join(TMP, "ohne");
+    fs.mkdirSync(ohne, { recursive: true });
+    fs.copyFileSync(HELFER, path.join(ohne, "helfer.mjs"));
+    const lines0 = logText().split("\n").length;
+    await restartWith(() => cfg(), env, path.join(ohne, "helfer.mjs"));
+    const since = logText().split("\n").slice(lines0 - 1);
+    ok(since.filter((l) => /Weitere Seiten aus: .*weitere-seiten\.mjs/.test(l)).length === 1, "logged once at the start", since.filter((l) => l.includes("Weitere Seiten")));
+    const solo2 = uuid();
+    await api("PUT", `/api/library/${solo2}`, { json: { id: solo2, title: "Nur hier", kind: "notebook", created: now, modified: now, pageCount: 5 } });
+    q = await ask(solo2, "quick", 2, soloCtx, { mode: "ok" });
+    ok(q.done && q.p.replaceAll(q.id, "<id>") === soloWith.p && systemOf(q.c) === soloWith.system, "same message and system prompt as with the module when nothing else is written", q.p);
+    ok(q.c.args[q.c.args.indexOf("--output-format") + 1] === "json" && !q.c.args.includes("--verbose") && optOf(q.c, "--max-turns") === "30", "json output as before", q.c.args);
+    q = await ask(nb, "quick", 6, ctx, { mode: "ok", readWeitere: [1] });
+    ok(q.done && q.p === nbPrompt(q.id, { note: NOTE_TODAY }) && q.c.weitere === null && unterlagen(q.id) === "Nachbarseiten 4, 9 (Bereich 4–9)", "written pages elsewhere: nothing offered, texts and log as before", [q.p, unterlagen(q.id)]);
+  }
+
+  console.log("== weitere Seiten: right after a restart (setup) the helper fetches a missing copy of the last documents' strokes");
+  {
+    await restartWith(() => cfg(), env); // wieder der Helfer mit weitere-seiten.mjs daneben
+    const fresh = uuid();
+    await api("PUT", `/api/library/${fresh}`, { json: { id: fresh, title: "Neu da", kind: "notebook", created: now, modified: now, pageCount: 4 } });
+    await syncAdd(fresh, [[uuid(), inkStroke({ top: pageTop(0) })], [uuid(), inkStroke({ top: pageTop(3), x: 220 })]]);
+    q = await ask(fresh, "quick", 1, null, { mode: "ok" });
+    const mirrorDir = path.join(HOME, "spiegel", fresh), claudeRuns = calls().filter((x) => x.args).length;
+    ok(q.done && fs.existsSync(path.join(mirrorDir, "stand.json")), "asked once: its copy exists", q.done);
+    // Wie gleich nach dem Einrichten mit dem neuen Helfer: Die Kopie fehlt noch. Dazu zwei ältere Dokumente ohne Kopie,
+    // deren letzte Frage beim Start gerade älter als 60 Tage ist: Das Aufräumen beim Start löscht sie (und ändert damit fragen/
+    // dieser Dokumente), zu den Dokumenten mit den letzten Fragen macht sie das nicht
+    const older = [uuid(), uuid()];
+    await restartWith(() => {
+      cfg();
+      fs.rmSync(mirrorDir, { recursive: true, force: true });
+      const st = JSON.parse(fs.readFileSync(path.join(HOME, "state.json"), "utf8"));
+      const t = new Date(Date.now() - 61 * 86400000);
+      for (const id of older) {
+        st.docs[id] = {};
+        const f = path.join(HOME, "chats", id, "fragen", uuid());
+        fs.mkdirSync(f, { recursive: true });
+        fs.utimesSync(f, t, t);
+        fs.utimesSync(path.dirname(f), t, t);
+      }
+      fs.writeFileSync(path.join(HOME, "state.json"), JSON.stringify(st, null, 2));
+    }, env);
+    const back = await waitFor(() => { try { return JSON.parse(fs.readFileSync(path.join(mirrorDir, "stand.json"), "utf8")).complete === true; } catch { return false; } }, 10000);
+    ok(back && getsOf(fresh).some((u) => /since=0&/.test(u)) && calls().filter((x) => x.args).length === claudeRuns, "fetched in idle time without a question, Claude not asked", getsOf(fresh));
+    ok(older.every((id) => !getsOf(id).length && !fs.readdirSync(path.join(HOME, "chats", id, "fragen")).length), "not the older documents whose old questions the start just removed", older.map(getsOf));
+    const g0 = getsOf(fresh).length;
+    await restartWith(() => cfg(), env);
+    await sleep(1500);
+    ok(getsOf(fresh).length === g0, "a complete copy is not fetched again at the next start (the next question does that)", getsOf(fresh).slice(g0));
+  }
+
+  console.log("== weitere Seiten: the key never leaves the helper");
+  {
+    const secrets = [KEY, "must-not-leak"].map((s) => Buffer.from(s));
+    const files = [...walk(path.join(HOME, "chats")), ...walk(path.join(HOME, "spiegel")), ...walk(path.join(HOME, "seitenbilder"))];
+    const leaks = [...files.map((f) => f.file), path.join(HOME, "helfer.log"), path.join(FAKE, "calls.jsonl"), ...(fs.existsSync(OSA_LOG) ? [OSA_LOG] : [])]
+      .filter((f) => { const b = fs.readFileSync(f); return secrets.some((s) => b.includes(s)); });
+    ok(files.length > 20 && !leaks.length, `not in chats/, spiegel/, seitenbilder/, the log or the arguments of claude (${files.length} files)`, leaks);
+    ok(!files.some((f) => f.st.isSymbolicLink()) && files.filter((f) => f.file.includes(`${path.sep}weitere${path.sep}`)).every((f) => f.st.nlink === 1), "no links in chats/, every page file a copy of its own");
+    // Ohne poppler gab es keine Fragen zu PDFs, also kein osascript
+    if (!hasPoppler) console.log("  skip  osascript: arguments and environment (pdfinfo/pdftoppm missing)");
+    else {
+      const osa = fs.readFileSync(OSA_LOG, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      const bgArgs = osa.filter((o) => o.argv[2]?.endsWith("hintergrund.js"));
+      ok(bgArgs.length >= 3 && osa.every((o) => !o.leak.length) && bgArgs.every((o) => ["hoehen", "bilder", "farben"].includes(o.argv[3]) && o.argv.slice(4).every((x) => x.startsWith(HOME) || /^\d+:\d+:\d+$/.test(x))), "osascript: only paths in the helper's folder and numbers, no key in its environment", bgArgs.slice(0, 3));
+    }
+  }
+
+  await restartWith(() => writeConfig(), {}, HELFER);
+  proxy.close();
 }

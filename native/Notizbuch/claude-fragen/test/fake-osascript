@@ -1,6 +1,15 @@
 #!/usr/bin/env node
 // Ersatz für osascript in Tests des Helfers (Linux): seiten.js mit -l JavaScript <script> <pdf> <ziel> <von> <bis>,
 // oder -e (Mitteilung). $FAKE_STATE/pages.json: { "n": <Seitenzahl>, "fail": true }
+// hintergrund.js (weitere-seiten.mjs, erkannt an „// BetterNotes hintergrund v1“) mit -l JavaScript <script> <Art> …:
+// hoehen <pdf> über pdfinfo -box (CropBox, Drehung), bilder <pdf> <ordner> i:B:H … über pdftoppm (CropBox, Drehung, ohne
+// Anmerkungen, JPEG Qualität 60, genau B × H Pixel nach der Drehung), farben <ordner> i:x:y … (das JPEG in ein PDF
+// gepackt und mit pdftoppm als PPM gelesen); gibt dasselbe JSON aus wie das echte Skript. Jeder Aufruf steht in
+// calls.jsonl als { bg: { mode, pdf, specs }, envKeys }. $FAKE_STATE/bg.json: { "fail": true } (osascript scheitert),
+// { "wrongSize": true } (Bilder 1 Pixel zu breit), { "failPages": [i, …] } (diese Seiten scheitern), { "delayMs": <ms> }
+// (wartet vor dem Zeichnen), { "pageMs": <ms> } (braucht je Seite so lange, jede ist gleich fertig), { "slowPages": { "<i>": <ms> } }
+// (diese Seiten brauchen so lange, etwa eine, an der PDFKit hängt), { "blank": true } (zeichnet nichts, nur Weiß), { "noRotate": true } (übersieht /Rotate),
+// { "noCrop": true } (übersieht die CropBox): wie ein PDFKit, das anders zeichnet als die App
 const fs = require("fs"), path = require("path");
 const DIR = process.env.FAKE_STATE || path.join(require("os").tmpdir(), "betternotes-fake");
 fs.mkdirSync(DIR, { recursive: true });
@@ -10,6 +19,11 @@ if (process.argv[2] === "-e") {
   fs.appendFileSync(path.join(DIR, "calls.jsonl"), JSON.stringify({ notify: process.argv[3] }) + "\n");
   process.exit(0);
 }
+{
+  let text = "";
+  try { text = fs.readFileSync(process.argv[4], "utf8"); } catch {}
+  if (text.includes("// BetterNotes hintergrund v1")) background(process.argv.slice(5));
+}
 const [l, lang, script, pdf, target, from, to] = process.argv.slice(2);
 fs.appendFileSync(path.join(DIR, "calls.jsonl"), JSON.stringify({ osascript: { l, lang, script: path.basename(script), scriptOK: fs.readFileSync(script, "utf8").includes("insertPageAtIndex"), pdf: path.basename(pdf), from, to }, envKeys: Object.keys(process.env).filter((k) => /NOTIZBUCH|BETTERNOTES/i.test(k)) }) + "\n");
 if (cfg.fail) { process.stderr.write("execution error: PDFKit kaputt (-2700)\n"); process.exit(1); }
@@ -17,3 +31,104 @@ const n = cfg.n, first = Math.max(0, Number(from)), last = Math.min(n - 1, Numbe
 if (first > last) { process.stdout.write("leer " + n + "\n"); process.exit(0); }
 fs.writeFileSync(target, "%PDF-1.4 window " + first + "-" + last);
 process.stdout.write(`ok ${first + 1} ${last + 1} ${n}\n`);
+
+function background([mode, pdf, ...rest]) {
+  const { execFileSync } = require("child_process");
+  const print = (x) => { process.stdout.write(JSON.stringify(x) + "\n"); process.exit(0); };
+  let bg = {};
+  try { bg = JSON.parse(fs.readFileSync(path.join(DIR, "bg.json"), "utf8")); } catch {}
+  fs.appendFileSync(path.join(DIR, "calls.jsonl"), JSON.stringify({ bg: { mode, pdf: path.basename(String(pdf)), specs: mode === "bilder" ? rest.slice(1) : mode === "farben" ? rest : [] }, envKeys: Object.keys(process.env).filter((k) => /NOTIZBUCH|BETTERNOTES/i.test(k)) }) + "\n");
+  if (bg.fail) { process.stderr.write("execution error: PDFKit kaputt (-2700)\n"); process.exit(1); }
+  if (bg.delayMs) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, bg.delayMs);
+  if (mode === "farben") print({ c: rest.map((spec) => pixel(pdf, spec)) });
+  let n = 0;
+  try { n = Number((execFileSync("pdfinfo", [pdf], { encoding: "utf8" }).match(/^Pages:\s+(\d+)/m) || [])[1]) || 0; } catch {}
+  if (!n) print({ error: "PDF lässt sich nicht öffnen" });
+  if (mode === "hoehen") {
+    const box = execFileSync("pdfinfo", ["-f", "1", "-l", String(n), "-box", pdf], { encoding: "utf8" });
+    const pages = [], heights = [];
+    for (let i = 1; i <= n; i++) {
+      const rot = Number((box.match(new RegExp(`^Page\\s+${i} rot:\\s+(-?\\d+)`, "m")) || [])[1]) || 0;
+      const [x0, y0, x1, y1] = (box.match(new RegExp(`^Page\\s+${i} CropBox:\\s+(\\S+)\\s+(\\S+)\\s+(\\S+)\\s+(\\S+)`, "m")) || []).slice(1).map(Number);
+      const r = ((rot % 360) + 360) % 360, turned = r === 90 || r === 270, w = x1 - x0, h = y1 - y0;
+      const W = turned ? h : w, H = turned ? w : h;
+      pages.push({ w, h, rot: r });
+      heights.push(W > 0 ? 768 * H / W : 768 * 297 / 210);
+    }
+    print({ pages, heights });
+  }
+  if (mode !== "bilder") print({ error: "unbekannt" });
+  const [dir, ...specs] = rest;
+  const ok = [], fail = [];
+  // Die Knöpfe ändern eine Kopie des PDFs, gleich lang (die Verweise im PDF bleiben gültig)
+  if (bg.blank || bg.noRotate || bg.noCrop) {
+    let text = fs.readFileSync(pdf, "latin1");
+    if (bg.blank) text = text.replace(/\/Contents/g, "/Kontents");
+    if (bg.noRotate) text = text.replace(/\/Rotate\s+-?\d+/g, (m) => "/Rotate 0".padEnd(m.length, " "));
+    if (bg.noCrop) text = text.replace(/\/CropBox/g, "/KropBox");
+    pdf = path.join(DIR, "knoepfe.pdf");
+    fs.writeFileSync(pdf, text, "latin1");
+  }
+  for (const spec of specs) {
+    const m = /^(\d{1,5}):(\d{1,5}):(\d{1,5})$/.exec(spec);
+    if (!m) continue;
+    const i = Number(m[1]), pw = Number(m[2]) + (bg.wrongSize ? 1 : 0), ph = Number(m[3]);
+    try {
+      if (bg.pageMs) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, bg.pageMs);
+      if (bg.slowPages?.[i]) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, bg.slowPages[i]);
+      if (i >= n || (bg.failPages || []).includes(i)) throw new Error("Seite fehlt");
+      const tmp = path.join(dir, `bg-${i}.tmp`);
+      execFileSync("pdftoppm", ["-jpeg", "-jpegopt", "quality=60", "-hide-annotations", "-cropbox", "-scale-dimension-before-rotation",
+        "-f", String(i + 1), "-l", String(i + 1), "-scale-to-x", String(pw), "-scale-to-y", String(ph), "-singlefile", pdf, tmp], { stdio: "ignore" });
+      fs.renameSync(tmp + ".jpg", path.join(dir, `bg-${i}.jpg`));
+      ok.push(i);
+    } catch {
+      fail.push(i);
+    }
+  }
+  print({ ok, fail });
+}
+
+/// farben: Pixel x, y (oben links 0, 0) von <ordner>/bg-<i>.jpg als [r, g, b], sonst null
+function pixel(dir, spec) {
+  const { execFileSync } = require("child_process");
+  const m = /^(\d{1,5}):(\d{1,5}):(\d{1,5})$/.exec(spec);
+  if (!m) return null;
+  pixel.cache = pixel.cache || {};
+  if (!(m[1] in pixel.cache)) {
+    pixel.cache[m[1]] = null;
+    try {
+      const jpg = fs.readFileSync(path.join(dir, `bg-${m[1]}.jpg`));
+      // Größe aus dem SOF-Abschnitt
+      let w = 0, h = 0;
+      for (let i = 2; i + 9 < jpg.length;) {
+        const len = jpg.readUInt16BE(i + 2);
+        if (jpg[i + 1] >= 0xc0 && jpg[i + 1] <= 0xc3) { h = jpg.readUInt16BE(i + 5); w = jpg.readUInt16BE(i + 7); break; }
+        i += 2 + len;
+      }
+      if (!w || !h) throw new Error("kein JPEG");
+      const content = `q ${w} 0 0 ${h} 0 0 cm /I Do Q`;
+      const head = `%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n` +
+        `3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 ${w} ${h}] /Contents 4 0 R /Resources << /XObject << /I 5 0 R >> >> >> endobj\n` +
+        `4 0 obj << /Length ${content.length} >> stream\n${content}\nendstream endobj\n` +
+        `5 0 obj << /Type /XObject /Subtype /Image /Width ${w} /Height ${h} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpg.length} >> stream\n`;
+      const file = path.join(DIR, "farben.pdf");
+      fs.writeFileSync(file, Buffer.concat([Buffer.from(head, "latin1"), jpg, Buffer.from("\nendstream endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n", "latin1")]));
+      execFileSync("pdftoppm", ["-scale-to-x", String(w), "-scale-to-y", String(h), "-singlefile", file, path.join(DIR, "farben")], { stdio: "ignore" });
+      const ppm = fs.readFileSync(path.join(DIR, "farben.ppm"));
+      // P6, Breite, Höhe, 255, je ein Leerzeichen bzw. Zeilenende dazwischen
+      let at = 0, fields = [];
+      while (fields.length < 4) {
+        while (/\s/.test(String.fromCharCode(ppm[at]))) at++;
+        let t = "";
+        while (!/\s/.test(String.fromCharCode(ppm[at]))) t += String.fromCharCode(ppm[at++]);
+        fields.push(t);
+      }
+      pixel.cache[m[1]] = { w: Number(fields[1]), h: Number(fields[2]), data: ppm.subarray(at + 1) };
+    } catch {}
+  }
+  const img = pixel.cache[m[1]], x = Number(m[2]), y = Number(m[3]);
+  if (!img || x >= img.w || y >= img.h) return null;
+  const k = (y * img.w + x) * 3;
+  return [img.data[k], img.data[k + 1], img.data[k + 2]];
+}
