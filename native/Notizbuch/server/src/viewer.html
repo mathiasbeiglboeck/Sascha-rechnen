@@ -112,7 +112,45 @@ body.lassoing .page canvas.ink { cursor:crosshair; }
 #sel-bar { position:absolute; left:0; bottom:100%; margin-bottom:6px; display:flex; gap:4px; white-space:nowrap; }
 #sel-bar button { font:13px var(--f); border:0; border-radius:7px; padding:5px 9px; background:var(--text); color:var(--bar); cursor:pointer; }
 #tools #paste[hidden] { display:none; }
+#tools #export[aria-disabled="true"] { opacity:.45; cursor:progress; }
+/* Sichern geht, solange die Ansicht verbunden ist: Dann zeigt sie den neuesten Stand. Ohne Verbindung und nach dem
+   Ende des Teilens ist die Leiste wie bisher */
+#tools:has(#status:not(.live)) #export { display:none; }
+/* Handy: „Als PDF sichern“ steht im Nur-Sehen-Modus oben bei Name und Status (beim Bearbeiten nicht, dort ist die
+   Leiste voll). Damit „Bearbeiten“ daneben Platz hat, kürzt sich der Name etwas früher. Mit dem Auge für Gäste ist der
+   Status zu lang dafür: Dann bekommt der Name seine alte Breite, „Bearbeiten“ rückt wie bisher darunter (ebenso ohne
+   Verbindung, wenn der Knopf fehlt) */
+body.phone.editing #tools #export { display:none; }
+body.phone #tools #export { height:26px; }
+@media (max-width:700px) {
+  #tools #export { order:-2; }
+  body.phone:not(.editing) #title { max-width:max(90px, min(200px, 45vw, calc(100vw - 260px))); }
+}
+@media (max-width:440px) {
+  body.phone:not(.editing) #title { max-width:max(90px, min(200px, 45vw, calc(100vw - 252px))); }
+}
+@media (max-width:700px) {
+  body.phone:not(.editing) #tools:has(#status svg) #title,
+  body.phone:not(.editing) #tools:has(#status:not(.live)) #title { max-width:min(200px, 45vw); }
+}
+/* Breites Fenster: Mit „Einfügen“ oder dem Auge für Gäste wird die eine Zeile durch den neuen Knopf sonst gerade zu
+   lang. Der Name gibt dann so viel Platz her wie nötig (etwas mehr, für andere Schriften), aber nur, wenn der Knopf
+   da ist (verbunden; das Auge gibt es nur dann) */
+@media (min-width:701px) and (max-width:820px) {
+  body:not(.phone) #tools:has(#paste:not([hidden])):has(#status.live) #title,
+  body:not(.phone) #tools:has(#status svg) #title { max-width:max(48px, min(83px, calc(100vw - 646px))); }
+  body:not(.phone) #tools:has(#paste:not([hidden])):has(#status.live svg) #title { max-width:max(48px, min(83px, calc(100vw - 678px))); }
+}
+@media (min-width:821px) {
+  body:not(.phone) #tools:has(#paste:not([hidden])):has(#status.live) #title { max-width:min(163px, calc(100vw - 685px)); }
+  body:not(.phone) #tools:has(#status svg) #title { max-width:min(163px, calc(100vw - 681px)); }
+  body:not(.phone) #tools:has(#paste:not([hidden])):has(#status.live svg) #title { max-width:min(163px, calc(100vw - 717px)); }
+}
 #msg { max-width:520px; margin:80px auto; text-align:center; color:var(--muted); line-height:1.5; padding:0 16px; }
+#toast { position:fixed; left:50%; bottom:calc(18px + env(safe-area-inset-bottom)); transform:translateX(-50%); z-index:8;
+  width:max-content; max-width:calc(100% - 32px); box-sizing:border-box; padding:8px 14px; border-radius:16px;
+  background:rgba(35,48,42,.9); color:var(--bar); font:13px/1.35 var(--f); text-align:center; pointer-events:none; }
+#toast:empty { opacity:0; }
 </style>
 </head>
 <body>
@@ -141,6 +179,9 @@ body.lassoing .page canvas.ink { cursor:crosshair; }
   <i class="sep"></i>
   <button id="follow" class="on" title="Mitscrollen, wo gerade geschrieben wird">Folgen</button>
   <span id="status">verbinde …</span>
+  <button id="export" class="icon" title="Als PDF sichern: alle Seiten mit den Notizen" aria-label="Als PDF sichern">
+    <svg viewBox="0 0 24 24"><path d="M12 4.5v10M7.8 10.6l4.2 4.2 4.2-4.2"/><path d="M5 15v2.5A2.5 2.5 0 0 0 7.5 20h9a2.5 2.5 0 0 0 2.5-2.5V15"/></svg>
+  </button>
   <button id="edit" title="Mit dem Finger zeichnen; zwei Finger scrollen und zoomen">
     <svg viewBox="0 0 24 24"><path d="M4.5 19.5l1-4.2L15.8 5a1.9 1.9 0 0 1 2.7 0l.5.5a1.9 1.9 0 0 1 0 2.7L8.7 18.5z"/><path d="M14 6.8l3.2 3.2"/></svg>Bearbeiten
   </button>
@@ -151,6 +192,7 @@ body.lassoing .page canvas.ink { cursor:crosshair; }
 </div></div>
 <div id="pages"></div>
 <div id="msg" hidden></div>
+<div id="toast" role="status" aria-live="polite"></div>
 <div id="eraser-cursor"></div>
 <svg id="lasso-svg"><path d=""></path></svg>
 <div id="sel"><div id="sel-bar">
@@ -1176,6 +1218,513 @@ async function load(isReload) {
     throw e;
   }
 }
+
+// ---------- Als PDF sichern ----------
+// Alle Seiten mit den Notizen, wie die App exportiert (PDFExport.swift): Notizbuchseiten als A4 mit Karos (ohne die
+// leeren Seiten am Ende), PDF-Seiten in Originalgröße. Bei einem PDF bleibt das Original samt Text und Links erhalten,
+// die Notizen kommen als eigener Inhalt dazu, als Vektoren wie in drawWire. Anmerkungen des Originals (Formularfelder,
+// Markierungen), die unter Notizen liegen, werden dabei Teil der Seite, damit die Notizen wie hier darüber bleiben.
+// Liest pdf-lib das PDF nicht (verschlüsselt, beschädigt) oder sieht eine Seite dort anders aus als hier, übernimmt es
+// die Seiten aus pdf.js als Bild. Alles geschieht hier im Browser mit dem, was die Ansicht schon geladen hat (das PDF
+// über pdf.js): Der Server merkt vom Sichern nichts. pdf-lib lädt erst beim ersten Sichern, die Ansicht startet so
+// schnell wie bisher. pdf-lib 1.17.1 genau wie im npm-Paket (beide Adressen liefern es unverändert, die Prüfsumme gilt
+// für beide)
+const PDFLIB_URLS = ["https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js",
+  "https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"];
+const PDFLIB_SRI = "sha384-weMABwrltA6jWR8DDe9Jp5blk+tZQh7ugpCsF3JwSA53WZM9/14PjS5LAJNHNjAI";
+const A4W = 595.28;   // Breite einer Notizbuchseite im PDF (Punkte), wie in der App
+const INK_MIN = 0.4;  // dünnste Linie in Seitenpunkten (etwa 0,1 mm), damit beim Drucken nichts verschwindet
+const MARKER_INK = "com.apple.ink.marker";
+const CHANGED = new Error("Dokument geändert");
+const exportBtn = document.getElementById("export"), toastEl = document.getElementById("toast");
+let pdfLib = null, exporting = false, toastTimer;
+/// Kurzer Hinweis unten (leer = weg). Das Element bleibt immer da, damit Bildschirmleser jede Änderung vorlesen
+function toast(text, ms = 0) {
+  clearTimeout(toastTimer);
+  toastEl.textContent = text;
+  if (ms) toastTimer = setTimeout(() => { toastEl.textContent = ""; }, ms);
+}
+/// Gibt den Browser kurz frei. Über MessageChannel statt setTimeout: Im Hintergrund-Tab drosseln Browser Zeitgeber bis
+/// auf einmal pro Minute, und das Sichern stünde dann fast still
+const breathe = () => new Promise((resolve) => {
+  const channel = new MessageChannel();
+  channel.port1.onmessage = () => { channel.port1.close(); resolve(); };
+  channel.port2.postMessage(null);
+});
+/// Wartet auf p, eine Antwort von pdf.js zum PDF source. Zeigt die Ansicht inzwischen ein neues PDF (vom iPad), hat sie
+/// das alte beendet, und pdf.js antwortet darauf womöglich nie mehr: dann gleich CHANGED
+function same(source, p) {
+  let timer;
+  const changed = new Promise((resolve, reject) => {
+    timer = setInterval(() => { if (pdf !== source) reject(CHANGED); }, 250);
+  });
+  return Promise.race([p, changed]).finally(() => clearInterval(timer));
+}
+/// pdf-lib von der ersten Adresse, die antwortet (je höchstens 20 Sekunden)
+function loadPdfLib() {
+  if (window.PDFLib) return Promise.resolve(fixNames(window.PDFLib));
+  const load = (src) => new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    const fail = () => { clearTimeout(timer); s.remove(); reject(new Error("pdf-lib fehlt")); };
+    const timer = setTimeout(fail, 20000);
+    s.src = src; s.integrity = PDFLIB_SRI; s.crossOrigin = "anonymous";
+    s.onload = () => { clearTimeout(timer); window.PDFLib ? resolve(window.PDFLib) : fail(); };
+    s.onerror = fail;
+    document.head.appendChild(s);
+  });
+  pdfLib = pdfLib || PDFLIB_URLS.reduce((p, src) => p.catch(() => window.PDFLib || load(src)), Promise.reject())
+    .then(fixNames).catch((e) => { pdfLib = null; throw e; });
+  return pdfLib;
+}
+/// pdf-lib erkennt #xx in Namen nur mit Großbuchstaben: /F#c3#a4 schriebe es als anderen Namen zurück, und Schriften
+/// oder Bilder, die der Inhalt so nennt, fehlten dann. Einmal alle #xx groß schreiben, bevor pdf-lib sie liest
+function fixNames(lib) {
+  if (!lib.PDFName.bnFixed) {
+    const of = lib.PDFName.of;
+    lib.PDFName.of = (name) => of(String(name).replace(/#([0-9a-f]{2})/gi, (m, hex) => "#" + hex.toUpperCase()));
+    lib.PDFName.bnFixed = true;
+  }
+  return lib;
+}
+const num = (v) => String(Math.round(v * 100) / 100);
+// Punkte der Striche auf 0,1 (etwa 0,03 mm): unsichtbar, macht das PDF aber ein gutes Stück kleiner
+const pt = (v) => String(Math.round(v * 10) / 10);
+/// Wo ein Strich wirklich Tinte hinterlässt (Punkte ± halbe Breite wie in drawWire), oder null, wenn er nicht
+/// gezeichnet wird (kaputte oder unsinnig große Werte: Zahlen wie 1e+21 wären im PDF ungültig)
+function inkBounds(wire) {
+  const p = wire?.p;
+  if (!Array.isArray(p) || !p.length) return null;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const q of p) {
+    if (!Array.isArray(q) || q.length < 9 || !q.every(Number.isFinite)) return null;
+    const r = Math.max(pw(q), INK_MIN) / 2;
+    if (Math.abs(q[0]) > 1e5 || Math.abs(q[1]) > 1e8 || r > 500) return null;
+    x0 = Math.min(x0, q[0] - r); x1 = Math.max(x1, q[0] + r);
+    y0 = Math.min(y0, q[1] - r); y1 = Math.max(y1, q[1] + r);
+  }
+  return { x0, y0, x1, y1 };
+}
+/// Die Striche, die auf Seite f Tinte hinterlassen
+const onPage = (snap, f) => snap.wires.filter((s) => s.y1 > f.y && s.y0 < f.y + f.h);
+/// Karos wie PageView.drawGrid beim Export: 0,5 Seitenpunkte breit, grau 0,82, Linien bis an den Rand
+function gridContent(f) {
+  let c = "q 0.82 G 0.5 w\n";
+  for (let k = 0; k * GRID <= W + 1e-6; k++) c += `${num(k * GRID)} 0 m ${num(k * GRID)} ${num(f.h)} l\n`;
+  for (let k = 0; k * GRID <= f.h + 1e-6; k++) c += `0 ${num(k * GRID)} m ${num(W)} ${num(k * GRID)} l\n`;
+  return c + "S Q\n";
+}
+/// Die Tinte einer Seite als PDF-Inhalt, in Seitenpunkten ab der linken oberen Ecke (y nach unten), an der Seite
+/// abgeschnitten. Jeder Strich als Kurve durch die Mittelpunkte seiner Punkte wie drawWire, mit dessen Breite (pw),
+/// runde Enden, Breite je Abschnitt (gleiche Breiten in einem Pfad). Ein Punkt (auch mehrere Punkte an derselben
+/// Stelle) als Kreis, wie PencilKit ihn zeigt. Deckkraft unter 1 und Textmarker (multipliziert, damit Gedrucktes
+/// darunter lesbar bleibt) über den Grafikzustand gs(Deckkraft, Textmarker)
+function inkContent(f, wires, gs) {
+  const unit = (v, d) => (Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : d);
+  let c = `0 0 ${num(W)} ${num(f.h)} re W n 1 J 1 j\n`, color = null;
+  for (const { wire } of wires) {
+    const p = wire.p;
+    const col = Array.isArray(wire.c) ? wire.c : [];
+    const rgb = [0, 1, 2].map((j) => String(Math.round(unit(col[j], 0) * 1000) / 1000)).join(" ");
+    const alpha = unit(col[3], 1), marker = wire.ink === MARKER_INK, wrap = alpha < 1 || marker;
+    if (wrap) c += `q ${gs(alpha, marker)} gs ${rgb} RG ${rgb} rg\n`;
+    else if (rgb !== color) { c += `${rgb} RG ${rgb} rg\n`; color = rgb; }
+    const X = (q) => q[0], Y = (q) => q[1] - f.y;
+    const sx = pt(X(p[0])), sy = pt(Y(p[0]));
+    if (p.every((q) => pt(X(q)) === sx && pt(Y(q)) === sy)) {
+      // Ein Pfad ohne Länge erschiene in manchen Programmen gar nicht
+      const r = p.reduce((most, q) => Math.max(most, pw(q)), INK_MIN) / 2, x = X(p[0]), y = Y(p[0]), k = 0.5523 * r;
+      c += `${num(x + r)} ${num(y)} m ${num(x + r)} ${num(y + k)} ${num(x + k)} ${num(y + r)} ${num(x)} ${num(y + r)} c ` +
+        `${num(x - k)} ${num(y + r)} ${num(x - r)} ${num(y + k)} ${num(x - r)} ${num(y)} c ` +
+        `${num(x - r)} ${num(y - k)} ${num(x - k)} ${num(y - r)} ${num(x)} ${num(y - r)} c ` +
+        `${num(x + k)} ${num(y - r)} ${num(x + r)} ${num(y - k)} ${num(x + r)} ${num(y)} c f\n`;
+    } else {
+      // Durchscheinend (Textmarker): eine Breite für den ganzen Strich, ein Pfad. Sonst wären die Stellen, an denen
+      // zwei Abschnitte mit verschiedener Breite aneinanderstoßen, doppelt gefärbt
+      const fixed = wrap ? p.reduce((sum, q) => sum + pw(q), 0) / p.length : null;
+      let width = null;
+      for (let i = 1; i < p.length; i++) {
+        const a = p[i - 1], b = p[i], ax = X(a), ay = Y(a), bx = X(b), by = Y(b);
+        const m0x = i === 1 ? ax : (X(p[i - 2]) + ax) / 2, m0y = i === 1 ? ay : (Y(p[i - 2]) + ay) / 2;
+        const last = i === p.length - 1;
+        const m1x = last ? bx : (ax + bx) / 2, m1y = last ? by : (ay + by) / 2;
+        const wv = Math.round(Math.max(fixed ?? (pw(a) + pw(b)) / 2, INK_MIN) * 20) / 20;
+        if (wv !== width) {
+          if (width !== null) c += "S\n";
+          c += `${num(wv)} w ${pt(m0x)} ${pt(m0y)} m\n`;
+          width = wv;
+        }
+        // Die quadratische Kurve von drawWire (Kontrollpunkt a) als kubische
+        c += `${pt(m0x + (2 / 3) * (ax - m0x))} ${pt(m0y + (2 / 3) * (ay - m0y))} ` +
+          `${pt(m1x + (2 / 3) * (ax - m1x))} ${pt(m1y + (2 / 3) * (ay - m1y))} ${pt(m1x)} ${pt(m1y)} c\n`;
+      }
+      c += "S\n";
+    }
+    if (wrap) c += "Q\n";
+  }
+  return c;
+}
+/// Grafikzustände (Deckkraft, Textmarker) für Seite page: gs(Deckkraft, Textmarker) liefert ihren Namen auf der Seite.
+/// states: dieselben Zustände für das ganze Dokument
+function stateNames(out, page, states) {
+  const names = new Map();
+  return (alpha, marker) => {
+    const key = `${Math.round(alpha * 1000)}|${marker ? 1 : 0}`;
+    if (!names.has(key)) {
+      let ref = states.get(key);
+      if (!ref) {
+        const a = Math.round(alpha * 1000) / 1000;
+        ref = out.context.register(out.context.obj(marker ? { Type: "ExtGState", CA: a, ca: a, BM: "Multiply" }
+          : { Type: "ExtGState", CA: a, ca: a }));
+        states.set(key, ref);
+      }
+      // Ein Name, den die Seite noch nicht kennt (pdf-lib klammert dabei den alten Inhalt in q … Q)
+      names.set(key, page.node.newExtGState("BNInk", ref).asString());
+    }
+    return names.get(key);
+  };
+}
+/// Inhalt als komprimierter Datenstrom. CompressionStream rechnet nebenher, ohne die Seite anzuhalten (sonst pdf-lib)
+async function contentRef(out, text) {
+  if (typeof CompressionStream === "function") {
+    try {
+      const z = await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream("deflate"))).arrayBuffer();
+      return out.context.register(out.context.stream(new Uint8Array(z), { Filter: "FlateDecode" }));
+    } catch {}
+  }
+  return out.context.register(out.context.flateStream(text));
+}
+const matrix = (m) => m.map((v) => String(Math.round(v * 1e6) / 1e6)).join(" ");
+/// Schreibt Karos (nur Notizbuch) und Tinte der Seite f als eigenen Inhalt ans Ende der PDF-Seite page. m bildet
+/// Seitenpunkte (oben links, y nach unten) auf die Seite im PDF ab. before: PDF-Inhalt, der davor in der normalen
+/// Abbildung der Seite gezeichnet wird (Anmerkungen des Originals)
+async function addInk(out, page, m, f, wires, { grid = false, gs, before = "" }) {
+  const body = (grid ? gridContent(f) : "") + (wires.length ? inkContent(f, wires, gs) : "");
+  page.node.normalize();
+  page.node.addContentStream(await contentRef(out, `${before}q\n${matrix(m)} cm\n${body}Q\n`));
+}
+async function notebookPDF(lib, snap, step) {
+  const out = await lib.PDFDocument.create(), states = new Map(), k = A4W / W;
+  for (let i = 0; i < snap.frames.length; i++) {
+    const f = snap.frames[i], page = out.addPage([A4W, f.h * k]);
+    await addInk(out, page, [k, 0, 0, -k, 0, f.h * k], f, onPage(snap, f), { grid: true, gs: stateNames(out, page, states) });
+    await step(i + 1);
+  }
+  return out;
+}
+/// Sichtbarer Ausschnitt und Drehung, wie pdf.js sie zeigt: CropBox, soweit sie in der MediaBox liegt, sonst die
+/// MediaBox; /Rotate auf 0, 90, 180 oder 270
+function viewOf(page) {
+  const box = (b) => [Math.min(b.x, b.x + b.width), Math.min(b.y, b.y + b.height),
+    Math.max(b.x, b.x + b.width), Math.max(b.y, b.y + b.height)];
+  const media = box(page.getMediaBox()), crop = box(page.getCropBox());
+  let view = [Math.max(media[0], crop[0]), Math.max(media[1], crop[1]), Math.min(media[2], crop[2]), Math.min(media[3], crop[3])];
+  if (!(view[2] > view[0] && view[3] > view[1])) view = media;
+  const r = page.getRotation().angle;
+  return { view, rotate: r % 90 ? 0 : ((r % 360) + 360) % 360 };
+}
+/// Abbildung Seitenpunkte → PDF für einen Ausschnitt view mit Drehung rotate. null, wenn die Seite hier anders hoch ist
+function pageMatrix({ view, rotate }, f) {
+  const [x0, y0, x1, y1] = view, turned = rotate === 90 || rotate === 270;
+  const dw = turned ? y1 - y0 : x1 - x0, dh = turned ? x1 - x0 : y1 - y0;
+  if (!(dw > 0) || !(dh > 0) || Math.abs((W * dh) / dw - f.h) > 0.5) return null;
+  const k = dw / W;
+  return rotate === 0 ? [k, 0, 0, -k, x0, y1] : rotate === 90 ? [0, k, k, 0, x0, y0]
+    : rotate === 180 ? [-k, 0, 0, k, x1, y0] : [0, -k, -k, 0, x1, y1];
+}
+/// Wie oft der Original-Inhalt einer Seite Q ohne offenes q hat (under), wie viele q am Ende offen bleiben (open) und
+/// ob ein Text (BT ohne ET) offen bleibt. pdf-lib klammert den Inhalt in ein q … Q, die Notizen danach verlassen sich
+/// darauf, mit dem Ausgangszustand der Seite zu beginnen
+function balance(lib, out, page) {
+  const raw = page.node.get(lib.PDFName.of("Contents")), contents = raw && out.context.lookup(raw);
+  const list = !contents ? [] : contents instanceof lib.PDFArray ? contents.asArray().map((r) => out.context.lookup(r)) : [contents];
+  const space = (c) => c === 0 || c === 9 || c === 10 || c === 12 || c === 13 || c === 32;
+  const delim = (c) => c === 40 || c === 41 || c === 60 || c === 62 || c === 91 || c === 93 || c === 123 || c === 125 || c === 47 || c === 37;
+  let depth = 0, under = 0, text = false;
+  for (const s of list) {
+    if (!(s instanceof lib.PDFRawStream)) throw new Error("Inhalt unlesbar");
+    if (!s.contents.length) continue; // leer: pdf.js zeichnet nichts (pdf-lib hielte es für kaputt)
+    const b = lib.decodePDFRawStream(s).decode();
+    for (let i = 0; i < b.length;) {
+      const c = b[i];
+      if (space(c)) i++;
+      else if (c === 37) { while (i < b.length && b[i] !== 10 && b[i] !== 13) i++; }      // % Kommentar
+      else if (c === 40) {                                                                   // (Text)
+        let open = 1; i++;
+        while (i < b.length && open) { const d = b[i++]; if (d === 92) i++; else if (d === 40) open++; else if (d === 41) open--; }
+      } else if (c === 60 && b[i + 1] === 60) i += 2;                                          // << Wörterbuch
+      else if (c === 60) { while (i < b.length && b[i] !== 62) i++; i++; }                    // <hex>
+      else if (c === 47) { i++; while (i < b.length && !space(b[i]) && !delim(b[i])) i++; }    // /Name
+      else if (delim(c)) i++;
+      else {
+        const start = i;
+        while (i < b.length && !space(b[i]) && !delim(b[i])) i++;
+        const word = String.fromCharCode(...b.subarray(start, Math.min(i, start + 3)));
+        if (i - start > 2) continue;
+        if (word === "q") depth++;
+        else if (word === "Q") { if (depth) depth--; else under++; }
+        else if (word === "BT") text = true;
+        else if (word === "ET") text = false;
+        else if (word === "ID") {                                                            // Bilddaten bis EI
+          i++;
+          while (i < b.length && !(b[i] === 69 && b[i + 1] === 73 && space(b[i - 1]) && (i + 2 >= b.length || space(b[i + 2]) || delim(b[i + 2])))) i++;
+          i += 2;
+        }
+      }
+    }
+  }
+  return { under, open: depth, text };
+}
+/// Zahlen eines PDF-Arrays (NaN, wo keine Zahl steht)
+function numbers(lib, out, arr) {
+  return arr ? arr.asArray().map((v) => { const n = out.context.lookup(v); return n instanceof lib.PDFNumber ? n.asNumber() : NaN; }) : null;
+}
+/// Sichtbare Anmerkungen der Seite (außer Links), die ein Strich berührt (boxes: Fläche jedes Strichs im PDF), werden
+/// Teil der Seite: ihr Aussehen als Inhalt vor den Notizen, die Anmerkung selbst ausgeblendet. Liefert den Inhalt dafür.
+/// Fehlt einer das gespeicherte Aussehen oder soll ein Formularfeld es neu erstellen (pdf.js denkt es sich dann aus),
+/// geht es nur als Bild
+function flattenAnnots(lib, out, page, boxes) {
+  const { PDFName, PDFDict, PDFArray, PDFNumber, PDFStream, PDFRef, PDFBool } = lib;
+  const annots = page.node.Annots();
+  const form = out.catalog.lookup(PDFName.of("AcroForm"));
+  const redraw = form instanceof PDFDict && form.lookup(PDFName.of("NeedAppearances")) === PDFBool.True;
+  let ops = "";
+  for (let j = 0; annots && j < annots.size(); j++) {
+    const a = out.context.lookup(annots.get(j));
+    if (!(a instanceof PDFDict)) continue;
+    const sub = a.lookup(PDFName.of("Subtype"));
+    if (sub === PDFName.of("Link") || sub === PDFName.of("Popup")) continue;
+    const flag = a.lookup(PDFName.of("F")), flags = flag instanceof PDFNumber ? flag.asNumber() : 0;
+    if (flags & 34) continue; // ausgeblendet (2) oder nicht zu sehen (32)
+    const r = numbers(lib, out, a.lookupMaybe(PDFName.of("Rect"), PDFArray));
+    if (!r || r.length !== 4 || !r.every(Number.isFinite)) continue;
+    const rx0 = Math.min(r[0], r[2]), rx1 = Math.max(r[0], r[2]), ry0 = Math.min(r[1], r[3]), ry1 = Math.max(r[1], r[3]);
+    if (!boxes.some((b) => rx0 < b[2] && b[0] < rx1 && ry0 < b[3] && b[1] < ry1)) continue;
+    if (redraw && sub === PDFName.of("Widget")) throw new Error("Formularfeld ohne festes Aussehen");
+    const ap = a.lookup(PDFName.of("AP"));
+    let ref = ap instanceof PDFDict ? ap.get(PDFName.of("N")) : undefined, n = ref && out.context.lookup(ref);
+    if (n instanceof PDFDict) {
+      // Aussehen je Zustand (Ankreuzfeld): der aktuelle; ohne Aussehen für ihn zeigt auch pdf.js nichts
+      const as = a.lookup(PDFName.of("AS"));
+      ref = as instanceof PDFName ? n.get(as) : undefined; n = ref && out.context.lookup(ref);
+      if (!n) continue;
+    }
+    if (!(n instanceof PDFStream) || !(ref instanceof PDFRef)) throw new Error("Anmerkung ohne Aussehen");
+    // pdf.js zeigt das Aussehen auch ohne /Subtype /Form; als Teil der Seite ließen PDF-Programme es dann weg
+    if (n.dict.lookup(PDFName.of("Subtype")) !== PDFName.of("Form")) n.dict.set(PDFName.of("Subtype"), PDFName.of("Form"));
+    const bbox = numbers(lib, out, n.dict.lookupMaybe(PDFName.of("BBox"), PDFArray));
+    const t = numbers(lib, out, n.dict.lookupMaybe(PDFName.of("Matrix"), PDFArray)) || [1, 0, 0, 1, 0, 0];
+    if (!bbox || bbox.length !== 4 || t.length !== 6 || ![...bbox, ...t].every(Number.isFinite)) throw new Error("Anmerkung unlesbar");
+    // Wie PDF-Programme das Aussehen in das Rechteck setzen (PDF 1.7, 12.5.5)
+    const corners = [[bbox[0], bbox[1]], [bbox[2], bbox[1]], [bbox[0], bbox[3]], [bbox[2], bbox[3]]]
+      .map(([x, y]) => [t[0] * x + t[2] * y + t[4], t[1] * x + t[3] * y + t[5]]);
+    const tx0 = Math.min(...corners.map((c) => c[0])), tx1 = Math.max(...corners.map((c) => c[0]));
+    const ty0 = Math.min(...corners.map((c) => c[1])), ty1 = Math.max(...corners.map((c) => c[1]));
+    if (!(tx1 - tx0 > 1e-6 && ty1 - ty0 > 1e-6)) continue; // zeichnet nichts
+    const sx = (rx1 - rx0) / (tx1 - tx0), sy = (ry1 - ry0) / (ty1 - ty0);
+    // Ohne /CA: Bei gespeichertem Aussehen gilt es nicht (pdf.js zeigt es deckend)
+    const name = page.node.newXObject("BNAnnot", ref).asString();
+    const draw = `q ${matrix([sx, 0, 0, sy, rx0 - sx * tx0, ry0 - sy * ty0])} cm ${name} Do Q`;
+    // Auf einer Ebene (/OC) nur, wo die Ebene an ist, wie in pdf.js
+    const oc = a.get(PDFName.of("OC"));
+    if (oc instanceof PDFRef || oc instanceof PDFDict) {
+      const res = page.node.Resources();
+      let props = res.lookup(PDFName.of("Properties"));
+      if (!(props instanceof PDFDict)) { props = out.context.obj({}); res.set(PDFName.of("Properties"), props); }
+      const key = props.uniqueKey("BNOC");
+      props.set(key, oc);
+      ops += `/OC ${key.asString()} BDC ${draw} EMC\n`;
+    } else ops += draw + "\n";
+    a.set(PDFName.of("F"), PDFNumber.of(flags | 2));
+  }
+  return ops;
+}
+/// Das Original mit den Notizen darüber. Wirft, wenn das so nicht sicher geht (dann als Bild)
+async function overlayPDF(lib, snap, step) {
+  const { PDFName, PDFRef, PDFArray } = lib;
+  const out = await lib.PDFDocument.load(await same(snap.source, snap.data), { updateMetadata: false, parseSpeed: Infinity });
+  const pages = out.getPages();
+  if (pages.length !== snap.frames.length) throw new Error("andere Seitenzahl");
+  if (new Set(pages.map((p) => p.node)).size !== pages.length) throw new Error("Seite doppelt");
+  // Jede Seite muss so aussehen wie in pdf.js (pdf-lib liest bei doppelt vorhandenen Objekten manchmal ein anderes)
+  const views = [];
+  for (let i = 0; i < pages.length; i++) {
+    if (pdf !== snap.source) throw CHANGED;
+    const shown = await same(snap.source, snap.source.getPage(i + 1)), own = viewOf(pages[i]);
+    if (own.rotate !== shown.rotate || own.view.some((v, j) => Math.abs(v - shown.view[j]) > 1e-3)) throw new Error("andere Seite");
+    views.push(pageMatrix(own, snap.frames[i]));
+  }
+  if (views.some((m) => !m)) throw new Error("andere Seitengröße");
+  const states = new Map();
+  for (let i = 0; i < pages.length; i++) {
+    const page = pages[i], f = snap.frames[i], m = views[i], wires = onPage(snap, f);
+    if (wires.length) {
+      const fix = balance(lib, out, page);
+      if (fix.under) throw new Error("Inhalt unausgeglichen");
+      // Teilen sich Seiten eine Liste von Inhalten, bekäme jede auch die Notizen der anderen
+      const contents = page.node.get(PDFName.of("Contents"));
+      if (contents instanceof PDFRef) {
+        const list = out.context.lookup(contents);
+        if (list instanceof PDFArray) page.node.set(PDFName.of("Contents"), out.context.obj(list.asArray()));
+      }
+      // Fläche jedes Strichs im PDF (für die Anmerkungen darunter)
+      const boxes = wires.map((s) => {
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (const [x, y] of [[s.x0, s.y0 - f.y], [s.x1, s.y0 - f.y], [s.x0, s.y1 - f.y], [s.x1, s.y1 - f.y]]) {
+          const px = m[0] * x + m[2] * y + m[4], py = m[1] * x + m[3] * y + m[5];
+          x0 = Math.min(x0, px); x1 = Math.max(x1, px); y0 = Math.min(y0, py); y1 = Math.max(y1, py);
+        }
+        return [x0, y0, x1, y1];
+      });
+      const gs = stateNames(out, page, states);
+      const before = flattenAnnots(lib, out, page, boxes);
+      page.node.normalize();
+      // Offene q und ein offener Text schließen, bevor pdf-lib den alten Inhalt mit Q beendet
+      if (fix.open || fix.text) {
+        const list = page.node.Contents();
+        list.insert(list.size() - 1, await contentRef(out, (fix.text ? "ET\n" : "") + "Q\n".repeat(fix.open)));
+      }
+      await addInk(out, page, m, f, wires, { gs, before });
+    }
+    await step(i + 1);
+  }
+  return out;
+}
+/// Ersatz: jede Seite aus pdf.js als JPEG, die Notizen als Vektoren darüber. Bildpunkte je Seite nach Seitenzahl:
+/// kurze Dokumente scharf (A4 wie doppelt gezeigt), lange Dokumente nicht riesig
+async function rasterPDF(lib, snap, step) {
+  const source = snap.source;
+  if (source.numPages !== snap.frames.length) throw new Error("andere Seitenzahl");
+  const out = await lib.PDFDocument.create(), states = new Map();
+  const budget = Math.min(2.4e6, Math.max(0.8e6, 1.5e8 / snap.frames.length));
+  for (let i = 0; i < snap.frames.length; i++) {
+    if (pdf !== source) throw CHANGED;
+    const page = await same(source, source.getPage(i + 1));
+    const vp1 = page.getViewport({ scale: 1 });
+    const vp = page.getViewport({ scale: Math.min(2, Math.sqrt(budget / (vp1.width * vp1.height))) });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(vp.width); canvas.height = Math.round(vp.height);
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (pdf !== source) throw CHANGED;
+    try { await same(source, page.render({ canvasContext: ctx, viewport: vp }).promise); } finally { page.cleanup(); }
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.8));
+    canvas.width = canvas.height = 0;
+    if (!blob) throw new Error("Bild nicht erstellt");
+    const image = await out.embedJpg(new Uint8Array(await blob.arrayBuffer()));
+    const p = out.addPage([vp1.width, vp1.height]);
+    p.drawImage(image, { x: 0, y: 0, width: vp1.width, height: vp1.height });
+    const k = vp1.width / W, f = snap.frames[i];
+    await addInk(out, p, [k, 0, 0, -k, 0, vp1.height], f, onPage(snap, f), { gs: stateNames(out, p, states) });
+    await step(i + 1);
+  }
+  return out;
+}
+function saveFile(bytes, name) {
+  const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+/// Dateiname wie beim Export in der App (CanvasController.fileName), Zeichen für Zeichen wie Swift (zusammengesetzte
+/// Zeichen und Emoji als eines): „/ \ |“ werden „-“, „:“ wird „.“, „* ? " < >“ fallen weg, Steuerzeichen werden
+/// Leerzeichen, keine Punkte und Leerzeichen an den Enden, höchstens 200 Bytes
+function fileName(title) {
+  const text = String(title || "");
+  const chars = typeof Intl === "object" && Intl.Segmenter
+    ? Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text), (s) => s.segment) : [...text];
+  let name = "";
+  for (const ch of chars) {
+    if (ch === "/" || ch === "\\" || ch === "|") name += "-";
+    else if (ch === ":") name += ".";
+    else if (!['*', '?', '"', '<', '>'].includes(ch)) {
+      const control = [...ch].some((u) => { const v = u.codePointAt(0); return v < 0x20 || (v >= 0x7f && v <= 0x9f); });
+      name += control ? " " : ch;
+    }
+  }
+  // Leerzeichen und Zeilenwechsel wie Swifts whitespacesAndNewlines, dazu Punkte
+  const trim = (s) => s.replace(/^[\p{Z}\t-\r\u0085.]+|[\p{Z}\t-\r\u0085.]+$/gu, "");
+  const kept = typeof Intl === "object" && Intl.Segmenter
+    ? Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(trim(name)), (s) => s.segment) : [...trim(name)];
+  let short = "", bytes = 0;
+  const utf8 = new TextEncoder();
+  for (const ch of kept) {
+    bytes += utf8.encode(ch).length;
+    if (bytes > 200) break;
+    short += ch;
+  }
+  return trim(short) || "Notizen";
+}
+// Warum es nichts mehr zu sichern gibt (wie es die Ansicht selbst sagt)
+const goneText = () => document.getElementById("msg").textContent || "Das Teilen wurde beendet.";
+async function exportPDF(e) {
+  // Zweiter Klick eines Doppelklicks: nicht gleich noch einmal sichern
+  if (exporting || e?.detail > 1) return;
+  if (gone) return toast(goneText(), 3000);
+  if (!doc || !frames.length || (doc.kind === "pdf" && !pdf)) return toast("Das Dokument lädt noch …", 2500);
+  // aria-disabled statt disabled: Mit der Tastatur bleibt der Fokus so auf dem Knopf
+  exporting = true; exportBtn.setAttribute("aria-disabled", "true");
+  // Der Stand beim Tippen: Was danach live dazukommt, ist im PDF nicht mehr dabei. Die Bytes des PDFs gleich holen,
+  // bevor die Ansicht es (neues PDF vom iPad) austauschen kann
+  const wires = [];
+  for (const id of order) {
+    const s = strokes.get(id), b = s && inkBounds(s.wire);
+    if (b) wires.push({ wire: s.wire, ...b });
+  }
+  const snap = { frames: frames.map((f) => ({ y: f.y, h: f.h })), wires, kind: doc.kind, source: pdf, title: doc.title || "" };
+  if (snap.kind === "pdf") { snap.data = pdf.getData(); snap.data.catch(() => {}); }
+  else {
+    // Die leeren Seiten am Ende (im Notizbuch kommt nach der letzten beschriebenen immer eine) gehören nicht ins PDF
+    let last = 0;
+    snap.frames.forEach((f, i) => { if (onPage(snap, f).length) last = i; });
+    snap.frames.length = last + 1;
+  }
+  const n = snap.frames.length;
+  let raster = false;
+  const step = (i) => {
+    toast(raster ? `PDF wird erstellt (Seiten als Bilder) … ${i} von ${n}` : `PDF wird erstellt … ${i} von ${n} Seiten`);
+    return breathe();
+  };
+  try {
+    toast("PDF wird erstellt …");
+    const lib = await loadPdfLib();
+    let bytes = null;
+    if (snap.kind === "pdf") {
+      try {
+        const out = await overlayPDF(lib, snap, step);
+        toast("PDF wird gespeichert …");
+        // Ohne neuen Titel: Der Name der Datei trägt ihn, die Angaben des Originals bleiben, wie sie sind
+        bytes = await out.save({ objectsPerTick: Infinity });
+      } catch (err) {
+        if (err === CHANGED || pdf !== snap.source) throw CHANGED;
+        raster = true;
+      }
+    }
+    if (!bytes) {
+      const out = raster ? await rasterPDF(lib, snap, step) : await notebookPDF(lib, snap, step);
+      if (snap.title) try { out.setTitle(snap.title, { showInWindowTitleBar: true }); } catch {}
+      toast("PDF wird gespeichert …");
+      bytes = await out.save({ objectsPerTick: Infinity });
+    }
+    // Inzwischen nicht mehr geteilt: dann auch nichts mehr sichern
+    if (gone) return toast(goneText(), 3000);
+    saveFile(bytes, fileName(snap.title) + ".pdf");
+    toast("PDF gesichert", 2500);
+  } catch (err) {
+    // Neues PDF während des Sicherns: pdf.js bricht dann auch mit eigenen Fehlern ab
+    toast(err === CHANGED || (snap.kind === "pdf" && pdf !== snap.source) ? "Das Dokument hat sich gerade geändert. Bitte noch einmal sichern."
+      : err?.message === "pdf-lib fehlt" ? "PDF-Export geht gerade nicht: Ein Baustein dafür lädt nicht (Internet?)"
+      : "PDF-Export hat nicht geklappt", 6000);
+  } finally {
+    exporting = false; exportBtn.removeAttribute("aria-disabled");
+  }
+}
+exportBtn.onclick = exportPDF;
+// Gleich nach dem Wechsel zwischen „Bearbeiten“ und „Nur sehen“ ordnet sich die Leiste neu: Ein zweites Tippen (Doppel-
+// tippen) träfe dann einen anderen Knopf (Sichern, Zurück …). Solche Klicks fallen weg, wie setEditing es für sich tut
+document.getElementById("tools").addEventListener("click", (e) => {
+  if (performance.now() - switched < 500 && !e.target.closest("#edit, #view")) { e.stopPropagation(); e.preventDefault(); }
+}, true);
 
 let resizeTimer;
 // Safari am iPad meldet „resize“ auch, wenn nur die Leisten einklappen: dann nichts neu anlegen

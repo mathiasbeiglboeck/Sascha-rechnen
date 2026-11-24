@@ -33,3 +33,5 @@ Adresse und Schlüssel trägst du dann in der App ein (Zahnrad in der Übersicht
 | GET | `/s/:token` | Web-Ansicht für Gäste (ohne Schlüssel; dazu `/s/:token/data`, `/pdf`, `/ws`) |
 
 Lokal testen: `echo SECRET=test > .dev.vars && npx wrangler dev`.
+
+Die Web-Ansicht kann alle Seiten mit den Notizen als PDF sichern (Knopf mit Download-Symbol, solange sie verbunden ist). Das geschieht ganz im Browser mit dem, was die Ansicht schon geladen hat, und pdf-lib, das erst beim ersten Sichern lädt; der Server bekommt davon nichts mit. Test dafür: `test/export.mjs` (Playwright mit Chromium, poppler und python3 mit pypdf; Aufruf im Kopf der Datei).
