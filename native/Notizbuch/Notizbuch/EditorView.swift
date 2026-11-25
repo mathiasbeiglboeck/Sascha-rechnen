@@ -42,6 +42,9 @@ final class ToolState: ObservableObject {
     /// Am iPhone startet jedes Dokument im Nur-Sehen-Modus
     @Published var viewOnly = UIDevice.current.userInterfaceIdiom == .phone
     @Published var menusHidden = false
+    /// Am iPad mit der eigenen Zeile: Antippen des Datums blendet die Leiste aus und wieder ein (Wunsch 25.11., für das
+    /// iPad mini ohne Drücken am Pencil). Uhrzeit, Datum und Akku bleiben dabei stehen, die Tabs gehen mit der Leiste
+    @Published var barHidden = false
     /// Am iPad wählbar: eingeklappte Leiste mit nur Radierer und Ausklappen (für Stifte ohne Drücken, z. B. am
     /// iPad mini mit dem einfachen Pencil). Bleibt auf dem Gerät gespeichert.
     @Published var menuCollapsed = UserDefaults.standard.bool(forKey: "menuCollapsed") {
@@ -57,7 +60,7 @@ final class ToolState: ObservableObject {
     weak var canvas: CanvasController?
     private var flashTask: Task<Void, Never>?
 
-    /// Doppeltippen am Pencil: Radierer ↔ Stift (vom Lasso aus zum Radierer)
+    /// Kurzer Hinweis oben; ein leerer Text blendet ihn aus
     func show(_ message: String, seconds: Double = 1.6) {
         flash = message.isEmpty ? nil : message
         flashTask?.cancel()
@@ -76,16 +79,28 @@ final class ToolState: ObservableObject {
         if UIDevice.current.userInterfaceIdiom == .phone { viewOnly = true }
     }
 
+    /// Doppeltippen am Pencil oder Antippen von WLAN und Akku: Radierer ↔ Stift (vom Lasso aus zum Radierer). Ohne
+    /// sichtbare Leiste sagt ein Hinweis, was jetzt gilt
     func toggleEraser() {
         mode = mode == .eraser ? .pen : .eraser
-        guard menusHidden else { return }
-        flash = mode == .eraser ? "Radierer" : "Stift"
-        flashTask?.cancel()
-        flashTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(0.9))
-            guard !Task.isCancelled else { return }
-            self?.flash = nil
-        }
+        guard menusHidden || barHidden else { return }
+        show(mode == .eraser ? "Radierer" : "Stift", seconds: 0.9)
+    }
+
+    /// Pencil Pro zweimal hin und her gedreht: Lasso ↔ Stift (Wunsch 25.11.). Der Hinweis kommt auch bei eingeklappter
+    /// Leiste: Sie zeigt nur den Radierer, Lasso und Stift sähen dort gleich aus
+    func toggleLasso() {
+        mode = mode == .lasso ? .pen : .lasso
+        let collapsed = UIDevice.current.userInterfaceIdiom == .pad && menuCollapsed
+        guard menusHidden || barHidden || collapsed else { return }
+        show(mode == .lasso ? "Lasso" : "Stift", seconds: 0.9)
+    }
+
+    /// Drücken am Pencil Pro: alle Menüs aus und wieder ein. Beim Einblenden kommt auch eine mit dem Datum
+    /// ausgeblendete Leiste wieder
+    func toggleMenus() {
+        menusHidden.toggle()
+        if !menusHidden { barHidden = false }
     }
 }
 
@@ -111,9 +126,23 @@ struct EditorView: View {
     private var collapsed: Bool { UIDevice.current.userInterfaceIdiom == .pad && tools.menuCollapsed }
     /// Tabs stehen über der Leiste, wenn sie eingeblendet und ausgeklappt ist; auch ein einzelner, damit sich jeder
     /// Tab mit seinem Kreuz schließen lässt (der letzte führt zurück zur Übersicht)
-    private var tabsShown: Bool { !tools.menusHidden && !collapsed && !tabs.ids.isEmpty }
+    private var tabsShown: Bool { !tools.menusHidden && !tools.barHidden && !collapsed && !tabs.ids.isEmpty }
     /// Was über der Leiste steht: am iPad die eigene Zeile, am iPhone die Tabs
     private var aboveBar: CGFloat { ownStatusLine ? StatusLine.height : (tabsShown ? Self.tabRowHeight : 0) }
+    /// Hinweise stehen unter der Leiste; ohne sie gleich unter der eigenen Zeile, ohne Menüs ganz oben
+    private var flashTop: CGFloat {
+        if tools.menusHidden { return 10 }
+        return tools.barHidden ? aboveBar + 10 : 64 + aboveBar
+    }
+
+    // Antippen in der eigenen Zeile am iPad (Wunsch 25.11.)
+
+    /// Uhrzeit: zur Übersicht der Notizbücher, wie „zurück“ in der Leiste (die Tabs bleiben offen)
+    private func tapClock() { tabs.closeEditor() }
+    /// Datum: Leiste aus und wieder ein
+    private func tapDate() { tools.barHidden.toggle() }
+    /// WLAN und Akku: Stift ↔ Radierer, wie Doppeltippen am Pencil
+    private func tapDevice() { tools.toggleEraser() }
 
     var body: some View {
         // Leiste als Overlay: Wird sie breiter, darf das nie die Größe der Leinwand ändern
@@ -123,13 +152,17 @@ struct EditorView: View {
                     if !tools.menusHidden {
                         VStack(spacing: 6) {
                             if ownStatusLine {
-                                StatusLine(tabs: tabs, showTabs: tabsShown) { tools.canvas?.scrollToTop() }
+                                StatusLine(tabs: tabs, showTabs: tabsShown,
+                                           onClock: { tapClock() }, onDate: { tapDate() }, onDevice: { tapDevice() })
                             } else if tabsShown {
                                 TabStrip(tabs: tabs)
                                     .transition(.opacity)
                             }
-                            ToolBar(tools: tools, onClose: { tabs.closeEditor() })
-                                .padding(.horizontal, 12)
+                            if !tools.barHidden {
+                                ToolBar(tools: tools, onClose: { tabs.closeEditor() })
+                                    .padding(.horizontal, 12)
+                                    .transition(.opacity)
+                            }
                         }
                         .padding(.top, ownStatusLine ? 0 : 6)
                         .transition(.move(edge: .top).combined(with: .opacity))
@@ -144,7 +177,7 @@ struct EditorView: View {
                             .padding(.horizontal, 14).padding(.vertical, 7)
                             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 17, style: .continuous))
                             .padding(.horizontal, 16)
-                            .padding(.top, tools.menusHidden ? 10 : 64 + aboveBar)
+                            .padding(.top, flashTop)
                             .transition(.opacity)
                     }
                 }
@@ -171,7 +204,9 @@ struct EditorView: View {
                 // Übersicht, nicht als safeAreaInset: Dessen Rand übergeht die Titelzeile der NavigationStack, sie lag
                 // dann unter Uhrzeit und WLAN (Runde 7)
                 VStack(spacing: 0) {
-                    if ownStatusLine { StatusLine(tabs: tabs, showTabs: false) }
+                    // Die Uhrzeit führt auch von hier zu den Notizbüchern; Datum und Akku tun hier nichts (keine Leiste,
+                    // kein Stift)
+                    if ownStatusLine { StatusLine(tabs: tabs, showTabs: false, onClock: { tapClock() }) }
                     PageOverview(controller: canvas) { tools.overviewShown = false }
                 }
                 .background(Color(white: 0.92).ignoresSafeArea())
@@ -183,6 +218,7 @@ struct EditorView: View {
         .statusBarHidden(tools.menusHidden || ownStatusLine)
         .persistentSystemOverlays(tools.menusHidden ? .hidden : .automatic)
         .animation(.easeOut(duration: 0.2), value: tools.menusHidden)
+        .animation(.easeOut(duration: 0.2), value: tools.barHidden)
         .animation(.easeOut(duration: 0.2), value: tools.menuCollapsed)
         .animation(.easeOut(duration: 0.2), value: tools.flash)
         .animation(.easeOut(duration: 0.2), value: tabsShown)
@@ -193,7 +229,8 @@ struct EditorView: View {
             let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
             func value(_ name: String) -> String? { items.first { $0.name == name }?.value }
             // debug/tool?mode=pen|eraser|lasso|pointer&edit: Werkzeug wie in der Leiste wählen (edit: wie „Bearbeiten“);
-            // &width=0…4, &overview=1|0 (Seitenübersicht), &collapsed=1|0 (eingeklappte Leiste), &menus=0|1 (Menüs aus/an)
+            // &width=0…4, &overview=1|0 (Seitenübersicht), &collapsed=1|0 (eingeklappte Leiste), &menus=0|1 (Menüs aus/an),
+            // &bar=0|1 (Leiste aus/an wie mit dem Datum)
             if url.path == "/tool" {
                 switch value("mode") {
                 case "pen"?: tools.mode = .pen
@@ -207,6 +244,28 @@ struct EditorView: View {
                 if let v = value("overview") { tools.overviewShown = v == "1" }
                 if let v = value("collapsed") { tools.menuCollapsed = v == "1" }
                 if let v = value("menus") { tools.menusHidden = v == "0" }
+                if let v = value("bar") { tools.barHidden = v == "0" }
+                return
+            }
+            // debug/status?tap=clock|date|device: wie Antippen von Uhrzeit, Datum oder WLAN/Akku in der eigenen Zeile;
+            // tap=squeeze wie Drücken am Pencil Pro. Eine halbe Sekunde danach steht im Protokoll („Status-Debug: …“),
+            // was dann gilt (ein Hinweis steht 0,9 s)
+            if url.path == "/status" {
+                let tap = value("tap") ?? "-"
+                let tools = self.tools, tabs = self.tabs
+                switch tap {
+                case "clock": tapClock()
+                case "date": tapDate()
+                case "device": tapDevice()
+                case "squeeze": tools.toggleMenus()
+                default: break
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    NSLog("Status-Debug: %@ → Editor %@, Leiste %@, Menüs %@, Übersicht %@, Werkzeug %@, Hinweis %@", tap,
+                          tabs.editorShown ? "offen" : "zu", tools.barHidden ? "aus" : "an",
+                          tools.menusHidden ? "aus" : "an", tools.overviewShown ? "offen" : "zu", "\(tools.mode)",
+                          tools.flash ?? "-")
+                }
                 return
             }
             // debug/awake?lowpower=1|0|auto&seconds=N: Stromsparmodus vortäuschen, Frist verkürzen; meldet den Stand
@@ -243,8 +302,9 @@ struct CanvasRepresentable: UIViewControllerRepresentable {
         controller.onGuests = { [weak tools] guests in
             if tools?.canvas?.doc.id == id { tools?.guests = guests }
         }
-        controller.onToggleMenus = { [weak tools] in tools?.menusHidden.toggle() }
+        controller.onToggleMenus = { [weak tools] in tools?.toggleMenus() }
         controller.onToggleEraser = { [weak tools] in tools?.toggleEraser() }
+        controller.onToggleLasso = { [weak tools] in tools?.toggleLasso() }
         tools.canvas = controller
         return controller
     }
@@ -270,9 +330,6 @@ struct ToolBar: View {
     let onClose: () -> Void
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.colorScheme) private var colorScheme
-
-    /// Hintergrund der Leiste: durchscheinend wie die Tabs dahinter, ohne Schatten (Wunsch 19.11., zum Ausprobieren)
-    static let backgroundOpacity: Double = 0.55
 
     var body: some View {
         if isPad && tools.menuCollapsed {
@@ -351,12 +408,7 @@ struct ToolBar: View {
         .padding(.vertical, wide ? 2 : 8)
         // Quer am iPhone nicht über die ganze, sehr breite Zeile
         .frame(maxWidth: wide ? 600 : nil)
-        .background { Self.background }
-    }
-
-    /// Halbdurchsichtig wie die Tabs hinter dem vorderen
-    private static var background: some View {
-        Capsule().fill(.regularMaterial).opacity(backgroundOpacity)
+        .barBackground()
     }
 
     private var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
@@ -374,7 +426,7 @@ struct ToolBar: View {
         .tint(.primary)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background { Self.background }
+        .barBackground()
     }
 
     private func shareMenu(_ wide: Bool) -> some View {
@@ -537,6 +589,13 @@ struct ToolBar: View {
 }
 
 private extension View {
+    /// Hintergrund der Leiste: undurchsichtig mit leichtem Schatten, wie vor dem 19.11. (Wunsch 25.11.: halbdurchsichtig
+    /// war zu unruhig). Die Tabs bleiben halbdurchsichtig
+    func barBackground() -> some View {
+        background(.regularMaterial, in: Capsule())
+            .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+    }
+
     /// Ein Feld der breiten Leiste am iPhone: so breit, wie Platz ist (alle gleich), und 44 Punkte hoch; die ganze
     /// Fläche nimmt das Tippen an, nicht nur das Symbol
     @ViewBuilder func cell(_ wide: Bool) -> some View {
