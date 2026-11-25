@@ -87,6 +87,8 @@ struct Case {
     var wrap = false
     /// Erste Erkennung in diesem Zeitraum (Sekunden)
     var first: ClosedRange<Double>? = nil
+    /// Zweite Erkennung in diesem Zeitraum (Sekunden)
+    var second: ClosedRange<Double>? = nil
 }
 
 let writing = (0..<30).map { i in Leg(to: i % 2 == 1 ? 0 : 30, seconds: 0.3, reset: true) }
@@ -153,6 +155,55 @@ let cases: [Case] = [
                           Leg(to: 10, seconds: 0.2), Leg(to: -16, seconds: 0.2)]), want: 0),
     Case(name: "Treffer, 2,5 s ruhig, dann ±15° um die Ruhelage (zweimal)",
          points: path(0, swings(4, 40, 0.2) + [Leg(to: 0, seconds: 2.5)] + around(4, 15, 0.2)), want: 2),
+    // Seit 150: Nach dem Treffer weiter schweben; der Rest der auslösenden Drehung zählt auch später nicht
+    Case(name: "7 × 90° je 250 ms, dann 2,5 s schwebend (einmal)",
+         points: path(0, swings(7, 90, 0.25) + [Leg(to: 90, seconds: 2.5)]), want: 1),
+    Case(name: "um die Ruhelage 7 × ±30°, dann 2,5 s schwebend (einmal)",
+         points: path(0, around(7, 30, 0.25) + [Leg(to: 30, seconds: 2.5)]), want: 1),
+    Case(name: "7 × 45° je 200 ms, dann 2,5 s schwebend (einmal)",
+         points: path(0, swings(7, 45, 0.2) + [Leg(to: 45, seconds: 2.5)]), want: 1),
+    Case(name: "7 × 40° je 300 ms, dann 2,5 s schwebend (einmal)",
+         points: path(0, swings(7, 40, 0.3) + [Leg(to: 40, seconds: 2.5)]), want: 1),
+    Case(name: "7 × 90° mit Zittern ±2°, dann 2,5 s schwebend (einmal)",
+         points: path(0, swings(7, 90, 0.25) + [Leg(to: 90, seconds: 2.5)], noise: 2), want: 1),
+    Case(name: "Treffer, gleich ±20° um die Ruhelage zurück (zweimal, rechtzeitig)",
+         points: path(0, swings(4, 40, 0.2) + [Leg(to: 0, seconds: 0.3)] + around(4, 20, 0.2)
+                      + [Leg(to: -20, seconds: 0.3, reset: true)]), want: 2, first: 0.6...0.8, second: 1.9...2.3),
+    Case(name: "Treffer, 0,4 s still, dann weiter −20, +20, −20, +20 (zweimal)",
+         points: path(0, swings(4, 40, 0.2) + [Leg(to: 0, seconds: 0.4), Leg(to: -20, seconds: 0.2),
+                                                Leg(to: 20, seconds: 0.2), Leg(to: -20, seconds: 0.2),
+                                                Leg(to: 20, seconds: 0.2)]), want: 2),
+    Case(name: "Treffer, aufgesetzt, dann ±15° um die Ruhelage (zweimal)",
+         points: path(0, swings(4, 40, 0.2) + [Leg(to: 0, seconds: 0.01, reset: true)] + around(4, 15, 0.2)), want: 2),
+    Case(name: "erst kurz zurück (+6°), dann −10, +16, −10, +16",
+         points: path(0, [Leg(to: 0, seconds: 0.3), Leg(to: 6, seconds: 0.15), Leg(to: -10, seconds: 0.2),
+                          Leg(to: 16, seconds: 0.2), Leg(to: -10, seconds: 0.2), Leg(to: 16, seconds: 0.2)]), want: 1),
+    Case(name: "Sägezahn abwärts −30, −10, −40, −20, −50 (keine Umkehr weit genug)",
+         points: path(0, [Leg(to: -30, seconds: 0.2), Leg(to: -10, seconds: 0.2), Leg(to: -40, seconds: 0.2),
+                          Leg(to: -20, seconds: 0.2), Leg(to: -50, seconds: 0.2)]), want: 0),
+    Case(name: "Sägezahn aufwärts 30, 10, 40, 20, 50 (keine Umkehr weit genug)",
+         points: path(0, [Leg(to: 30, seconds: 0.2), Leg(to: 10, seconds: 0.2), Leg(to: 40, seconds: 0.2),
+                          Leg(to: 20, seconds: 0.2), Leg(to: 50, seconds: 0.2)]), want: 0),
+    Case(name: "Treffer, aufgesetzt, gleich weiter −20, +20, −20, +20 (zweimal)",
+         points: path(0, swings(4, 40, 0.2) + [Leg(to: 0, seconds: 0.01, reset: true), Leg(to: -20, seconds: 0.2),
+                                                Leg(to: 20, seconds: 0.2), Leg(to: -20, seconds: 0.2),
+                                                Leg(to: 20, seconds: 0.2)]), want: 2),
+    Case(name: "Zeit springt nach dem Treffer zurück, dann −20, +20, −20, +20 (zweimal)",
+         points: path(0, swings(4, 40, 0.2)) + path(0, [Leg(to: 0, seconds: 0.01), Leg(to: -20, seconds: 0.2),
+                                                        Leg(to: 20, seconds: 0.2), Leg(to: -20, seconds: 0.2),
+                                                        Leg(to: 20, seconds: 0.2)]), want: 2),
+    Case(name: "über-gedreht, die vierte langsam (1 s) mit Zittern ±2° (einmal)",
+         points: path(0, [Leg(to: 40, seconds: 0.2), Leg(to: 0, seconds: 0.2), Leg(to: 40, seconds: 0.2),
+                          Leg(to: -50, seconds: 1.0), Leg(to: 40, seconds: 0.2), Leg(to: -50, seconds: 0.2),
+                          Leg(to: 40, seconds: 0.2), Leg(to: 40, seconds: 2.5)], noise: 2), want: 1),
+    Case(name: "Treffer, Spitze springt 130 Punkte, dann −20, +20, −20, +20 (zweimal)",
+         points: path(0, swings(4, 40, 0.2) + [Leg(to: 0, seconds: 0.1, dx: 130), Leg(to: -20, seconds: 0.2),
+                                                Leg(to: 20, seconds: 0.2), Leg(to: -20, seconds: 0.2),
+                                                Leg(to: 20, seconds: 0.2)]), want: 2),
+    Case(name: "8 × 26° (zweimal)", points: path(0, swings(8, 26, 0.2)), want: 2),
+    Case(name: "Treffer, gleich ±13° je 150 ms zurück (zweimal)",
+         points: path(0, swings(4, 40, 0.2) + [Leg(to: 13, seconds: 0.15), Leg(to: -13, seconds: 0.15),
+                                                Leg(to: 13, seconds: 0.15), Leg(to: -13, seconds: 0.15)]), want: 2),
 ]
 
 var failures = 0
@@ -160,6 +211,7 @@ for c in cases {
     let hits = run(c.points, wrap: c.wrap)
     var ok = hits.count == c.want
     if let range = c.first, let t = hits.first, !range.contains(t) { ok = false }
+    if let range = c.second, hits.count > 1, !range.contains(hits[1]) { ok = false }
     if !ok { failures += 1 }
     let at = hits.isEmpty ? "" : " bei " + hits.map { String(format: "%.3f s", $0) }.joined(separator: ", ")
     print("\(ok ? "ok  " : "FEHL") \(c.name): \(hits.count) (erwartet \(c.want))\(at)")

@@ -17,6 +17,10 @@ struct PencilRoll {
     static let window = 2.0
     /// So weit darf die Spitze dabei wandern (Bildschirmpunkte)
     static let drift = 120.0
+    /// Nach einem Treffer endet die auslösende Drehung, sobald sie 5 Grad zurückgeht (kleineres Zittern zählt nicht) …
+    static let blockEnd = 5 * Double.pi / 180
+    /// … oder so lange keinen neuen äußersten Wert erreicht (Sekunden)
+    static let blockPause = 0.25
 
     private struct Sample {
         var angle: Double
@@ -31,10 +35,13 @@ struct PencilRoll {
     /// Letzter Rohwert: Der entfaltete Winkel läuft über ±180 Grad hinweg stetig weiter
     private var lastRaw: Double?
     private var angle = 0.0
-    /// Nach einem Treffer die Richtung der Drehung, die ihn auslöste (1 oder −1): Sie läuft meist noch weiter, und ihr
-    /// Rest soll nicht als erste Drehung der nächsten Geste zählen (sonst schalteten sieben weite Bewegungen zweimal).
-    /// Erst ihre Umkehr zählt wieder. 0: Zählung wie sonst
-    private var continuing = 0
+    /// Nach einem Treffer die Drehung, die ihn auslöste (1 aufwärts, −1 abwärts): Sie läuft meist noch weiter, und ihr
+    /// Rest soll nie für die nächste Geste zählen, auch nicht Sekunden später (sonst schalteten sieben weite Bewegungen
+    /// zweimal, die zweite erst, wenn der Pencil schon ruht). Solange sie weiterläuft, bleibt nur ihr äußerster Wert im
+    /// Fenster; erst ihre Umkehr zählt als erste Drehung der nächsten Geste. 0: Zählung wie sonst
+    private var block = 0
+    private var blockExtreme = 0.0
+    private var blockTime = 0.0
 
     init() {}
 
@@ -43,7 +50,7 @@ struct PencilRoll {
         samples = []
         lastRaw = nil
         angle = 0
-        continuing = 0
+        block = 0
     }
 
     /// Nächster Wert im Schweben: Rollwinkel im Bogenmaß, Zeit in Sekunden, Ort der Spitze in Bildschirmpunkten.
@@ -61,11 +68,21 @@ struct PencilRoll {
         // Rückwärts laufende Zeit kommt nicht vor; wenn doch, von hier aus neu
         if let last = samples.last, time < last.time {
             samples = []
-            continuing = 0
+            block = 0
+        }
+        // Die auslösende Drehung läuft weiter: Alles davor fällt weg, gezählt wird erst ab ihrem äußersten Wert
+        if block != 0 {
+            if Double(block) * (angle - blockExtreme) > 0 {
+                blockExtreme = angle
+                blockTime = time
+                samples = []
+            } else if time - blockTime > Self.blockPause || Double(block) * (blockExtreme - angle) >= Self.blockEnd {
+                block = 0
+            }
         }
         samples.append(Sample(angle: angle, time: time, x: x, y: y))
-        // Was zu alt ist oder zu weit von der Spitze jetzt, fällt vorne weg (der neueste Wert bleibt immer). Fällt der
-        // Wert des letzten Treffers weg, zählt alles wieder wie sonst
+        // Was zu alt ist oder zu weit von der Spitze jetzt, fällt vorne weg (der neueste Wert bleibt immer). Ist die
+        // Spitze so weit gewandert, zählt auch eine noch laufende auslösende Drehung wieder wie jede andere
         var drop = 0
         while drop < samples.count - 1,
               time - samples[drop].time > Self.window
@@ -74,23 +91,24 @@ struct PencilRoll {
         }
         if drop > 0 {
             samples.removeFirst(drop)
-            continuing = 0
+            block = 0
         }
-        let (count, direction) = Self.swings(in: samples, continuing: continuing)
+        let (count, direction) = Self.swings(in: samples)
         guard count >= Self.swingsNeeded else { return false }
         samples = [samples[samples.count - 1]]
-        continuing = direction
+        block = direction
+        blockExtreme = angle
+        blockTime = time
         return true
     }
 
     /// Zahl der Drehungen im Wechsel und die Richtung der letzten (1 aufwärts, −1 abwärts, 0 noch keine). Die erste
     /// zählt ab `firstSwing` vom tiefsten oder höchsten Wert davor, jede weitere ab `minSwing` vom letzten Umkehrpunkt;
-    /// die letzte zählt, sobald sie so weit ist, auch wenn sie noch weitergeht. Mit `continuing` läuft beim ersten Wert
-    /// noch eine Drehung in diese Richtung: Erst ihre Umkehr zählt
-    private static func swings(in samples: [Sample], continuing: Int) -> (count: Int, direction: Int) {
+    /// die letzte zählt, sobald sie so weit ist, auch wenn sie noch weitergeht
+    private static func swings(in samples: [Sample]) -> (count: Int, direction: Int) {
         guard let start = samples.first?.angle else { return (0, 0) }
         var low = start, high = start, extreme = start
-        var direction = continuing, count = 0
+        var direction = 0, count = 0
         for sample in samples {
             let a = sample.angle
             switch direction {

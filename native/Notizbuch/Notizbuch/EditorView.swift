@@ -96,9 +96,13 @@ final class ToolState: ObservableObject {
         show(mode == .lasso ? "Lasso" : "Stift", seconds: 0.9)
     }
 
-    /// Drücken am Pencil Pro: alle Menüs aus und wieder ein. Beim Einblenden kommt auch eine mit dem Datum
-    /// ausgeblendete Leiste wieder
+    /// Drücken am Pencil Pro: alle Menüs aus und wieder ein. Ist nur die Leiste mit dem Datum ausgeblendet, holt ein
+    /// Drücken sie zurück (statt auch noch die Zeile auszublenden); beim Einblenden kommt sie ohnehin mit
     func toggleMenus() {
+        if barHidden && !menusHidden {
+            barHidden = false
+            return
+        }
         menusHidden.toggle()
         if !menusHidden { barHidden = false }
     }
@@ -137,8 +141,15 @@ struct EditorView: View {
 
     // Antippen in der eigenen Zeile am iPad (Wunsch 25.11.)
 
-    /// Uhrzeit: zur Übersicht der Notizbücher, wie „zurück“ in der Leiste (die Tabs bleiben offen)
-    private func tapClock() { tabs.closeEditor() }
+    /// Uhrzeit: zur Übersicht der Notizbücher, wie „zurück“ in der Leiste (die Tabs bleiben offen). Nicht, solange in
+    /// der Seitenübersicht Seiten gelöscht, eingefügt oder zurückgeholt werden: Die Übersicht ist dann gesperrt, und
+    /// die laufende Änderung schriebe sonst noch in die schon geschlossene Leinwand (Striche könnten verloren gehen).
+    /// Aus der Übersicht geht diese zuerst zu: Sie blendet weich aus, statt beim Wegfahren schlagartig zu verschwinden
+    private func tapClock() {
+        guard tools.canvas?.isRestructuring != true else { return }
+        if tools.overviewShown { tools.overviewShown = false }
+        tabs.closeEditor()
+    }
     /// Datum: Leiste aus und wieder ein
     private func tapDate() { tools.barHidden.toggle() }
     /// WLAN und Akku: Stift ↔ Radierer, wie Doppeltippen am Pencil

@@ -3005,17 +3005,25 @@ extension CanvasController {
     /// - `debug/roll?deg=40&n=4&ms=200&move=0`: Pencil Pro im Schweben gedreht (der Simulator kennt keinen Rollwinkel):
     ///   n Drehungen zu je deg Grad im Wechsel, jede ms Millisekunden lang, 120 Werte je Sekunde; die Spitze wandert
     ///   dabei move Punkte nach rechts. `&around`: um die Ruhelage (+deg, −deg, +deg, …) statt 0, deg, 0, …
-    ///   Geht durch dieselbe Zählung wie das Schweben und schaltet wie dort um. Protokoll „Rolle-Debug: …“: wie oft
-    ///   erkannt, und kurz danach das Werkzeug
+    ///   `&hover=2500`: danach so viele Millisekunden still weiter schweben (der Rest der Drehungen darf auch dann nicht
+    ///   noch einmal zählen). Geht durch dieselbe Zählung wie das Schweben und schaltet wie dort um. Protokoll
+    ///   „Rolle-Debug: …“: wie oft erkannt, und kurz danach das Werkzeug
     private func debugRoll(_ items: [URLQueryItem]) {
-        func number(_ name: String) -> Double? { items.first { $0.name == name }?.value.flatMap { Double($0) } }
-        let deg = number("deg") ?? 40, ms = number("ms") ?? 200, move = number("move") ?? 0
-        let n = max(Int(number("n") ?? 4), 0)
+        // Nur endliche Werte in vernünftigen Grenzen (Int(Double) bräche bei nan oder 1e300 ab)
+        func number(_ name: String, _ fallback: Double, _ range: ClosedRange<Double>) -> Double {
+            guard let v = items.first(where: { $0.name == name })?.value.flatMap({ Double($0) }), v.isFinite else {
+                return fallback
+            }
+            return min(max(v, range.lowerBound), range.upperBound)
+        }
+        let deg = number("deg", 40, -360...360), ms = number("ms", 200, 10...5000), move = number("move", 0, -2000...2000)
+        let n = Int(number("n", 4, 0...100)), hover = number("hover", 0, 0...10_000)
         let around = items.contains { $0.name == "around" }
         let steps = max(Int((ms / 1000 * 120).rounded()), 1)
         let x0 = Double(view.bounds.midX), y = Double(view.bounds.midY)
         var time = CACurrentMediaTime()
         var hits = 0
+        var angle = 0.0, x = x0
         roll.reset()
         for i in 0..<n {
             let low = around ? -deg : 0.0
@@ -3023,17 +3031,24 @@ extension CanvasController {
             for s in 1...steps {
                 time += 1.0 / 120
                 let u = Double(s) / Double(steps)
-                let angle = (from + (to - from) * (1 - cos(Double.pi * u)) / 2) * Double.pi / 180
-                let x = x0 + move * (Double(i) + u) / Double(n)
+                angle = (from + (to - from) * (1 - cos(Double.pi * u)) / 2) * Double.pi / 180
+                x = x0 + move * (Double(i) + u) / Double(n)
                 if roll.add(roll: angle, time: time, x: x, y: y) {
                     hits += 1
                     rolled(at: CGPoint(x: x, y: y))
                 }
             }
         }
+        for _ in 0..<Int((hover / 1000 * 120).rounded()) {
+            time += 1.0 / 120
+            if roll.add(roll: angle, time: time, x: x, y: y) {
+                hits += 1
+                rolled(at: CGPoint(x: x, y: y))
+            }
+        }
         roll.reset()
-        NSLog("Rolle-Debug: %ld Drehungen zu %.0f°%@ je %.0f ms, Spitze %.0f Punkte: erkannt %ld×", n, deg,
-              around ? " um die Ruhelage" : "", ms, move, hits)
+        NSLog("Rolle-Debug: %ld Drehungen zu %.0f°%@ je %.0f ms, Spitze %.0f Punkte%@: erkannt %ld×", n, deg,
+              around ? " um die Ruhelage" : "", ms, move, hover > 0 ? ", dann \(Int(hover)) ms schwebend" : "", hits)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
             let tool = self.lasso ? "Lasso" : self.erasing ? "Radierer" : self.pointing ? "Zeigestift" : "Stift"
