@@ -93,6 +93,8 @@ struct Case {
 
 let writing = (0..<30).map { i in Leg(to: i % 2 == 1 ? 0 : 30, seconds: 0.3, reset: true) }
 let fidget = (0..<10).map { i in Leg(to: i % 2 == 0 ? 20 : 0, seconds: 0.3) }
+/// Nach dem Treffer 1 s lang mit 2° je Sekunde weiter, in kleinen Schritten
+let creep = (1...10).map { i in Leg(to: -Double(i) * 0.2, seconds: 0.1) }
 var withNaN = path(0, swings(4, 40, 0.2))
 withNaN[40].angle = .nan
 let cases: [Case] = [
@@ -204,6 +206,40 @@ let cases: [Case] = [
     Case(name: "Treffer, gleich ±13° je 150 ms zurück (zweimal)",
          points: path(0, swings(4, 40, 0.2) + [Leg(to: 13, seconds: 0.15), Leg(to: -13, seconds: 0.15),
                                                 Leg(to: 13, seconds: 0.15), Leg(to: -13, seconds: 0.15)]), want: 2),
+    // Seit 151: echte Werte zittern und kriechen; die auslösende Drehung gilt nur als weiterlaufend, solange sie um
+    // mindestens 1° je 0,25 s weiterkommt und die Spitze nahe der Stelle des Treffers bleibt
+    Case(name: "Treffer, 0,4 s still, dann weiter −20, +20, −20, +20, alles mit Zittern ±0,3° (zweimal)",
+         points: path(0, swings(4, 40, 0.2) + [Leg(to: 0, seconds: 0.4), Leg(to: -20, seconds: 0.2),
+                                                Leg(to: 20, seconds: 0.2), Leg(to: -20, seconds: 0.2),
+                                                Leg(to: 20, seconds: 0.2)], noise: 0.3), want: 2),
+    Case(name: "Treffer, Spitze springt 130 Punkte, dann −20, +20, −20, +20, alles mit Zittern ±0,3° (zweimal)",
+         points: path(0, swings(4, 40, 0.2) + [Leg(to: 0, seconds: 0.1, dx: 130), Leg(to: -20, seconds: 0.2),
+                                                Leg(to: 20, seconds: 0.2), Leg(to: -20, seconds: 0.2),
+                                                Leg(to: 20, seconds: 0.2)], noise: 0.3), want: 2),
+    Case(name: "Treffer, 3 s langsam weiter (−3°), dann −20, +20, −20, +20 (zweimal)",
+         points: path(0, swings(4, 40, 0.2) + [Leg(to: -3, seconds: 3), Leg(to: -20, seconds: 0.2),
+                                                Leg(to: 20, seconds: 0.2), Leg(to: -20, seconds: 0.2),
+                                                Leg(to: 20, seconds: 0.2)]), want: 2),
+    Case(name: "Treffer, weiter bis −60° und dabei 200 Punkte gewandert, dann +40, −40, +40 (zweimal)",
+         points: path(0, swings(4, 40, 0.2) + [Leg(to: -60, seconds: 0.8, dx: 200), Leg(to: 40, seconds: 0.2),
+                                                Leg(to: -40, seconds: 0.2), Leg(to: 40, seconds: 0.2)]), want: 2),
+    Case(name: "Treffer, 1 s mit 2° je Sekunde weiter (−2°), dann −20, +20, −20, +20 (zweimal)",
+         points: path(0, swings(4, 40, 0.2) + creep + [Leg(to: -20, seconds: 0.2), Leg(to: 20, seconds: 0.2),
+                                                        Leg(to: -20, seconds: 0.2), Leg(to: 20, seconds: 0.2)]),
+         want: 2),
+    Case(name: "Treffer, weiter bis −60°, die Spitze wandert dabei gleich 80 Punkte, dann +40, −40, +40 (einmal)",
+         points: path(0, swings(4, 40, 0.2) + [Leg(to: -20, seconds: 0.2, dx: 80), Leg(to: -60, seconds: 0.4),
+                                                Leg(to: 40, seconds: 0.2), Leg(to: -40, seconds: 0.2),
+                                                Leg(to: 40, seconds: 0.2)]), want: 1),
+    Case(name: "Treffer, langsam weiter (30° in 1,3 s), dann +40, −40, +40 (einmal)",
+         points: path(0, swings(4, 40, 0.2) + [Leg(to: -30, seconds: 1.3), Leg(to: 40, seconds: 0.2),
+                                                Leg(to: -40, seconds: 0.2), Leg(to: 40, seconds: 0.2)]), want: 1),
+    Case(name: "Treffer, 0,15 s Stocken in der vierten Drehung, dann weiter bis 7 Bewegungen (einmal)",
+         points: path(0, [Leg(to: 40, seconds: 0.2), Leg(to: 0, seconds: 0.2), Leg(to: 40, seconds: 0.2),
+                          Leg(to: 10, seconds: 0.15), Leg(to: 10, seconds: 0.15), Leg(to: -30, seconds: 0.15),
+                          Leg(to: 40, seconds: 0.2), Leg(to: -30, seconds: 0.2), Leg(to: 40, seconds: 0.2)]), want: 1),
+    Case(name: "7 × 40°, dann zurück in die Ruhelage (8 Bewegungen: zweimal)",
+         points: path(0, swings(7, 40, 0.2) + [Leg(to: 0, seconds: 0.4)]), want: 2),
 ]
 
 var failures = 0

@@ -17,10 +17,14 @@ struct PencilRoll {
     static let window = 2.0
     /// So weit darf die Spitze dabei wandern (Bildschirmpunkte)
     static let drift = 120.0
-    /// Nach einem Treffer endet die auslösende Drehung, sobald sie 5 Grad zurückgeht (kleineres Zittern zählt nicht) …
+    /// Nach einem Treffer endet die auslösende Drehung, sobald sie 5 Grad zurückgeht (kleineres Zittern zählt nicht), …
     static let blockEnd = 5 * Double.pi / 180
-    /// … oder so lange keinen neuen äußersten Wert erreicht (Sekunden)
+    /// … oder so lange keinen neuen äußersten Wert erreicht (Sekunden) …
     static let blockPause = 0.25
+    /// … wobei ein neuer äußerster Wert mindestens 1 Grad weiter sein muss: Zittern und langsames Kriechen (unter etwa
+    /// 4 Grad je Sekunde) halten sie so nicht am Leben, echtes Weiterdrehen schon. Und sie endet, sobald die Spitze
+    /// weiter als `drift` von der Stelle des Treffers ist
+    static let blockStep = 1 * Double.pi / 180
 
     private struct Sample {
         var angle: Double
@@ -37,11 +41,14 @@ struct PencilRoll {
     private var angle = 0.0
     /// Nach einem Treffer die Drehung, die ihn auslöste (1 aufwärts, −1 abwärts): Sie läuft meist noch weiter, und ihr
     /// Rest soll nie für die nächste Geste zählen, auch nicht Sekunden später (sonst schalteten sieben weite Bewegungen
-    /// zweimal, die zweite erst, wenn der Pencil schon ruht). Solange sie weiterläuft, bleibt nur ihr äußerster Wert im
-    /// Fenster; erst ihre Umkehr zählt als erste Drehung der nächsten Geste. 0: Zählung wie sonst
+    /// zweimal, die zweite erst, wenn der Pencil schon ruht). Solange sie weiterläuft, bleibt nur ihr äußerster Wert (auf
+    /// 1 Grad genau) im Fenster; erst ihre Umkehr zählt als erste Drehung der nächsten Geste. 0: Zählung wie sonst
     private var block = 0
     private var blockExtreme = 0.0
     private var blockTime = 0.0
+    /// Ort der Spitze beim Treffer
+    private var blockX = 0.0
+    private var blockY = 0.0
 
     init() {}
 
@@ -70,9 +77,12 @@ struct PencilRoll {
             samples = []
             block = 0
         }
-        // Die auslösende Drehung läuft weiter: Alles davor fällt weg, gezählt wird erst ab ihrem äußersten Wert
+        // Die auslösende Drehung läuft weiter: Alles davor fällt weg, gezählt wird erst ab ihrem äußersten Wert. Ist die
+        // Spitze von der Stelle des Treffers weit weg, zählt alles wieder wie sonst
         if block != 0 {
-            if Double(block) * (angle - blockExtreme) > 0 {
+            if hypot(x - blockX, y - blockY) > Self.drift {
+                block = 0
+            } else if Double(block) * (angle - blockExtreme) >= Self.blockStep {
                 blockExtreme = angle
                 blockTime = time
                 samples = []
@@ -81,8 +91,8 @@ struct PencilRoll {
             }
         }
         samples.append(Sample(angle: angle, time: time, x: x, y: y))
-        // Was zu alt ist oder zu weit von der Spitze jetzt, fällt vorne weg (der neueste Wert bleibt immer). Ist die
-        // Spitze so weit gewandert, zählt auch eine noch laufende auslösende Drehung wieder wie jede andere
+        // Was zu alt ist oder zu weit von der Spitze jetzt, fällt vorne weg (der neueste Wert bleibt immer); dann endet
+        // auch eine noch laufende auslösende Drehung
         var drop = 0
         while drop < samples.count - 1,
               time - samples[drop].time > Self.window
@@ -99,6 +109,8 @@ struct PencilRoll {
         block = direction
         blockExtreme = angle
         blockTime = time
+        blockX = x
+        blockY = y
         return true
     }
 

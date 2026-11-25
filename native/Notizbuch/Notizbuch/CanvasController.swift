@@ -1676,6 +1676,8 @@ extension CanvasController {
 
     /// Löscht Seiten samt ihren Notizen; die Seiten darunter rücken nach
     func deletePages(_ pages: Set<Int>, done: @escaping (String?) -> Void) {
+        // Schon verlassen (etwa die Uhrzeit getippt, während ein Menü noch zuging): nichts mehr an der Datei ändern
+        guard !left else { done("Das Dokument ist schon geschlossen"); return }
         guard !restructuring else { done("Einen Moment, die letzte Änderung läuft noch"); return }
         var gone = pages.filter { layout.frames.indices.contains($0) }
         guard !gone.isEmpty else { done(nil); return }
@@ -1723,6 +1725,7 @@ extension CanvasController {
 
     /// Fügt eine leere karierte Seite ein, sodass sie Seite `index` wird
     func insertBlankPage(at index: Int, done: @escaping (String?) -> Void) {
+        guard !left else { done("Das Dokument ist schon geschlossen"); return }
         guard !restructuring else { done("Einen Moment, die letzte Änderung läuft noch"); return }
         let j = min(max(index, 0), layout.frames.count)
         let mapping: (Int) -> Int? = { i in i >= j ? i + 1 : i }
@@ -1774,6 +1777,7 @@ extension CanvasController {
 
     /// Macht die letzte Seitenänderung rückgängig
     func undoPageChange(done: @escaping (String?) -> Void) {
+        guard !left else { done("Das Dokument ist schon geschlossen"); return }
         guard let undo = pageUndo, !restructuring else { done(nil); return }
         pageUndo = nil
         restructuring = true
