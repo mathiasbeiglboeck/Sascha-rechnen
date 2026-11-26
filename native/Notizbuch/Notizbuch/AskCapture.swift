@@ -213,7 +213,7 @@ extension PageExport {
         // Von der Frage nach außen
         let order = span.filter { $0 != q && frames.indices.contains($0) }
             .sorted { (abs($0 - q), $0) < (abs($1 - q), $1) }
-        for i in order where hasInk(page: i) || notes[i]?.isEmpty == false {
+        for i in order where hasInk(page: i) || notes[i]?.contains(where: { $0.text != nil || $0.box != nil }) == true {
             let shot = autoreleasepool { contextJPEG(page: i) }
             if total + shot.jpeg.count > maxBytes {
                 let reach = abs(i - q) - 1

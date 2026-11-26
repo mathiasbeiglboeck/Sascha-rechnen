@@ -55,9 +55,10 @@ final class InkCanvasView: PKCanvasView {
     private var panel: SelectionMenuPanel?
     /// Wo PencilKit sein Menü zeigen wollte (Mitte oben der Auswahl, in PencilKits innerer Fläche)
     private var panelSource: CGPoint?
-    /// Wohin die offene Liste gehört, in den Koordinaten dieser Fläche: Mitte oben der Auswahl und ihre ungefähre Fläche.
-    /// Zum neu Legen, wenn die Tastatur kommt oder geht, und um zu sehen, ob eine Berührung auf der Auswahl begann
-    private var panelAnchor: (point: CGPoint, area: CGRect)?
+    /// Wohin die offene Liste gehört, in den Koordinaten dieser Fläche: Mitte oben der Auswahl und ihre ungefähre Fläche
+    /// (zum neu Legen, wenn die Tastatur kommt oder geht), dazu wo eine Berührung als auf der Auswahl zählt (die Fläche
+    /// samt dem Lasso daran: PencilKit nimmt Tippen in dessen Rand als Tippen auf die Auswahl)
+    private var panelAnchor: (point: CGPoint, area: CGRect, touchArea: CGRect)?
     /// Zählt jedes Öffnen und Schließen: Eine Liste, die noch auf ihre Runde wartet, geht danach nicht mehr auf
     private var panelRequest = 0
     /// Eine Berührung auf der Auswahl hat die Liste geschlossen: wann, und an welcher Auswahl (siehe presentSelectionPanel)
@@ -147,7 +148,7 @@ final class InkCanvasView: PKCanvasView {
         // nur dieses, statt nach einem neuen zu fragen (Simulator, 26.11.: nach „bleibt zu“ öffnete erst das zweite
         // Tippen die Liste wieder). Gleich danach zu: Dann fragt PencilKit bei jedem Tippen auf die Auswahl
         func handled() -> Bool {
-            DispatchQueue.main.async { [weak menu] in menu?.dismissMenu() }
+            Self.dismissSoon(menu)
             return true
         }
         // Tippen auf die Auswahl, während die Liste offen war: Die Berührung hat sie geschlossen, PencilKit fragt nach
@@ -197,6 +198,11 @@ final class InkCanvasView: PKCanvasView {
         let point = space.convert(source, to: self)
         let estimate = selectionEstimate(at: point, target: target.map { space.convert($0, to: self) })
         let area = estimate.area.union(CGRect(origin: point, size: .zero))
+        var touchArea = area
+        if let lasso = selectionArea?(), !lasso.rect.isNull, !lasso.rect.isInfinite,
+           lasso.rect.insetBy(dx: -60, dy: -60).contains(point) {
+            touchArea = touchArea.union(lasso.rect)
+        }
         let region = visibleRegion(in: host)
         guard panel.bounds.width <= region.width, panel.bounds.height <= region.height else { return }
         panel.frame = Self.place(panel.bounds.size, near: convert(point, to: host), avoiding: convert(area, to: host),
@@ -214,7 +220,7 @@ final class InkCanvasView: PKCanvasView {
         host.addSubview(panel)
         self.panel = panel
         panelSource = source
-        panelAnchor = (point, area)
+        panelAnchor = (point, area, touchArea)
         watchTouches(in: window)
         panel.alpha = 0
         UIView.animate(withDuration: 0.12) { panel.alpha = 1 }
@@ -224,8 +230,16 @@ final class InkCanvasView: PKCanvasView {
         Self.debugLog("Menü mit allen Einträgen geht auf")
     }
 
-    /// Ein neues Lasso wurde gezogen (CanvasController): Die Auswahl der vorigen Liste taugt nicht mehr als Schätzung
-    func forgetSelection() {
+    /// Ist die Liste einer Auswahl gerade offen?
+    var isShowingSelectionPanel: Bool { panel != nil }
+
+    /// Ein neues Lasso wurde gezogen (CanvasController): Die Auswahl der vorigen Liste taugt nicht mehr als Schätzung.
+    /// Begann sein Weg auf ihr (`start`, Koordinaten dieser Fläche), hat er sie nur verschoben (ein Zug mit etwas Bogen
+    /// hat auch eine Fläche): Dann wandert sie mit
+    func forgetSelection(unlessStartingAt start: CGPoint) {
+        let z = max(zoomScale, 0.01)
+        if let known = knownSelection,
+           known.area.applying(CGAffineTransform(scaleX: z, y: z)).insetBy(dx: -24, dy: -24).contains(start) { return }
         knownSelection = nil
     }
 
@@ -300,7 +314,8 @@ final class InkCanvasView: PKCanvasView {
 
     /// Platz für die Liste (Größe `size`) in `region`: über der Auswahl `area` wie PencilKits Menü (waagrecht mittig zu
     /// `point`), sonst darunter, rechts oder links daneben. Passt sie nirgends ganz daneben, dort, wo sie am wenigsten
-    /// von der Auswahl verdeckt (dieselben Plätze an den Rand geschoben, auch in die Ecken). `size` passt in `region`
+    /// von der Auswahl verdeckt; dieselben Plätze an den Rand geschoben oder in die Ecken nur, wenn sie deutlich weniger
+    /// verdecken (sonst spränge die Liste für ein paar Punkte weit weg). `size` passt in `region`
     private static func place(_ size: CGSize, near point: CGPoint, avoiding area: CGRect, within region: CGRect) -> CGRect {
         func clampX(_ x: CGFloat) -> CGFloat { min(max(x, region.minX), region.maxX - size.width) }
         func clampY(_ y: CGFloat) -> CGFloat { min(max(y, region.minY), region.maxY - size.height) }
@@ -323,9 +338,17 @@ final class InkCanvasView: PKCanvasView {
                        CGPoint(x: right, y: top), CGPoint(x: right, y: bottom),
                        CGPoint(x: left, y: top), CGPoint(x: left, y: bottom)]
             .map { CGRect(origin: $0, size: size) }
-        let inside = (candidates + corners)
-            .map { CGRect(x: clampX($0.minX), y: clampY($0.minY), width: size.width, height: size.height) }
-        return inside.min { covered($0) < covered($1) } ?? inside[0]
+        func clamped(_ rect: CGRect) -> CGRect {
+            CGRect(x: clampX(rect.minX), y: clampY(rect.minY), width: size.width, height: size.height)
+        }
+        // Von gleich guten Plätzen der erste (Rundungsfehler unter 1 pt² zählen nicht)
+        func least(_ rects: [CGRect]) -> CGRect {
+            var best = rects[0]
+            for rect in rects.dropFirst() where covered(rect) < covered(best) - 1 { best = rect }
+            return best
+        }
+        let basic = least(candidates.map(clamped)), edge = least(corners.map(clamped))
+        return covered(edge) < min(covered(basic) * 0.8, covered(basic) - 500) ? edge : basic
     }
 
     /// Die Einträge als Abschnitte der Liste: Jedes Untermenü (auch inline) wird ein Abschnitt, ausgeblendete Einträge
@@ -367,17 +390,22 @@ final class InkCanvasView: PKCanvasView {
         panelWatcher = watcher
     }
 
-    /// Ein Finger oder Handballen am iPad, wo nur der Pencil zeichnet (drawingPolicy .pencilOnly)
+    /// Ein Finger oder Handballen am iPad auf dieser Fläche, wo nur der Pencil zeichnet (drawingPolicy .pencilOnly).
+    /// Nicht auf der Leiste, den Tabs oder anderen Ansichten darüber: Dort schließt ein Finger die Liste gleich (UIKit
+    /// kennt die Ansicht unter der Berührung schon, wenn der Beobachter sie sieht)
     private func isFingerOnPencilCanvas(_ touch: UITouch) -> Bool {
         drawingPolicy == .pencilOnly && touch.type != .pencil && touch.type != .indirectPointer
+            && touch.view?.isDescendant(of: self) == true
     }
 
     /// Eine Berührung beginnt, während die Liste offen ist. Neben der Liste schließt sie sie gleich. Nicht am iPad mit
-    /// dem Finger: Dort liegt beim Schreiben oft der Handballen auf, und das soll die Liste nicht schließen. Ein Finger
-    /// schließt sie dort erst mit einem kurzen Tippen (tapWhilePanelOpen) oder wenn die Seite zu scrollen beginnt
-    /// (CanvasController). Und nie, solange eine Zeile der Liste gedrückt ist: Deren Wahl ginge sonst verloren
+    /// dem Finger auf der Fläche: Dort liegt beim Schreiben oft der Handballen auf, und das soll die Liste nicht
+    /// schließen. Ein Finger schließt sie dort erst mit einem kurzen Tippen (tapWhilePanelOpen) oder wenn die Seite zu
+    /// scrollen beginnt (CanvasController). Am iPhone nie, solange eine Zeile der Liste gedrückt ist: Deren Wahl ginge
+    /// sonst verloren. Am iPad drückt dann ein Finger oder der Handballen die Zeile (der Pencil kann nicht zugleich
+    /// woanders aufsetzen): Der Pencil schließt trotzdem, und die Zeile wählt beim Abheben nichts mehr
     private func touchDownWhilePanelOpen(_ touch: UITouch) {
-        guard let panel, !isFingerOnPencilCanvas(touch), !panel.isPressingRow,
+        guard let panel, !isFingerOnPencilCanvas(touch), drawingPolicy == .pencilOnly || !panel.isPressingRow,
               !panel.bounds.contains(touch.location(in: panel)) else { return }
         closeByTouch(at: touch.location(in: self))
     }
@@ -397,7 +425,8 @@ final class InkCanvasView: PKCanvasView {
     /// kommen. Ist nicht bekannt, wo die Auswahl liegt, zählt jede Berührung als auf ihr
     private func closeByTouch(at point: CGPoint) {
         let onSelection = panelAnchor.map { anchor in
-            anchor.area.width < 1 || anchor.area.height < 1 || anchor.area.insetBy(dx: -24, dy: -24).contains(point)
+            let area = anchor.touchArea
+            return area.width < 1 || area.height < 1 || area.insetBy(dx: -24, dy: -24).contains(point)
         } ?? true
         panelClosedByTouch = onSelection ? panelSource.map { (time: Date(), source: $0) } : nil
         closePanel(animated: false, reason: onSelection ? "Berührung auf der Auswahl" : "Berührung neben der Liste")
@@ -469,8 +498,13 @@ final class InkCanvasView: PKCanvasView {
             #endif
             // Außerhalb des Lasso-Modus gehört ein langer Finger zum Scrollen: kein Menü
             guard lasso else { return UIMenu(children: []) }
-            // Gleich nach einem ∞ auch nicht (PencilKit hat seines oben trotzdem gebaut, sein Zustand ist wie sonst)
-            if let ink = canvas as? InkCanvasView, Date() < ink.menuBlockedUntil { return UIMenu(children: []) }
+            // Gleich nach einem ∞ auch nicht (PencilKit hat seines oben trotzdem gebaut, sein Zustand ist wie sonst). Das
+            // leere Menü gleich schließen, sonst schlösse das nächste Tippen auf die Auswahl nur dieses (siehe
+            // presentSelectionPanel)
+            if let ink = canvas as? InkCanvasView, Date() < ink.menuBlockedUntil {
+                dismissSoon(interaction as? UIEditMenuInteraction)
+                return UIMenu(children: [])
+            }
             // Ohne Menü von PencilKit zeigt UIKit die vorgeschlagenen Einträge: dieselben Regeln für diese
             let base = result?.children ?? ((suggested as? [UIMenuElement]) ?? [])
             let removed = filtered(base)
@@ -503,11 +537,20 @@ final class InkCanvasView: PKCanvasView {
             if removed == nil, extra.isEmpty { return result }
             if result == nil { debugLog("PencilKit gab kein Menü zurück") }
             if !extra.isEmpty { kept.insert(UIMenu(title: "", options: .displayInline, children: extra), at: 0) }
-            if kept.isEmpty { return UIMenu(children: []) }
+            if kept.isEmpty {
+                dismissSoon(interaction as? UIEditMenuInteraction)
+                return UIMenu(children: [])
+            }
             return result?.replacingChildren(kept) ?? UIMenu(children: kept)
         }
         let previous = method_setImplementation(method, imp_implementationWithBlock(replacement))
         assert(previous == originalIMP)
+    }
+
+    /// Schließt UIKits Bearbeiten-Menü gleich nach dieser Runde, wenn es leer bleibt: Hält UIKit ein leeres Menü für
+    /// offen, schließt das nächste Tippen auf die Auswahl nur dieses, statt nach einem neuen zu fragen
+    private static func dismissSoon(_ menu: UIEditMenuInteraction?) {
+        DispatchQueue.main.async { [weak menu] in menu?.dismissMenu() }
     }
 
     /// Wohin das Bearbeiten-Menü nach PencilKit zeigen soll (UIKit fragt das beim Zeigen ab), in den Koordinaten der
@@ -622,7 +665,7 @@ final class InkCanvasView: PKCanvasView {
 private final class SelectionMenuPanel: UIView {
     /// Ein Eintrag wurde angetippt
     var onChoose: ((UIAction) -> Void)?
-    /// Der Pencil (oder ein Zeiger) schwebt über der Liste (true) oder nicht mehr (false)
+    /// Der Pencil schwebt über der Liste (true) oder nicht mehr (false); ein Zeiger zählt nicht
     var onHover: ((Bool) -> Void)?
     /// VoiceOver: Wischen mit zwei Fingern (Z-Form) schließt die Liste
     var onEscape: (() -> Void)?
@@ -697,6 +740,9 @@ private final class SelectionMenuPanel: UIView {
     @objc private func hovered(_ g: UIHoverGestureRecognizer) {
         switch g.state {
         case .began, .changed:
+            // Nur der Pencil meldet beim Schweben eine Höhe; ein Zeiger (Trackpad, Maus) meldet 0. Über der Liste ruhend
+            // sperrte er sonst Finger und Scrollen
+            guard isHovered || g.zOffset > 0 else { return }
             isHovered = true
             onHover?(true)
         default:
@@ -766,6 +812,8 @@ private final class SelectionMenuRow: UIButton {
             icon.widthAnchor.constraint(equalToConstant: 24),
         ])
         isEnabled = enabled
+        // Liegt der Handballen (nicht angenommen) schon auf der Zeile, käme der Pencil sonst gar nicht an
+        isMultipleTouchEnabled = true
         isAccessibilityElement = true
         accessibilityLabel = action.title
         // .button allein löschte UIKits „abgeblendet“ für nicht wählbare Einträge

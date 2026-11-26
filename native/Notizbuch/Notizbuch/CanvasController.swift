@@ -65,6 +65,9 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private let lassoTracker = LassoTracker()
     /// Der zuletzt gezogene Weg des Lassos (Seitenpunkte)
     private var lassoPath: LassoPath?
+    /// Rechteck des vorigen Lassos (Seitenpunkte), wenn ein gerader Zug danach seine Auswahl verschob (lassoEnded):
+    /// Seine Größe taugt noch, um die Liste neben die verschobene Auswahl zu legen; sonst nichts
+    private var movedLasso: CGRect?
     /// ∞ mit dem Lasso: die Zeichnung beim Aufsetzen des laufenden Wegs (ein Wert, kostet nichts) und `k` dazu. Liegen
     /// Striche danach verschoben, hat der Weg eine Auswahl verschoben (strokesMoved)
     private var lassoStart: (drawing: PKDrawing, k: CGFloat)?
@@ -349,8 +352,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         redrawWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            // Nicht mitten in einem Strich, sonst ginge er verloren
-            if self.toolBusy || (self.redrawWaitsForPencil && self.pencilNear) {
+            // Nicht mitten in einem Strich, sonst ginge er verloren. Auch nicht, solange die Liste einer Lasso-Auswahl
+            // offen ist: Die neu gesetzte Zeichnung höbe Auswahl und Liste auf, etwa wenn der Pencil über der Liste
+            // weggehoben wird oder eine Zeile länger drückt
+            if self.toolBusy || (self.redrawWaitsForPencil && (self.pencilNear || self.canvas.isShowingSelectionPanel)) {
                 self.redrawInkSoon(waitForPencil: self.redrawWaitsForPencil)
                 return
             }
@@ -1013,6 +1018,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         lassoTracker.isEnabled = lasso && !viewOnly
         if !lassoTracker.isEnabled {
             lassoPath = nil
+            movedLasso = nil
             lassoStart = nil
         }
         if !isPad { canvas.panGestureRecognizer.minimumNumberOfTouches = viewOnly ? 1 : 2 }
@@ -2369,10 +2375,12 @@ extension CanvasController: UIGestureRecognizerDelegate {
 
     /// Rechteck des zuletzt gezogenen Lassos auf der Leinwand (nil: keins): Das Menü der Auswahl geht daneben auf. Dazu,
     /// ob die Tinte darunter noch dieselbe ist; sonst wurde die Auswahl verschoben oder dupliziert (ein kurzer Zug zählt
-    /// nicht als Weg und lässt den alten stehen), und nur seine Größe taugt noch. Einmal je geöffnetem Menü, nicht beim
-    /// Schreiben
+    /// nicht als Weg und lässt den alten stehen), und nur seine Größe taugt noch. Hat ein gerader Zug die Auswahl
+    /// verschoben, das Lasso davor (nur seine Größe zählt). Einmal je geöffnetem Menü, nicht beim Schreiben
     private func lassoAreaOnCanvas() -> (rect: CGRect, unchanged: Bool)? {
-        guard let path = lassoPath else { return nil }
+        guard let path = lassoPath else {
+            return movedLasso.map { (rect: pagesView.convert($0, to: canvas), unchanged: false) }
+        }
         return (pagesView.convert(path.bounds, to: canvas), inkPrint(near: path.bounds) == path.inkPrint)
     }
 
@@ -2415,13 +2423,19 @@ extension CanvasController: UIGestureRecognizerDelegate {
         // Ein anderer Weg nach einem ∞: PencilKits Menü wieder wie sonst
         canvas.menuBlockedUntil = .distantPast
         guard LassoGeometry.area(points) * s * s >= 400 else {
+            // Begann der Zug im Lasso, hat er dessen Auswahl verschoben: Für die Liste daneben taugt noch seine Größe
+            if let old = lassoPath, old.bounds.insetBy(dx: -8 / s, dy: -8 / s).contains(points[0]) {
+                movedLasso = old.bounds
+            }
             lassoPath = nil
             return
         }
         let box = LassoGeometry.bounds(points)
         lassoPath = LassoPath(points: points, bounds: box, inkPrint: inkPrint(near: box))
-        // Die Liste einer früheren Auswahl taugt nicht mehr als Schätzung, wo die Auswahl liegt
-        canvas.forgetSelection()
+        movedLasso = nil
+        // Die Liste einer früheren Auswahl taugt nicht mehr als Schätzung, wo die Auswahl liegt (außer der Weg begann auf
+        // ihr und hat sie nur verschoben)
+        canvas.forgetSelection(unlessStartingAt: pagesView.convert(points[0], to: canvas))
     }
 
     /// Kennzahl der Tinte, die `box` (Seitenpunkte) berührt, in Seitenpunkten gerechnet (übersteht Drehen)
@@ -2498,6 +2512,7 @@ extension CanvasController: UIGestureRecognizerDelegate {
                       pv: currentPagesVersion, effort: effort, created: Date().timeIntervalSince1970,
                       from: isPad ? "iPad" : "iPhone", mode: mode)
         lassoPath = nil
+        movedLasso = nil
         // Auswahl aufheben, sobald das Menü weg ist
         DispatchQueue.main.async { [weak self] in self?.endLassoSelection() }
 
