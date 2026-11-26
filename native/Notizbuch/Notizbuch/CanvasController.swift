@@ -977,6 +977,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             if !(canvas.tool is PKLassoTool) { canvas.tool = PKLassoTool() }
         } else {
             canvas.tool = inkingTool()
+            // Mit dem Lasso geht auch die Auswahl: ihr Menü mit allen Einträgen nicht offen lassen (siehe InkCanvasView)
+            canvas.dismissSelectionMenu()
         }
         // Nur-Sehen-Modus (am iPhone Standard): nichts zeichnet, ein Finger scrollt
         canvas.drawingGestureRecognizer.isEnabled = !erasing && !pointing && !viewOnly
@@ -2756,6 +2758,21 @@ extension CanvasController: UIGestureRecognizerDelegate {
 // MARK: Nur für Tests im Simulator (Debug-Build)
 
 extension CanvasController {
+    /// Probeschrift für Tests: drei Wellenlinien oben links auf der Seite `frame` (Seitenpunkte), als Striche der Leinwand
+    private func debugProbeStrokes(on frame: CGRect) -> [PKStroke] {
+        let toCanvas = CGAffineTransform(scaleX: k, y: k)
+        return (0..<3).map { line -> PKStroke in
+            let y0 = frame.minY + 120 + CGFloat(line) * 40
+            let points = (0...65).map { i -> PKStrokePoint in
+                let x = CGFloat(i) * 4
+                let p = CGPoint(x: frame.minX + 80 + x, y: y0 + 10 * sin(x / 12)).applying(toCanvas)
+                return PKStrokePoint(location: p, timeOffset: Double(i) * 0.01, size: CGSize(width: 3 * k, height: 3 * k),
+                                     opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2)
+            }
+            return PKStroke(ink: PKInk(.pen, color: .black), path: PKStrokePath(controlPoints: points, creationDate: Date()))
+        }
+    }
+
     /// Befehle über Links, etwa `xcrun simctl openurl booted "notizbuch://debug/ask?page=1"`:
     /// - `debug/ask?page=N&effort=quick|thorough[&mode=write]`: Frage zu Seite N wie mit dem Lasso (steht dort nichts, erst
     ///   Probeschrift); mit mode=write wie „Claude schreiben lassen“
@@ -2769,6 +2786,8 @@ extension CanvasController {
     /// - `debug/link…`: Vorschau auf das Ziel eines Links (siehe `debugLink`, Protokoll „Link-Debug: …“)
     /// - `debug/pen`: die fünf Stiftbreiten, wie PencilKit sie hier zeichnet (Protokoll „Link-Debug: Stift …“)
     /// - `debug/roll…`: Pencil Pro zweimal hin und her drehen (siehe `debugRoll`, Protokoll „Rolle-Debug: …“)
+    /// - `debug/fingerlasso[?ink]`: Lasso auch mit dem Finger, um das Menü einer Auswahl im Simulator zu prüfen
+    ///   (Protokoll „Asks-Debug: fingerlasso …“, das Menü selbst „InkCanvasView: Menü mit allen Einträgen …“)
     func debugCommand(_ url: URL) {
         let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         func value(_ name: String) -> String? { items.first { $0.name == name }?.value }
@@ -2956,9 +2975,20 @@ extension CanvasController {
             return NSLog("Link-Debug: IDs Zeit: %@", DebugMeasure.idTiming(n: n))
         case "/roll":
             return debugRoll(items)
-        case "/menutest":
-            // Wie zeigt iPadOS ein Menü mit vielen Einträgen? (siehe MenuDebug, Protokoll „Menü-Debug: …“)
-            return MenuDebug.run(items, host: self)
+        case "/fingerlasso":
+            // Lasso auch mit dem Finger (im Simulator ist jede Berührung ein Finger), um das Menü einer Auswahl zu
+            // prüfen; vorher debug/tool?mode=lasso&edit. &ink: vorher Probeschrift oben links auf Seite 1. Das Protokoll
+            // nennt, wo sie im Fenster liegt (Punkte), zum Umkreisen
+            canvas.drawingPolicy = .anyInput
+            var box = CGRect.null
+            if has("ink"), k > 0, let frame = layout.frames.first {
+                let strokes = debugProbeStrokes(on: frame)
+                canvas.drawing.strokes.append(contentsOf: strokes)
+                box = strokes.reduce(CGRect.null) { $0.union($1.renderBounds) }
+            }
+            let zoomed = box.applying(CGAffineTransform(scaleX: canvas.zoomScale, y: canvas.zoomScale))
+            return log("fingerlasso: an, Werkzeug \(canvas.tool is PKLassoTool ? "Lasso" : "kein Lasso"), Probeschrift im Fenster "
+                       + (box.isNull ? "keine" : "\(canvas.convert(zoomed, to: nil))"))
         case "/pen":
             // Wie dick die fünf Stufen hier eingestellt werden: PencilKit begrenzt die Breite je Tinte
             let pen = PKInkingTool.InkType.pen.validWidthRange
@@ -2987,17 +3017,7 @@ extension CanvasController {
                 pageArea.contains(CGPoint(x: $0.renderBounds.midX, y: $0.renderBounds.midY))
             }
             if onPage.isEmpty {
-                // Probeschrift: drei Wellenlinien oben links auf der Seite
-                let strokes = (0..<3).map { line -> PKStroke in
-                    let y0 = frame.minY + 120 + CGFloat(line) * 40
-                    let points = (0...65).map { i -> PKStrokePoint in
-                        let x = CGFloat(i) * 4
-                        let p = CGPoint(x: frame.minX + 80 + x, y: y0 + 10 * sin(x / 12)).applying(toCanvas)
-                        return PKStrokePoint(location: p, timeOffset: Double(i) * 0.01, size: CGSize(width: 3 * k, height: 3 * k),
-                                             opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2)
-                    }
-                    return PKStroke(ink: PKInk(.pen, color: .black), path: PKStrokePath(controlPoints: points, creationDate: Date()))
-                }
+                let strokes = debugProbeStrokes(on: frame)
                 canvas.drawing.strokes.append(contentsOf: strokes)
                 onPage = strokes
             }
