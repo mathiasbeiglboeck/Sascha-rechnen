@@ -428,7 +428,7 @@ async function answer(ask) {
   }, 300000);
   current = { id: ask.id, claim: job.claim, child: null, cancelled: false };
   try {
-    let result;
+    let result, files = null;
     if (lern) {
       result = await lernClaude(job, level);
     } else if (vok) {
@@ -453,7 +453,7 @@ async function answer(ask) {
         return true;
       }
       const dir = path.join(CHATS, job.doc.id);
-      const files = await fetchFiles(job, dir, t0);
+      files = await fetchFiles(job, dir, t0);
       if (current.cancelled) return;
       log(ask.id, `Unterlagen: ${filesSummary(job, files)}`);
       result = await askClaude(job, dir, files, level);
@@ -462,7 +462,7 @@ async function answer(ask) {
     if (result.ok) {
       localPause = 0;
       // „Claude schreiben lassen“: die Notizen fürs Dokument aus der Antwort lösen
-      const write = !lern && !vok && job.mode === "write" ? splitNotes(result.text, job) : null;
+      const write = !lern && !vok && job.mode === "write" ? splitNotes(result.text, job, files) : null;
       await reply(ask.id, write ? { claim: job.claim, markdown: write.markdown, notes: write.notes }
         : { claim: job.claim, markdown: result.text });
       log(ask.id, `beantwortet nach ${Math.round((Date.now() - t0) / 1000)} s (${result.text.length} Zeichen)` +
@@ -1014,10 +1014,22 @@ const NOTE_COLORS = { blau: "blue", rot: "red", grün: "green", gruen: "green", 
   lila: "purple", blue: "blue", red: "red", green: "green", black: "black", purple: "purple" };
 const NOTE_SIZES = { klein: "small", normal: "normal", groß: "large", gross: "large", small: "small", large: "large" };
 
+/// Bis zu welcher Seite (ab 0) Notizen von „Claude schreiben lassen“ stehen dürfen, null: unbekannt (dann bleiben alle;
+/// die App zeigt Notizen auf Seiten, die es nicht gibt, ohnehin nicht). Beim PDF zählt nur das PDF selbst: Die Zahl am
+/// Server ist dort 0 oder 1 (die App führt sie nur für Notizbücher), und vor der letzten Seitenänderung ist das PDF
+/// kein Maß. Beim Notizbuch die Seitenzahl aus der Nachricht an Claude (pageCount) und eine Seite mehr: Unten hat es
+/// meist eine leere Seite, die der Server noch nicht kennt (sie entsteht beim Schreiben)
+function lastNotePage(job, files) {
+  if (job.doc.kind === "pdf") return files?.total && !files.pdfOld ? files.total - 1 : null;
+  const count = files ? pageCount(job, files) : Number(job.doc.pageCount) || 0;
+  return count ? count : null;
+}
+
 /// Trennt die Antwort bei „Claude schreiben lassen“: der Text für die Sprechblase und die Notizen aus dem letzten
 /// Block ```notizen (oder ```json), umgerechnet für den Server: Seite ab 0, Lage als Anteil (0…1). Notizen
-/// außerhalb des Dokuments fallen weg. `problem`: was nicht ging (fürs Protokoll; die Sprechblase sagt es auch)
-function splitNotes(text, job) {
+/// außerhalb des Dokuments fallen weg (siehe lastNotePage), die Sprechblase sagt dann, wie viele. `problem`: was nicht
+/// ging (fürs Protokoll)
+function splitNotes(text, job, files) {
   const blocks = [...text.matchAll(/```(?:notizen|json)[^\n]*\n([\s\S]*?)```/g)];
   const block = blocks.at(-1);
   let markdown = block ? (text.slice(0, block.index) + text.slice(block.index + block[0].length)).trim() : text.trim();
@@ -1034,7 +1046,7 @@ function splitNotes(text, job) {
       raw = null;
     }
   }
-  const pageCount = Number(job?.doc?.pageCount) || 0;
+  const last = lastNotePage(job, files);
   const num = (v) => (typeof v === "number" ? v : typeof v === "string" ? Number(v.replace(",", ".").replace("%", "")) : NaN);
   const frac = (v) => { const n = num(v); return Number.isFinite(n) ? Math.min(Math.max(n / 100, -0.2), 1.2) : NaN; };
   const notes = [];
@@ -1049,8 +1061,7 @@ function splitNotes(text, job) {
     const box = k && k.length === 4 && k.every(Number.isFinite)
       ? [Math.min(k[0], k[2]), Math.min(k[1], k[3]), Math.max(k[0], k[2]), Math.max(k[1], k[3])] : null;
     if (!Number.isInteger(page) || page < 0 || !Number.isFinite(x) || !Number.isFinite(y) || (!text && !box)) continue;
-    // Ein Notizbuch hat unten meist eine leere Seite mehr, als der Server kennt (sie entsteht beim Schreiben)
-    if (pageCount && page > pageCount - (job.doc.kind === "pdf" ? 1 : 0)) {
+    if (last !== null && page > last) {
       outside++;
       continue;
     }
@@ -1069,6 +1080,10 @@ function splitNotes(text, job) {
   }
   if (!notes.length && raw === null) {
     markdown += "\n\n*(Ins Dokument kam nichts: Die Antwort enthielt keine lesbaren Notizen.)*";
+  }
+  if (outside) {
+    markdown += outside === 1 ? "\n\n*(Eine Notiz stand auf einer Seite, die es nicht gibt, und fehlt.)*"
+      : `\n\n*(${outside} Notizen standen auf Seiten, die es nicht gibt, und fehlen.)*`;
   }
   return { markdown, notes, problem };
 }

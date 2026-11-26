@@ -201,9 +201,20 @@ async function main() {
   const wr = await waitFor(async () => { const x = await askOf(doc, a.id); return x.status === "answered" ? x : null; }, 15000);
   c = calls().filter((x) => x.args).at(-1);
   ok(/Diesmal schreibst du ins Dokument/.test(promptOf(c)) && /```notizen/.test(promptOf(c)) && /das Dokument hat 30 Seiten/.test(promptOf(c)) && /Arbeite zügig/.test(promptOf(c)) && !/Antworte knapp/.test(promptOf(c)), "write: the task, the format, the page count, quick", promptOf(c));
-  ok(wr && wr.mode === "write" && wr.answer === "Zwei Fehler am Rand markiert, die Lösung unter den Auftrag geschrieben.", "write: the speech bubble text without the block", wr);
-  ok(wr?.notes?.length === 2 && wr.notes[0].page === 1 && wr.notes[0].x === 0.84 && wr.notes[0].color === "red" && wr.notes[0].size === "small" && wr.notes[0].box[3] === 0.32 && wr.notes[1].page === 0 && wr.notes[1].text.includes("\\int_0^1"), "write: notes in fractions, page from 0, the one outside the document dropped", wr?.notes);
-  ok(/schreibt ins Dokument/.test(logText()) && /2 Notizen ins Dokument \(1 außerhalb des Dokuments weggelassen\)/.test(logText()), "write: logged", logText().split("\n").slice(-4));
+  ok(wr && wr.mode === "write" && wr.answer === "Zwei Fehler am Rand markiert, die Lösung unter den Auftrag geschrieben.\n\n*(Eine Notiz stand auf einer Seite, die es nicht gibt, und fehlt.)*", "write: the speech bubble text without the block, saying that one note is missing", wr);
+  ok(wr?.notes?.length === 3 && wr.notes[0].page === 1 && wr.notes[0].x === 0.84 && wr.notes[0].color === "red" && wr.notes[0].size === "small" && wr.notes[0].box[3] === 0.32 && wr.notes[1].page === 0 && wr.notes[1].text.includes("\\int_0^1"), "write: notes in fractions, page from 0, the one outside the document dropped", wr?.notes);
+  // Die Seitenzahl gibt beim PDF das PDF (30), nicht der Server (4): Am 26.11. fielen so 13 von 14 Notizen weg
+  ok(wr?.notes?.[2]?.page === 11 && wr.notes[2].text === "Index falsch", "write: a note on page 12 of the 30-page PDF stays although the server knows only 4 pages", wr?.notes);
+  ok(/schreibt ins Dokument/.test(logText()) && /3 Notizen ins Dokument \(1 außerhalb des Dokuments weggelassen\)/.test(logText()), "write: logged", logText().split("\n").slice(-4));
+
+  console.log("== Claude schreiben lassen im Notizbuch: Seitenzahl aus der Nachricht und eine leere Seite mehr");
+  const wnb = uuid();
+  await api("PUT", `/api/library/${wnb}`, { json: { id: wnb, title: "Übungen", kind: "notebook", created: now, modified: now, pageCount: 2 } });
+  a = await createAsk(wnb, "quick", 0, { mode: "write" });
+  const wn = await waitFor(async () => { const x = await askOf(wnb, a.id); return x.status === "answered" ? x : null; }, 15000);
+  ok(wn?.notes?.length === 2 && wn.notes[0].page === 1 && wn.notes[1].page === 0, "write, notebook with 2 pages: notes on pages 1 and 2 stay, 12 and 40 go", wn?.notes);
+  ok(wn?.answer?.endsWith("*(2 Notizen standen auf Seiten, die es nicht gibt, und fehlen.)*"), "write, notebook: the speech bubble says that two notes are missing", wn?.answer);
+  ok(/2 Notizen ins Dokument \(2 außerhalb des Dokuments weggelassen\)/.test(logText()), "write, notebook: logged", logText().split("\n").slice(-4));
   setMode({ mode: "ok" });
 
   console.log("== other document: its own chat; notebook without PDF");

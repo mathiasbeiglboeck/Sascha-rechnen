@@ -213,6 +213,8 @@ const finish = () => {
   const write = "Zwei Fehler am Rand markiert, die Lösung unter den Auftrag geschrieben.\n\n```notizen\n" + JSON.stringify([
     { seite: 2, x: 84, y: 30, breite: 14, text: "Vorzeichen: $-2$", farbe: "rot", größe: "klein", kasten: [10, 29, 60, 32] },
     { seite: 1, x: 10, y: 55, breite: 80, text: "$$\\int_0^1 x\\,dx = \\tfrac12$$" },
+    // Seite 12: im PDF mit 30 Seiten, doch über der Seitenzahl, die der Server kennt (beim PDF 0 oder 1, hier 4)
+    { seite: 12, x: 80, y: 40, breite: 15, text: "Index falsch", farbe: "rot", größe: "klein" },
     { seite: 40, x: 10, y: 10, breite: 50, text: "außerhalb" },
   ]) + "\n```\n";
   const text = mode.mode === "rich" ? rich : mode.mode === "write" ? write : mode.mode === "huge" ? "x".repeat(210000) : `Antwort (${get("--effort")}) auf ${files.join(", ")}: $x^2$`;
