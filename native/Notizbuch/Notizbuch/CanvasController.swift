@@ -2902,6 +2902,9 @@ extension CanvasController {
             return NSLog("Link-Debug: IDs Zeit: %@", DebugMeasure.idTiming(n: n))
         case "/roll":
             return debugRoll(items)
+        case "/menutest":
+            // Wie zeigt iPadOS ein Menü mit vielen Einträgen? (siehe MenuDebug, Protokoll „Menü-Debug: …“)
+            return MenuDebug.run(items, host: self)
         case "/pen":
             // Wie dick die fünf Stufen hier eingestellt werden: PencilKit begrenzt die Breite je Tinte
             let pen = PKInkingTool.InkType.pen.validWidthRange
