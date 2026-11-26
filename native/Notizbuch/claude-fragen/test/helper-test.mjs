@@ -48,7 +48,7 @@ const CTX_PDF = (n) => { const b = new Uint8Array(n); b.set([0x25, 0x50, 0x44, 0
 async function createAsk(doc, effort = "quick", page = 1, ctx = null) {
   const id = uuid();
   const f = new FormData();
-  f.append("meta", JSON.stringify({ anchor: { page, x: 10, y: 20, w: 100, h: 30 }, pv: ctx?.pv || 0, effort, created: ctx?.created || Date.now() / 1000, from: "iPad", ...(ctx?.span ? { span: ctx.span, pages: ctx.pages } : {}) }));
+  f.append("meta", JSON.stringify({ anchor: { page, x: 10, y: 20, w: 100, h: 30 }, pv: ctx?.pv || 0, effort, created: ctx?.created || Date.now() / 1000, from: "iPad", ...(ctx?.span ? { span: ctx.span, pages: ctx.pages } : {}), ...(ctx?.mode ? { mode: ctx.mode } : {}) }));
   f.append("question", new Blob([PNG()], { type: "image/png" }), "question.png");
   f.append("page", new Blob([JPG()], { type: "image/jpeg" }), "page.jpg");
   if (ctx?.bytes) f.append("pages", new Blob([CTX_PDF(ctx.bytes)], { type: "application/pdf" }), "pages.pdf");
@@ -194,6 +194,17 @@ async function main() {
   ok(/Neue Frage zum selben Dokument/.test(c.args[c.args.indexOf("-p") + 1]) && /gründlich/.test(c.args[c.args.indexOf("-p") + 1]), "follow-up prompt, thorough");
   ok(/seiten-1-3\.pdf: die Seiten 1 bis 3/.test(promptOf(c)) && calls().filter((x) => x.osascript).at(-1).osascript.from === "-7", "thorough window: up to 7 pages before, 2 after", promptOf(c));
   ok(fs.statSync(path.join(HOME, "chats", doc, "dokument.pdf")).mtimeMs === pdfMtime, "PDF cached");
+
+  console.log("== Claude schreiben lassen: Auftrag in der Nachricht, Notizen an den Server");
+  setMode({ mode: "write" });
+  a = await createAsk(doc, "quick", 1, { mode: "write" });
+  const wr = await waitFor(async () => { const x = await askOf(doc, a.id); return x.status === "answered" ? x : null; }, 15000);
+  c = calls().filter((x) => x.args).at(-1);
+  ok(/Diesmal schreibst du ins Dokument/.test(promptOf(c)) && /```notizen/.test(promptOf(c)) && /das Dokument hat 30 Seiten/.test(promptOf(c)) && /Arbeite zügig/.test(promptOf(c)) && !/Antworte knapp/.test(promptOf(c)), "write: the task, the format, the page count, quick", promptOf(c));
+  ok(wr && wr.mode === "write" && wr.answer === "Zwei Fehler am Rand markiert, die Lösung unter den Auftrag geschrieben.", "write: the speech bubble text without the block", wr);
+  ok(wr?.notes?.length === 2 && wr.notes[0].page === 1 && wr.notes[0].x === 0.84 && wr.notes[0].color === "red" && wr.notes[0].size === "small" && wr.notes[0].box[3] === 0.32 && wr.notes[1].page === 0 && wr.notes[1].text.includes("\\int_0^1"), "write: notes in fractions, page from 0, the one outside the document dropped", wr?.notes);
+  ok(/schreibt ins Dokument/.test(logText()) && /2 Notizen ins Dokument \(1 außerhalb des Dokuments weggelassen\)/.test(logText()), "write: logged", logText().split("\n").slice(-4));
+  setMode({ mode: "ok" });
 
   console.log("== other document: its own chat; notebook without PDF");
   a = await createAsk(nb, "quick", 0);
