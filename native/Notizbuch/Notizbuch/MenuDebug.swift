@@ -1,5 +1,6 @@
 #if DEBUG
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 
 /// Nur für Tests im Simulator (Debug-Build): Wie zeigt iPadOS ein Menü mit vielen Einträgen? Wunsch 26.11.: Nach dem
 /// Markieren mit dem Lasso sollen alle Einträge sofort zu sehen sein; das Bearbeiten-Menü zeigt seit iPadOS 26 nur
@@ -8,19 +9,22 @@ import UIKit
 /// - `mode=button&shape=S`: unsichtbarer Knopf mit Menü, öffentliches `performPrimaryAction`, falls es das gibt
 /// - `mode=buttonprivate&shape=S`: derselbe Knopf, Menü über das private `_presentMenuAtLocation:` seiner
 ///   Kontextmenü-Interaktion (so öffnet UIKit Knopf-Menüs)
-/// - `mode=popover&shape=S`: eigene Liste als Popover
+/// - `mode=popover&shape=S`: eigene Liste als Popover; `mode=popoverpass`: dieselbe, Tippen daneben geht zur App durch
 /// - `pick=N`: in der eigenen Liste den N-ten Eintrag (ab 0) wählen
 /// - `close`: alles schließen
 /// Formen S: now (wie heute: vorn „Claude fragen“, „Claude gründlich fragen“ als eigener Abschnitt, dann PencilKits
 /// vier Einträge als Abschnitt), nowflat (PencilKits Einträge ohne Abschnitt), one (alle sechs in einem Abschnitt),
 /// flat (alle sechs ohne Abschnitt), plain (wie flat, ohne Bilder), pkfirst (PencilKits vier vorn), pkonly (nur die
 /// vier), pkimg (wie now, PencilKits Einträge mit Bildern), short (kurze Titel), many (zehn kurze Einträge).
-/// Protokoll „Menü-Debug: …“; ein gewählter Eintrag schreibt „Menü-Debug: gewählt <Titel>“
+/// Protokoll „Menü-Debug: …“; ein gewählter Eintrag schreibt „Menü-Debug: gewählt <Titel>“. Dazu meldet jedes Menü,
+/// wann es aufgeht und zugeht, und jede Berührung im Fenster ihren Ort und die Ansicht, die sie bekommt: So zeigt sich,
+/// ob ein Tippen neben ein offenes Menü bis zur App durchkommt oder vom Menü verschluckt wird
 @MainActor
 enum MenuDebug {
     private static var editInteraction: UIEditMenuInteraction?
     private static let editDelegate = EditDelegate()
     private static var button: UIButton?
+    private static var touchLogger: TouchLogger?
     private static weak var list: ListMenuController?
 
     static func run(_ items: [URLQueryItem], host: UIViewController) {
@@ -34,6 +38,11 @@ enum MenuDebug {
             return list.choose(pick)
         }
         close(host)
+        if touchLogger == nil, let window = host.view.window {
+            let logger = TouchLogger(target: nil, action: nil)
+            window.addGestureRecognizer(logger)
+            touchLogger = logger
+        }
         let shape = value("shape") ?? "now"
         let elements = Self.elements(shape)
         let view = host.view!
@@ -47,7 +56,7 @@ enum MenuDebug {
             interaction.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: point))
             log("Bearbeiten-Menü \(shape) bei \(Int(point.x)), \(Int(point.y)), Breite \(Int(view.bounds.width))")
         case "button", "buttonprivate":
-            let button = UIButton(type: .system)
+            let button = DebugMenuButton(type: .system)
             button.frame = CGRect(x: point.x - 22, y: point.y - 22, width: 44, height: 44)
             button.menu = UIMenu(children: elements)
             button.showsMenuAsPrimaryAction = true
@@ -67,7 +76,7 @@ enum MenuDebug {
                 present(interaction, sel, CGPoint(x: 22, y: 22))
                 log("Knopf \(shape): _presentMenuAtLocation: aufgerufen")
             }
-        case "popover":
+        case "popover", "popoverpass":
             let controller = ListMenuController(elements: elements)
             controller.modalPresentationStyle = .popover
             if let popover = controller.popoverPresentationController {
@@ -75,6 +84,7 @@ enum MenuDebug {
                 popover.sourceRect = CGRect(x: point.x, y: point.y, width: 1, height: 1)
                 popover.permittedArrowDirections = [.down, .up]
                 popover.delegate = controller
+                if value("mode") == "popoverpass" { popover.passthroughViews = [view] }
             }
             host.present(controller, animated: false)
             list = controller
@@ -126,12 +136,64 @@ enum MenuDebug {
         }
     }
 
-    private final class EditDelegate: NSObject, UIEditMenuInteractionDelegate {
+    @MainActor private final class EditDelegate: NSObject, UIEditMenuInteractionDelegate {
         var menu: UIMenu?
 
         func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
                                  suggestedActions: [UIMenuElement]) -> UIMenu? {
             menu
+        }
+
+        func editMenuInteraction(_ interaction: UIEditMenuInteraction, willPresentMenuFor configuration: UIEditMenuConfiguration,
+                                 animator: any UIEditMenuInteractionAnimating) {
+            MenuDebug.log("Bearbeiten-Menü geht auf")
+        }
+
+        func editMenuInteraction(_ interaction: UIEditMenuInteraction, willDismissMenuFor configuration: UIEditMenuConfiguration,
+                                 animator: any UIEditMenuInteractionAnimating) {
+            MenuDebug.log("Bearbeiten-Menü geht zu")
+        }
+    }
+
+    /// Knopf, der meldet, wann sein Menü aufgeht und zugeht
+    private final class DebugMenuButton: UIButton {
+        override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                             willDisplayMenuFor configuration: UIContextMenuConfiguration,
+                                             animator: (any UIContextMenuInteractionAnimating)?) {
+            super.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: animator)
+            MenuDebug.log("Knopf-Menü geht auf")
+        }
+
+        override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                             willEndFor configuration: UIContextMenuConfiguration,
+                                             animator: (any UIContextMenuInteractionAnimating)?) {
+            super.contextMenuInteraction(interaction, willEndFor: configuration, animator: animator)
+            MenuDebug.log("Knopf-Menü geht zu")
+        }
+    }
+
+    /// Beobachtet nur: meldet jede Berührung im Fenster mit Ort und Ansicht, hält nichts auf und scheitert sofort
+    private final class TouchLogger: UIGestureRecognizer, UIGestureRecognizerDelegate {
+        override init(target: Any?, action: Selector?) {
+            super.init(target: target, action: action)
+            cancelsTouchesInView = false
+            delaysTouchesBegan = false
+            delaysTouchesEnded = false
+            delegate = self
+        }
+
+        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+            for touch in touches {
+                let p = touch.location(in: view)
+                let hit = touch.view.map { String(describing: type(of: $0)) } ?? "keine Ansicht"
+                MenuDebug.log("Berührung bei \(Int(p.x)), \(Int(p.y)) auf \(hit)")
+            }
+            state = .failed
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+            true
         }
     }
 }
@@ -209,6 +271,10 @@ final class ListMenuController: UIViewController, UIPopoverPresentationControlle
     func adaptivePresentationStyle(for controller: UIPresentationController,
                                    traitCollection: UITraitCollection) -> UIModalPresentationStyle {
         .none
+    }
+
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        MenuDebug.log("eigene Liste durch Tippen daneben zu")
     }
 }
 #endif
