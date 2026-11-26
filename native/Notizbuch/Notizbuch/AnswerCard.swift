@@ -9,7 +9,10 @@ final class AnswerCardModel: ObservableObject {
     let doc: UUID
     let asks: AskStore
     @Published var askID: String
+    /// Angetippt an einer Notiz von „Claude schreiben lassen“: diese Notiz (sie lässt sich dann einzeln entfernen)
+    @Published var note: AskNote?
     var onDelete: (String) -> Void = { _ in }
+    var onDeleteNote: (String, AskNote) -> Void = { _, _ in }
 
     init(doc: UUID, askID: String, asks: AskStore) {
         self.doc = doc
@@ -65,6 +68,8 @@ struct AnswerCard: View {
         } message: {
             Text(ask?.isWaiting == true
                  ? "Die Frage wird zurückgezogen, auf allen Geräten."
+                 : ask?.notes?.isEmpty == false
+                 ? "Markierung, Antwort und was Claude ins Dokument geschrieben hat, verschwinden auf allen Geräten."
                  : "Markierung und Antwort verschwinden auf allen Geräten.")
         }
     }
@@ -89,6 +94,13 @@ struct AnswerCard: View {
                             copied = true
                         } label: {
                             Label(copied ? "Kopiert" : "Antwort kopieren", systemImage: "doc.on.doc")
+                        }
+                    }
+                    if let note = model.note, ask.notes?.contains(where: { $0.wire == note.wire }) == true {
+                        Button(role: .destructive) {
+                            model.onDeleteNote(ask.id, note)
+                        } label: {
+                            Label("Diese Notiz entfernen", systemImage: "eraser")
                         }
                     }
                     Button(role: .destructive) {
@@ -157,7 +169,9 @@ struct AnswerCard: View {
         let when = Calendar.current.isDateInToday(time)
             ? time.formatted(date: .omitted, time: .shortened)
             : time.formatted(date: .abbreviated, time: .shortened)
-        let effort = ask.isThorough ? "gründlich gefragt" : "gefragt"
+        let effort = ask.isWrite
+            ? (ask.isThorough ? "gründlich schreiben lassen" : "schreiben lassen")
+            : (ask.isThorough ? "gründlich gefragt" : "gefragt")
         return "\(effort) \(when)" + (ask.from.map { $0.isEmpty ? "" : " am \($0)" } ?? "")
     }
 

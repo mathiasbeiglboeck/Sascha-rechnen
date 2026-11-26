@@ -1060,9 +1060,11 @@ final class SyncEngine: ObservableObject {
             /// Die Seiten um die Frage (AskContext); ohne sie fehlen beide
             var span: [Int]?
             var pages: [Int]?
+            /// "write": „Claude schreiben lassen“
+            var mode: String?
         }
         let meta = Meta(anchor: ask.anchor, pv: ask.pv, effort: ask.effort, created: ask.created, from: ask.from ?? "",
-                        span: context?.info.span, pages: context?.info.pages)
+                        span: context?.info.span, pages: context?.info.pages, mode: ask.mode)
         part("meta", try JSONEncoder().encode(meta))
         // Die Frage als PNG (Lasso) oder JPEG (∞); der Server erkennt die Art ohnehin an den ersten Bytes
         let jpeg = question.starts(with: [0xFF, 0xD8, 0xFF])
@@ -1083,12 +1085,15 @@ final class SyncEngine: ObservableObject {
 
     /// Neue Stellen nach Seitenänderungen, für den Seitenstand `pv`. Der Server nimmt sie nur, wenn seine Stelle
     /// nicht schon zu einem neueren Seitenstand gehört
-    func moveAsks(_ doc: UUID, pv: Int, anchors: [String: AskAnchor]) async throws -> AskList {
+    /// Dazu die Notizen der Fragen von „Claude schreiben lassen“ (ersetzen die bisherigen; ein älterer Server übergeht sie)
+    func moveAsks(_ doc: UUID, pv: Int, anchors: [String: AskAnchor],
+                  notes: [String: [AskNote]] = [:]) async throws -> AskList {
         struct Body: Encodable {
             var pv: Int
             var anchors: [String: AskAnchor]
+            var notes: [String: [AskNote]]?
         }
-        let body = try JSONEncoder().encode(Body(pv: pv, anchors: anchors))
+        let body = try JSONEncoder().encode(Body(pv: pv, anchors: anchors, notes: notes.isEmpty ? nil : notes))
         return try JSONDecoder().decode(AskList.self, from: try await request("PATCH", Self.askPath(doc), body: body))
     }
 

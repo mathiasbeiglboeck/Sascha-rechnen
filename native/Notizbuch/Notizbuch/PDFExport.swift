@@ -10,11 +10,21 @@ struct PageExport: @unchecked Sendable {
     let ink: PKDrawing
     /// Striche je Seite, einmal vorsortiert (siehe `indexed()`); sonst wird je Seite die ganze Zeichnung durchsucht
     private var byPage: [[PKStroke]]?
+    /// Notizen von „Claude schreiben lassen“ je Seite (NotesOverlay.forExport), unter der Tinte wie in der App
+    var notes: [Int: [Note]] = [:]
 
-    init(frames: [CGRect], pdf: CGPDFDocument?, ink: PKDrawing) {
+    /// Eine Notiz auf einer Seite: gesetzter Text und Rahmen, Lage relativ zur Seite
+    struct Note: @unchecked Sendable {
+        let text: (CGRect, NoteTypesetter.Typeset)?
+        let box: CGRect?
+        let color: CGColor
+    }
+
+    init(frames: [CGRect], pdf: CGPDFDocument?, ink: PKDrawing, notes: [Int: [Note]] = [:]) {
         self.frames = frames
         self.pdf = pdf
         self.ink = ink
+        self.notes = notes
     }
 
     /// Dieselbe Momentaufnahme mit den Strichen nach Seiten sortiert: Die Übersicht fragt jede Seite einzeln
@@ -60,6 +70,7 @@ struct PageExport: @unchecked Sendable {
         } else {
             PageView.drawGrid(in: ctx, rect: rect, lineWidth: 0.5)
         }
+        drawNotes(i, in: ctx)
         let own = strokes(on: i)
         guard !own.isEmpty else { return }
         // Nur den Bereich mit Tinte rastern, nicht die ganze Seite
@@ -84,6 +95,7 @@ struct PageExport: @unchecked Sendable {
         } else {
             PageView.drawGrid(in: ctx, rect: region, lineWidth: 0.5)
         }
+        drawNotes(i, in: ctx)
         let area = region.offsetBy(dx: frame.minX, dy: frame.minY)
         let own = strokes(on: i).filter { $0.renderBounds.intersects(area) }
         if !own.isEmpty {
@@ -92,6 +104,22 @@ struct PageExport: @unchecked Sendable {
             }
         }
         ctx.restoreGState()
+    }
+
+    /// Die Notizen von Claude auf Seite `i` (Seitenpunkte ab der Ecke der Seite)
+    private func drawNotes(_ i: Int, in ctx: CGContext) {
+        guard let list = notes[i], !list.isEmpty else { return }
+        for note in list {
+            if let (rect, typeset) = note.text { typeset.draw(in: ctx, rect: rect) }
+            if let box = note.box {
+                ctx.saveGState()
+                ctx.setStrokeColor(note.color.copy(alpha: 0.85) ?? note.color)
+                ctx.setLineWidth(NotePlacement.boxLine)
+                ctx.addPath(UIBezierPath(roundedRect: box, cornerRadius: 4).cgPath)
+                ctx.strokePath()
+                ctx.restoreGState()
+            }
+        }
     }
 
     /// Breite der Seite im PDF: Notizbuchseiten als A4, PDF-Seiten in Originalgröße
