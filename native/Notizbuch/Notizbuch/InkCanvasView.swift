@@ -1,4 +1,5 @@
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 import PencilKit
 import ObjectiveC
 
@@ -19,8 +20,9 @@ struct SelectionMenuContext {
 ///   wenn kopierte Striche zum Einsetzen bereitliegen.
 /// - Mit dem Lasso bleiben Ausschneiden, Kopieren, Löschen, Duplizieren und Einsetzen; im Menü einer Auswahl
 ///   kommen vorn die Einträge für Claude dazu (`selectionMenuItems`).
-/// - Das Menü einer Auswahl zeigt alle Einträge auf einmal, untereinander (siehe `presentWholeMenu`): Das
-///   Bearbeiten-Menü zeigt seit iPadOS 26 nur etwa drei davon und den Rest hinter einem Pfeil.
+/// - Das Menü einer Auswahl zeigt alle Einträge auf einmal, untereinander, in einer eigenen Liste neben der Auswahl
+///   (siehe `presentSelectionPanel`): Das Bearbeiten-Menü zeigt seit iPadOS 26 nur etwa drei davon und den Rest hinter
+///   einem Pfeil.
 /// - „Alles auswählen“ fällt immer weg. Bleibt nichts übrig, kommt kein Menü.
 /// - „Leerzeile (oben) einfügen“ fällt anhand von PencilKits eigenen Übersetzungen weg (die Einträge tragen zufällige
 ///   Kennungen), falls PencilKits Schalter dafür (siehe unten) fehlt.
@@ -40,16 +42,27 @@ final class InkCanvasView: PKCanvasView {
     }
     /// Weitere Einträge vorn im Menü einer Lasso-Auswahl („Claude fragen“); setzt CanvasController
     var selectionMenuItems: ((SelectionMenuContext) -> [UIMenuElement])?
+    /// Rechteck des zuletzt gezogenen Lassos in den Koordinaten dieser Fläche (nil: keins). Das Menü einer Auswahl geht
+    /// daneben auf statt darüber; setzt CanvasController
+    var selectionArea: (() -> CGRect?)?
     /// Bis dahin kein Menü: Gleich nach einem ∞ mit dem Lasso fragt CanvasController Claude selbst
     var menuBlockedUntil = Date.distantPast
 
-    /// Das Menü einer Auswahl mit allen Einträgen, solange es aufgeht oder offen ist (siehe presentWholeMenu)
-    private var wholeMenu: WholeMenuAnchor?
-    /// Kurz nach dem Schließen dieses Menüs kein neues: Tippen auf die Auswahl schließt es dann, statt es gleich wieder
-    /// zu öffnen (so blendet PencilKit sein Bearbeiten-Menü beim Tippen auf die Auswahl aus und ein)
-    private var wholeMenuQuietUntil = Date.distantPast
-    /// Einmal PencilKits Bearbeiten-Menü wie früher: Das Menü mit allen Einträgen ging nicht auf
-    private var compactMenuOnce = false
+    /// Das Menü einer Auswahl mit allen Einträgen, solange es offen ist (siehe presentSelectionPanel)
+    private var panel: SelectionMenuPanel?
+    /// Wo PencilKit sein Menü zeigen wollte (Mitte oben der Auswahl, in PencilKits innerer Fläche)
+    private var panelSource: CGPoint?
+    /// Zählt jedes Öffnen und Schließen: Eine Liste, die noch auf ihre Runde wartet, geht danach nicht mehr auf
+    private var panelRequest = 0
+    /// Eine Berührung neben der Liste hat sie geschlossen: wann, und an welcher Auswahl (siehe presentSelectionPanel)
+    private var panelClosedByTouch: (time: Date, source: CGPoint)?
+    /// Bemerkt Berührungen im Fenster, solange die Liste offen ist
+    private var panelWatcher: PanelTouchWatcher?
+    /// Die Auswahl der zuletzt gezeigten Liste ohne Zoom: Mitte oben und ungefähre Fläche. Verschiebt man die Auswahl,
+    /// zeigt PencilKit sein Menü an der neuen Stelle, die Fläche wandert dann mit
+    private var knownSelection: (source: CGPoint, area: CGRect)?
+    /// Breite beim letzten Layout: Dreht sich das Gerät, geht die Liste zu
+    private var laidOutWidth: CGFloat = 0
 
     override init(frame: CGRect) {
         _ = Self.menuHook
@@ -72,97 +85,219 @@ final class InkCanvasView: PKCanvasView {
 
     override func willMove(toWindow newWindow: UIWindow?) {
         super.willMove(toWindow: newWindow)
-        if newWindow == nil { dismissSelectionMenu() }
+        guard newWindow == nil else { return }
+        dismissSelectionMenu()
+        if let watcher = panelWatcher {
+            watcher.view?.removeGestureRecognizer(watcher)
+            panelWatcher = nil
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        // Die Liste steht fest im Fenster: Nach dem Drehen passte sie nicht mehr zur Auswahl
+        guard abs(bounds.width - laidOutWidth) > 0.5 else { return }
+        laidOutWidth = bounds.width
+        if panel != nil { closePanel(animated: false, reason: "andere Breite") }
     }
 
     // MARK: Menü einer Auswahl mit allen Einträgen
 
     /// Zeigt das Menü einer Auswahl mit allen Einträgen auf einmal: vorn `claude`, darunter PencilKits Einträge, je als
-    /// Abschnitt. Es ist das Menü eines Knopfs (UIButton mit Menü), das öffentliche performPrimaryAction (ab iOS 17.4)
-    /// öffnet es: Wie das Bearbeiten-Menü, wenn man dort den Pfeil antippt, stehen alle Einträge untereinander. Der
-    /// Knopf ist unsichtbar, liegt über der Auswahl und bekommt nie eine Berührung (WholeMenuAnchor). Tippen neben das
-    /// Menü geht wie beim Bearbeiten-Menü an die Fläche durch und schließt es (im Simulator geprüft, 26.11.).
-    /// true: PencilKits Bearbeiten-Menü bleibt leer, das Menü geht gleich auf (oder ging eben erst zu, siehe
-    /// wholeMenuQuietUntil). false: das Bearbeiten-Menü wie früher, etwa vor iOS 17.4 oder mit Befehlen (UICommand) darin,
-    /// die vom Knopf aus nicht an PencilKits Fläche gingen
-    fileprivate func presentWholeMenu(claude: [UIMenuElement], pencilKit: [UIMenuElement],
-                                      interaction: UIEditMenuInteraction, configuration: UIEditMenuConfiguration) -> Bool {
-        if compactMenuOnce {
-            compactMenuOnce = false
-            return false
-        }
-        guard #available(iOS 17.4, *) else { return false }
-        guard !Self.containsCommand(pencilKit), let space = interaction.view, window != nil else { return false }
-        if Date() < wholeMenuQuietUntil {
-            Self.debugLog("Menü mit allen Einträgen: eben erst zu, bleibt zu")
-            return true
-        }
-        dismissSelectionMenu()
-
-        // Wohin PencilKit sein Menü setzen würde: neben die Auswahl (sonst an die Stelle des Menüs), im sichtbaren Teil
-        let point = configuration.sourcePoint
-        var target = interaction.delegate?.editMenuInteraction?(interaction, targetRectFor: configuration) ?? .null
-        if target.isNull || target.isInfinite { target = CGRect(origin: point, size: .zero) }
-        var place = space.convert(target, to: self).intersection(bounds)
-        if place.isNull || place.isEmpty {
-            let p = space.convert(point, to: self)
-            place = CGRect(x: min(max(p.x, bounds.minX), bounds.maxX), y: min(max(p.y, bounds.minY), bounds.maxY),
-                           width: 0, height: 0)
-        }
-        place = place.insetBy(dx: min(0, (place.width - 2) / 2), dy: min(0, (place.height - 2) / 2))
-
-        let anchor = WholeMenuAnchor(frame: place)
-        anchor.menu = UIMenu(children: [UIMenu(title: "", options: .displayInline, children: claude),
-                                        UIMenu(title: "", options: .displayInline, children: pencilKit)])
-        anchor.showsMenuAsPrimaryAction = true
-        // Sonst dreht UIKit die Reihenfolge um, wenn das Menü über der Auswahl aufgeht
-        anchor.preferredMenuElementOrder = .fixed
-        anchor.onEnd = { [weak self, weak anchor] in
-            guard let self, let anchor, self.wholeMenu === anchor else { return }
-            self.wholeMenu = nil
-            self.wholeMenuQuietUntil = Date().addingTimeInterval(0.25)
-        }
-        addSubview(anchor)
-        wholeMenu = anchor
-        // Nach dieser Runde: Dann hat UIKit das leere Bearbeiten-Menü verworfen
-        DispatchQueue.main.async { [weak self, weak anchor, weak interaction] in
-            guard let self, let anchor, self.wholeMenu === anchor else { return }
-            if anchor.window != nil { anchor.performPrimaryAction() }
-            // Ging es nicht auf, einmal das Bearbeiten-Menü wie früher (sonst bliebe die Auswahl ganz ohne Menü)
-            DispatchQueue.main.asyncAfter(deadline: .now() + (anchor.window != nil ? 0.6 : 0)) { [weak self, weak anchor] in
-                guard let self, let anchor, self.wholeMenu === anchor, !anchor.shown else { return }
-                Self.debugLog("Menü mit allen Einträgen ging nicht auf, Bearbeiten-Menü wie früher")
-                self.wholeMenu = nil
-                anchor.removeFromSuperview()
-                guard let interaction, interaction.view?.window != nil else { return }
-                self.compactMenuOnce = true
-                interaction.presentEditMenu(with: configuration)
+    /// Abschnitt, in einer eigenen Liste (SelectionMenuPanel) neben der Auswahl. Menüs von UIKit taugen dafür nicht: Das
+    /// Bearbeiten-Menü zeigt nur etwa drei Einträge, und ein Knopf-Menü (Version 161) hält die nächste Berührung fest,
+    /// Tippen daneben schloss dann nur das Menü (die Auswahl blieb), und Ziehen verschob die Auswahl nicht (im Simulator
+    /// geprüft, 26.11.). Die Liste hält nichts fest: Jede Berührung daneben schließt sie und tut, was sie sonst täte
+    /// (Tippen daneben hebt die Auswahl auf, Ziehen verschiebt sie, ein neues Lasso beginnt). Tippen auf die Auswahl
+    /// schließt sie, wie PencilKits Menü.
+    /// true: PencilKits Bearbeiten-Menü bleibt leer, die Liste geht gleich auf (oder bleibt zu, siehe
+    /// panelClosedByTouch). false: das Bearbeiten-Menü wie früher, etwa mit Befehlen (UICommand) darin, die die Liste
+    /// nicht ausführen kann, oder wenn sie nicht ganz auf den Bildschirm passt
+    fileprivate func presentSelectionPanel(claude: [UIMenuElement], pencilKit: [UIMenuElement], space: UIView,
+                                           source: CGPoint) -> Bool {
+        let elements: [UIMenuElement] = [UIMenu(title: "", options: .displayInline, children: claude)] + pencilKit
+        guard window != nil, let host = superview, let sections = Self.panelSections(elements), !sections.isEmpty
+        else { return false }
+        // Tippen auf die Auswahl, während die Liste offen war: Die Berührung hat sie geschlossen, PencilKit fragt nach
+        // dem Tippen nach seinem Menü. Es bleibt zu, wie PencilKits eigenes Menü beim Tippen auf die Auswahl
+        if let closed = panelClosedByTouch {
+            panelClosedByTouch = nil
+            if Date().timeIntervalSince(closed.time) < 0.6,
+               hypot(source.x - closed.source.x, source.y - closed.source.y) < 4 {
+                Self.debugLog("Menü mit allen Einträgen: eben erst zu, bleibt zu")
+                return true
             }
         }
-        Self.debugLog("Menü mit allen Einträgen bei \(place)")
+        // Schon offen für dieselbe Auswahl
+        if panel != nil, let shown = panelSource, hypot(source.x - shown.x, source.y - shown.y) < 1 { return true }
+        let region = visibleRegion(in: host)
+        let list = SelectionMenuPanel(sections: sections, maxWidth: min(360, max(region.width, 0)))
+        guard list.bounds.width <= region.width, list.bounds.height <= region.height else {
+            Self.debugLog("Menü mit allen Einträgen passt nicht (\(list.bounds.size) in \(region.size)), "
+                          + "Bearbeiten-Menü wie früher")
+            return false
+        }
+        closePanel(animated: false, reason: "neue Auswahl")
+        panelRequest += 1
+        let request = panelRequest
+        Self.debugLog("Menü mit allen Einträgen: "
+                      + sections.map { $0.map(\.title).joined(separator: " | ") }.joined(separator: " ‖ "))
+        // Erst nach dieser Runde: Dann hat UIKit das leere Bearbeiten-Menü verworfen, und CanvasController kennt den Weg
+        // eines Lassos, das eben endete (lassoEnded), für den Platz neben der Auswahl
+        DispatchQueue.main.async { [weak self, weak space] in
+            guard let self, let space, request == self.panelRequest else { return }
+            self.show(list, from: space, source: source)
+        }
         return true
     }
 
-    /// Schließt das Menü einer Auswahl mit allen Einträgen, falls es offen ist (anderes Werkzeug, Nur-Sehen, Fläche
-    /// weg). Kein „eben erst zu“: Ein neues Menü darf gleich wieder aufgehen
-    func dismissSelectionMenu() {
-        guard let anchor = wholeMenu else { return }
-        wholeMenu = nil
-        if anchor.shown && !anchor.ended {
-            anchor.contextMenuInteraction?.dismissMenu()
-        } else if !anchor.shown {
-            anchor.removeFromSuperview()
+    private func show(_ panel: SelectionMenuPanel, from space: UIView, source: CGPoint) {
+        guard let host = superview, let window else { return }
+        let point = space.convert(source, to: self)
+        let area = selectionEstimate(at: point).union(CGRect(origin: point, size: .zero))
+        let region = visibleRegion(in: host)
+        guard panel.bounds.width <= region.width, panel.bounds.height <= region.height else { return }
+        panel.frame = Self.place(panel.bounds.size, near: convert(point, to: host), avoiding: convert(area, to: host),
+                                 within: region)
+        panel.onChoose = { [weak self, weak panel] action in
+            guard let self, let panel, self.panel === panel else { return }
+            self.closePanel(animated: true, reason: "gewählt: \(action.title)")
+            // Erst danach, wie bei UIKits Menüs
+            DispatchQueue.main.async { action.performWithSender(nil, target: nil) }
         }
+        host.addSubview(panel)
+        self.panel = panel
+        panelSource = source
+        watchTouches(in: window)
+        panel.alpha = 0
+        UIView.animate(withDuration: 0.12) { panel.alpha = 1 }
+        UIAccessibility.post(notification: .layoutChanged, argument: panel.firstRow)
+        Self.debugLog("Menü mit allen Einträgen bei \(panel.frame), Auswahl etwa \(convert(area, to: host))")
+        Self.debugLog("Menü mit allen Einträgen geht auf")
     }
 
-    /// Befehle (UICommand) im Menü, auch in Abschnitten: UIKit schickt sie an den Knopf und die Ansichten über ihm, nicht
-    /// an PencilKits Fläche darunter. PencilKits eigene Einträge sind UIActions; Befehle kommen, wenn PencilKit kein
-    /// Menü baut und UIKit seine Vorschläge zeigt
-    private static func containsCommand(_ elements: [UIMenuElement]) -> Bool {
-        elements.contains { element in
-            if let menu = element as? UIMenu { return containsCommand(menu.children) }
-            return element is UICommand
+    /// Wo die Auswahl ungefähr liegt, deren Menü bei `point` (Mitte oben der Auswahl, Koordinaten dieser Fläche)
+    /// aufgehen soll: das zuletzt gezogene Lasso, wenn das Menü an ihm aufgeht; sonst die Auswahl der vorigen Liste,
+    /// mitgewandert (verschoben); sonst nur dieser Punkt
+    private func selectionEstimate(at point: CGPoint) -> CGRect {
+        let z = max(zoomScale, 0.01)
+        let unzoomed = CGPoint(x: point.x / z, y: point.y / z)
+        if let lasso = selectionArea?(), !lasso.isNull, !lasso.isInfinite,
+           lasso.insetBy(dx: -60, dy: -60).contains(point) {
+            knownSelection = (unzoomed, lasso.applying(CGAffineTransform(scaleX: 1 / z, y: 1 / z)))
+            return lasso
         }
+        if let known = knownSelection {
+            let moved = known.area.offsetBy(dx: unzoomed.x - known.source.x, dy: unzoomed.y - known.source.y)
+            knownSelection = (unzoomed, moved)
+            return moved.applying(CGAffineTransform(scaleX: z, y: z))
+        }
+        return CGRect(origin: point, size: .zero)
+    }
+
+    /// Wo die Liste ganz zu sehen ist, in den Koordinaten von `host`: der sichtbare Teil der Fläche unter der Leiste
+    /// (sie liegt über dem oberen contentInset) und in der Safe Area, mit etwas Abstand zum Rand
+    private func visibleRegion(in host: UIView) -> CGRect {
+        let safe = host.safeAreaInsets
+        let insets = UIEdgeInsets(top: max(contentInset.top, safe.top), left: safe.left, bottom: safe.bottom,
+                                  right: safe.right)
+        return convert(bounds, to: host).inset(by: insets).insetBy(dx: 8, dy: 8)
+    }
+
+    /// Platz für die Liste (Größe `size`) in `region`: über der Auswahl `area` wie PencilKits Menü (waagrecht mittig zu
+    /// `point`), sonst darunter, rechts oder links daneben. Passt sie nirgends ganz daneben, dort, wo sie am wenigsten
+    /// von der Auswahl verdeckt. `size` passt in `region`
+    private static func place(_ size: CGSize, near point: CGPoint, avoiding area: CGRect, within region: CGRect) -> CGRect {
+        func clampX(_ x: CGFloat) -> CGFloat { min(max(x, region.minX), region.maxX - size.width) }
+        func clampY(_ y: CGFloat) -> CGFloat { min(max(y, region.minY), region.maxY - size.height) }
+        let gap: CGFloat = 10
+        let x = clampX(point.x - size.width / 2)
+        let candidates = [CGPoint(x: x, y: area.minY - gap - size.height),
+                          CGPoint(x: x, y: area.maxY + gap),
+                          CGPoint(x: area.maxX + gap, y: clampY(area.minY)),
+                          CGPoint(x: area.minX - gap - size.width, y: clampY(area.minY))]
+            .map { CGRect(origin: $0, size: size) }
+        if let free = candidates.first(where: { region.contains($0) }) { return free }
+        func covered(_ rect: CGRect) -> CGFloat {
+            let common = rect.intersection(area)
+            return common.isNull ? 0 : common.width * common.height
+        }
+        let inside = candidates.map { CGRect(x: clampX($0.minX), y: clampY($0.minY), width: size.width, height: size.height) }
+        return inside.min { covered($0) < covered($1) } ?? inside[0]
+    }
+
+    /// Die Einträge als Abschnitte der Liste: Jedes Untermenü (auch inline) wird ein Abschnitt, ausgeblendete Einträge
+    /// fallen weg. nil bei Einträgen, die die Liste nicht selbst ausführen kann (Befehle, nachgeladene Einträge): Dann
+    /// kommt das Bearbeiten-Menü wie früher. Befehle (UICommand) gingen über die Responder-Kette, nicht sicher an
+    /// PencilKits Fläche; PencilKits eigene Einträge sind UIActions, Befehle kommen, wenn PencilKit kein Menü baut und
+    /// UIKit seine Vorschläge zeigt
+    private static func panelSections(_ elements: [UIMenuElement]) -> [[UIAction]]? {
+        var sections: [[UIAction]] = []
+        var current: [UIAction] = []
+        for element in elements {
+            if let menu = element as? UIMenu {
+                guard let inner = panelSections(menu.children) else { return nil }
+                if !current.isEmpty {
+                    sections.append(current)
+                    current = []
+                }
+                sections += inner
+            } else if let action = element as? UIAction {
+                if !action.attributes.contains(.hidden) { current.append(action) }
+            } else {
+                return nil
+            }
+        }
+        if !current.isEmpty { sections.append(current) }
+        return sections
+    }
+
+    /// Jede Berührung im Fenster neben der Liste schließt sie, ohne dass die Berührung verloren geht (PanelTouchWatcher)
+    private func watchTouches(in window: UIWindow) {
+        let watcher = panelWatcher ?? PanelTouchWatcher(target: nil, action: nil)
+        watcher.onTouchDown = { [weak self] touches in self?.touchDownWhilePanelOpen(touches) }
+        if watcher.view !== window {
+            watcher.view?.removeGestureRecognizer(watcher)
+            window.addGestureRecognizer(watcher)
+        }
+        watcher.isEnabled = true
+        panelWatcher = watcher
+    }
+
+    private func touchDownWhilePanelOpen(_ touches: Set<UITouch>) {
+        guard let panel else { return }
+        // In der Liste wählt sie selbst
+        guard touches.contains(where: { !panel.point(inside: $0.location(in: panel), with: nil) }) else { return }
+        panelClosedByTouch = panelSource.map { (time: Date(), source: $0) }
+        closePanel(animated: false, reason: "Berührung daneben")
+    }
+
+    /// Schließt die Liste, falls sie offen ist, und verwirft eine, die noch auf ihre Runde wartet
+    private func closePanel(animated: Bool, reason: String) {
+        panelRequest += 1
+        guard let panel else { return }
+        self.panel = nil
+        panelSource = nil
+        panel.isUserInteractionEnabled = false
+        if animated {
+            UIView.animate(withDuration: 0.1, animations: { panel.alpha = 0 }, completion: { _ in panel.removeFromSuperview() })
+        } else {
+            panel.removeFromSuperview()
+        }
+        // Der Beobachter ruht bis zur nächsten Liste (nicht mitten in seiner eigenen Berührung abschalten)
+        if let watcher = panelWatcher {
+            DispatchQueue.main.async { [weak self] in
+                if self?.panel == nil { watcher.isEnabled = false }
+            }
+        }
+        Self.debugLog("Menü mit allen Einträgen geht zu (\(reason))")
+    }
+
+    /// Schließt das Menü einer Auswahl mit allen Einträgen, falls es offen ist (anderes Werkzeug, Nur-Sehen, Fläche
+    /// weg). Kein „eben erst zu“: Ein neues darf gleich wieder aufgehen
+    func dismissSelectionMenu() {
+        panelClosedByTouch = nil
+        closePanel(animated: false, reason: "Werkzeug oder Fläche")
     }
 
     /// Einmal beim ersten Erzeugen, vor dem ersten Menü
@@ -218,12 +353,9 @@ final class InkCanvasView: PKCanvasView {
                 NSLog("InkCanvasView: Auswahl-Menü, Quelle %@ in %@", "\(point)", space.map { "\(type(of: $0))" } ?? "nil")
                 #endif
             }
-            // Menü einer Auswahl: alle Einträge auf einmal statt des Bearbeiten-Menüs (siehe presentWholeMenu)
-            if !extra.isEmpty, let ink = canvas as? InkCanvasView,
-               let editInteraction = interaction as? UIEditMenuInteraction,
-               let editConfiguration = configuration as? UIEditMenuConfiguration,
-               ink.presentWholeMenu(claude: extra, pencilKit: kept, interaction: editInteraction,
-                                    configuration: editConfiguration) {
+            // Menü einer Auswahl: alle Einträge auf einmal in einer eigenen Liste (siehe presentSelectionPanel)
+            if !extra.isEmpty, let ink = canvas as? InkCanvasView, let space,
+               ink.presentSelectionPanel(claude: extra, pencilKit: kept, space: space, source: point) {
                 return UIMenu(children: [])
             }
             // Nichts geändert: PencilKits Menü wie es ist (oder nil: UIKit zeigt seine Vorschläge)
@@ -331,46 +463,143 @@ final class InkCanvasView: PKCanvasView {
     }
 }
 
-/// Der unsichtbare Knopf, von dem das Menü einer Auswahl mit allen Einträgen aufgeht (InkCanvasView.presentWholeMenu).
-/// Ohne Titel und Bild zeichnet er nichts; er nimmt nie eine Berührung an (point(inside:) ist immer false), so geht
-/// jedes Tippen an die Fläche unter ihm. Nach dem Schließen nimmt er sich selbst weg
-private final class WholeMenuAnchor: UIButton {
-    /// Wenn das Menü zugeht, gleich zu Beginn (gewählt, daneben getippt oder geschlossen)
-    var onEnd: (() -> Void)?
-    private(set) var shown = false
-    private(set) var ended = false
+/// Das Menü einer Auswahl mit allen Einträgen (InkCanvasView.presentSelectionPanel): Abschnitte untereinander, je
+/// Eintrag eine Zeile mit Titel und Symbol wie in UIKits Menüs. Es liegt in der Ansicht über der Fläche, nicht in ihr:
+/// PencilKits Gesten (Lasso, Schreiben, Scrollen) sehen keine Berührung darin
+private final class SelectionMenuPanel: UIView {
+    /// Ein Eintrag wurde angetippt
+    var onChoose: ((UIAction) -> Void)?
+    /// Für Bedienungshilfen: Dorthin springt der Fokus, wenn die Liste aufgeht
+    private(set) var firstRow: UIView?
 
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        isAccessibilityElement = false
+    init(sections: [[UIAction]], maxWidth: CGFloat) {
+        super.init(frame: .zero)
+        layer.shadowColor = UIColor.black.cgColor
+        layer.shadowOpacity = 0.2
+        layer.shadowRadius = 16
+        layer.shadowOffset = CGSize(width: 0, height: 4)
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        for (index, section) in sections.enumerated() {
+            if index > 0 { stack.addArrangedSubview(Self.line(height: 8, alpha: 0.08)) }
+            for (row, action) in section.enumerated() {
+                if row > 0 { stack.addArrangedSubview(Self.line(height: 0.5, alpha: 0.18)) }
+                let button = SelectionMenuRow(action)
+                button.addAction(UIAction { [weak self] _ in self?.onChoose?(action) }, for: .touchUpInside)
+                stack.addArrangedSubview(button)
+                if firstRow == nil { firstRow = button }
+            }
+        }
+        // Gemessen, solange die Liste noch für sich steht (ohne Bindung an die noch leere Ansicht): so breit wie der
+        // längste Eintrag (mindestens 220, höchstens maxWidth), so hoch wie alle zusammen
+        let natural = stack.systemLayoutSizeFitting(UIView.layoutFittingCompressedSize).width
+        let width = ceil(min(max(natural, 220), maxWidth))
+        let height = stack.systemLayoutSizeFitting(CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
+                                                   withHorizontalFittingPriority: .required,
+                                                   verticalFittingPriority: .fittingSizeLevel).height
+        frame = CGRect(x: 0, y: 0, width: width, height: ceil(height))
+
+        let background = UIVisualEffectView(effect: UIBlurEffect(style: .systemThickMaterial))
+        background.layer.cornerRadius = Self.cornerRadius
+        background.layer.cornerCurve = .continuous
+        background.clipsToBounds = true
+        background.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(background)
+        background.contentView.addSubview(stack)
+        NSLayoutConstraint.activate([
+            background.topAnchor.constraint(equalTo: topAnchor),
+            background.bottomAnchor.constraint(equalTo: bottomAnchor),
+            background.leadingAnchor.constraint(equalTo: leadingAnchor),
+            background.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: background.contentView.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: background.contentView.bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: background.contentView.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: background.contentView.trailingAnchor),
+        ])
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) wird nicht verwendet") }
 
-    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
+    private static let cornerRadius: CGFloat = 14
 
-    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
-                                         willDisplayMenuFor configuration: UIContextMenuConfiguration,
-                                         animator: (any UIContextMenuInteractionAnimating)?) {
-        super.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: animator)
-        shown = true
-        #if DEBUG
-        NSLog("InkCanvasView: Menü mit allen Einträgen geht auf")
-        #endif
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        layer.shadowPath = UIBezierPath(roundedRect: bounds, cornerRadius: Self.cornerRadius).cgPath
     }
 
-    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
-                                         willEndFor configuration: UIContextMenuConfiguration,
-                                         animator: (any UIContextMenuInteractionAnimating)?) {
-        super.contextMenuInteraction(interaction, willEndFor: configuration, animator: animator)
-        guard !ended else { return }
-        ended = true
-        onEnd?()
-        #if DEBUG
-        NSLog("InkCanvasView: Menü mit allen Einträgen geht zu")
-        #endif
-        // Erst nach dem Zugehen weg (und nach dem gewählten Eintrag, den UIKit dabei ausführt)
-        let remove = { [weak self] in DispatchQueue.main.async { self?.removeFromSuperview() } }
-        if let animator { animator.addCompletion(remove) } else { remove() }
+    private static func line(height: CGFloat, alpha: CGFloat) -> UIView {
+        let line = UIView()
+        line.backgroundColor = UIColor.label.withAlphaComponent(alpha)
+        line.heightAnchor.constraint(equalToConstant: height).isActive = true
+        return line
     }
+}
+
+/// Eine Zeile der Liste: Titel vorn, Symbol hinten, wie in UIKits Menüs. Ein Knopf, damit UIKit sie als einen
+/// behandelt (Bedienungshilfen, Antippen)
+private final class SelectionMenuRow: UIButton {
+    init(_ action: UIAction) {
+        super.init(frame: .zero)
+        let enabled = !action.attributes.contains(.disabled)
+        let color: UIColor = !enabled ? .tertiaryLabel : action.attributes.contains(.destructive) ? .systemRed : .label
+        let title = UILabel()
+        title.text = action.title
+        title.font = UIFont.preferredFont(forTextStyle: .body)
+        title.adjustsFontForContentSizeCategory = true
+        title.lineBreakMode = .byTruncatingTail
+        title.textColor = color
+        let icon = UIImageView(image: action.image)
+        icon.tintColor = color
+        icon.contentMode = .scaleAspectFit
+        icon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(textStyle: .body)
+        for view in [title, icon] as [UIView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            view.isUserInteractionEnabled = false
+            addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+            title.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            title.topAnchor.constraint(greaterThanOrEqualTo: topAnchor, constant: 11),
+            title.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -11),
+            title.centerYAnchor.constraint(equalTo: centerYAnchor),
+            icon.leadingAnchor.constraint(greaterThanOrEqualTo: title.trailingAnchor, constant: 16),
+            icon.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 24),
+        ])
+        isEnabled = enabled
+        isAccessibilityElement = true
+        accessibilityLabel = action.title
+        accessibilityTraits = .button
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) wird nicht verwendet") }
+
+    override var isHighlighted: Bool {
+        didSet { backgroundColor = isHighlighted ? UIColor.label.withAlphaComponent(0.12) : .clear }
+    }
+}
+
+/// Bemerkt den Beginn jeder Berührung im Fenster, solange das Menü einer Auswahl offen ist, und schlägt sofort fehl:
+/// hält nichts auf, verzögert nichts, bricht nichts ab (wie der Beobachter von KeepAwake). So schließt eine Berührung
+/// neben der Liste sie und tut trotzdem, was sie sonst täte
+private final class PanelTouchWatcher: UIGestureRecognizer {
+    var onTouchDown: ((Set<UITouch>) -> Void)?
+
+    override init(target: Any?, action: Selector?) {
+        super.init(target: target, action: action)
+        cancelsTouchesInView = false
+        delaysTouchesBegan = false
+        delaysTouchesEnded = false
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        onTouchDown?(touches)
+        state = .failed
+    }
+
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
 }

@@ -221,6 +221,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         if isPad { lassoTracker.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)] }
         canvas.addGestureRecognizer(lassoTracker)
         canvas.selectionMenuItems = { [weak self] context in self?.askMenuItems(context) ?? [] }
+        canvas.selectionArea = { [weak self] in self?.lassoAreaOnCanvas() }
         // Markierungen der Fragen über der Tinte; Antippen öffnet die Antwort
         canvas.addSubview(askOverlay)
         askTap.drawing = canvas.drawingGestureRecognizer
@@ -919,6 +920,9 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     }
 
     private func setDrawing(_ drawing: PKDrawing) {
+        // Eine neue Zeichnung hebt PencilKits Auswahl auf: ihr Menü mit allen Einträgen nicht offen lassen (nur ein
+        // Blick, wenn keins offen ist)
+        canvas.dismissSelectionMenu()
         settingDrawing = true
         canvas.drawing = drawing
         settingDrawing = false
@@ -2323,6 +2327,11 @@ extension CanvasController: UIGestureRecognizerDelegate {
         }
     }
 
+    /// Rechteck des zuletzt gezogenen Lassos auf der Leinwand (nil: keins): Das Menü der Auswahl geht daneben auf
+    private func lassoAreaOnCanvas() -> CGRect? {
+        lassoPath.map { pagesView.convert($0.bounds, to: canvas) }
+    }
+
     /// Ein Weg des Lassos beginnt (auch Antippen): die Zeichnung merken, für ein ∞. Für ein ∞, über das noch nicht
     /// entschieden ist, ist das zugleich der Stand nach seinem Weg
     private func lassoBegan() {
@@ -2787,7 +2796,8 @@ extension CanvasController {
     /// - `debug/pen`: die fünf Stiftbreiten, wie PencilKit sie hier zeichnet (Protokoll „Link-Debug: Stift …“)
     /// - `debug/roll…`: Pencil Pro zweimal hin und her drehen (siehe `debugRoll`, Protokoll „Rolle-Debug: …“)
     /// - `debug/fingerlasso[?ink]`: Lasso auch mit dem Finger, um das Menü einer Auswahl im Simulator zu prüfen
-    ///   (Protokoll „Asks-Debug: fingerlasso …“, das Menü selbst „InkCanvasView: Menü mit allen Einträgen …“)
+    ///   (Protokoll „Asks-Debug: fingerlasso …“ mit der Zahl der Striche, das Menü selbst „InkCanvasView: Menü mit allen
+    ///   Einträgen …“)
     func debugCommand(_ url: URL) {
         let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         func value(_ name: String) -> String? { items.first { $0.name == name }?.value }
@@ -2978,8 +2988,11 @@ extension CanvasController {
         case "/fingerlasso":
             // Lasso auch mit dem Finger (im Simulator ist jede Berührung ein Finger), um das Menü einer Auswahl zu
             // prüfen; vorher debug/tool?mode=lasso&edit. &ink: vorher Probeschrift oben links auf Seite 1. Das Protokoll
-            // nennt, wo sie im Fenster liegt (Punkte), zum Umkreisen
+            // nennt, wo sie im Fenster liegt (Punkte), zum Umkreisen, und wie viele Striche auf der Leinwand sind. Den
+            // Weg des Lassos merkt sich die App dann auch vom Finger (wohin das Menü geht, „Claude fragen“)
             canvas.drawingPolicy = .anyInput
+            lassoTracker.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue),
+                                              NSNumber(value: UITouch.TouchType.pencil.rawValue)]
             var box = CGRect.null
             if has("ink"), k > 0, let frame = layout.frames.first {
                 let strokes = debugProbeStrokes(on: frame)
@@ -2987,7 +3000,8 @@ extension CanvasController {
                 box = strokes.reduce(CGRect.null) { $0.union($1.renderBounds) }
             }
             let zoomed = box.applying(CGAffineTransform(scaleX: canvas.zoomScale, y: canvas.zoomScale))
-            return log("fingerlasso: an, Werkzeug \(canvas.tool is PKLassoTool ? "Lasso" : "kein Lasso"), Probeschrift im Fenster "
+            return log("fingerlasso: an, Werkzeug \(canvas.tool is PKLassoTool ? "Lasso" : "kein Lasso"), "
+                       + "\(canvas.drawing.strokes.count) Striche, Probeschrift im Fenster "
                        + (box.isNull ? "keine" : "\(canvas.convert(zoomed, to: nil))"))
         case "/pen":
             // Wie dick die fünf Stufen hier eingestellt werden: PencilKit begrenzt die Breite je Tinte
