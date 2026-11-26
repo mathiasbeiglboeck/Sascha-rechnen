@@ -127,7 +127,7 @@ enum MenuDebug {
     }
 
     private final class EditDelegate: NSObject, UIEditMenuInteractionDelegate {
-        var menu = UIMenu(children: [])
+        var menu: UIMenu?
 
         func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
                                  suggestedActions: [UIMenuElement]) -> UIMenu? {
@@ -202,7 +202,7 @@ final class ListMenuController: UIViewController, UIPopoverPresentationControlle
     func choose(_ index: Int) {
         guard rows.indices.contains(index), let leaf = rows[index] else { return MenuDebug.log("kein Eintrag \(index)") }
         dismiss(animated: false) {
-            leaf.perform(withSender: nil, target: nil)
+            leaf.performWithSender(nil, target: nil)
         }
     }
 
