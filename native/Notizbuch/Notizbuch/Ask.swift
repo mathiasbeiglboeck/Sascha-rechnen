@@ -12,6 +12,33 @@ struct AskAnchor: Codable, Equatable {
     var rect: CGRect { CGRect(x: x, y: y, width: w, height: h) }
 }
 
+/// Eine Notiz, die Claude bei „Claude schreiben lassen“ ins Dokument schreibt: gedruckter Text (Markdown mit Formeln)
+/// ohne Hintergrund auf einer Seite, dazu wahlweise ein Rahmen um eine Stelle. Lage als Anteil der Seite (0…1, Ursprung
+/// oben links), so bleibt sie richtig, gleich wie hoch die Seite ist. So speichert sie auch der Server
+struct AskNote: Codable, Equatable, Hashable {
+    /// Seite ab 0; −1: Die Seite wurde gelöscht (Rückgängig noch möglich, nicht angezeigt)
+    var page: Int
+    var x: Double
+    var y: Double
+    var w: Double
+    var text: String
+    /// blue (Vorgabe), red, green, black, orange, purple
+    var color: String?
+    /// small, normal (Vorgabe), large
+    var size: String?
+    /// [x1, y1, x2, y2]: Rahmen um eine Stelle (etwa einen Fehler)
+    var box: [Double]?
+    /// Nur auf diesem Gerät: die Seite vor dem Löschen der Seite, für Rückgängig
+    var parked: Int?
+
+    /// Was der Server bekommt (ohne `parked`)
+    var wire: AskNote {
+        var n = self
+        n.parked = nil
+        return n
+    }
+}
+
 /// Eine Frage an Claude, wie der Server sie liefert, dazu, was nur dieses Gerät über sie weiß.
 ///
 /// Ablauf: local (nur hier, noch nicht am Server) → open (wartet auf den Mac) → claimed (der Mac arbeitet daran) →
@@ -34,6 +61,10 @@ struct Ask: Codable, Identifiable, Equatable {
     /// Gerät, auf dem gefragt wurde
     var from: String?
     var v: Int?
+    /// "write": „Claude schreiben lassen“, die Antwort kommt mit Notizen fürs Dokument
+    var mode: String?
+    /// Notizen auf den Seiten (nur bei mode "write", sobald beantwortet)
+    var notes: [AskNote]?
 
     // Nur auf diesem Gerät
     /// Die Antwort wurde hier schon angesehen
@@ -51,6 +82,12 @@ struct Ask: Codable, Identifiable, Equatable {
     var isFailed: Bool { status == "failed" }
     var isWaiting: Bool { !isAnswered && !isFailed }
     var isThorough: Bool { effort == "thorough" }
+    var isWrite: Bool { mode == "write" }
+    /// Die Notizen, die auf den Seiten stehen (nicht mit ihrer Seite gelöscht)
+    var shownNotes: [(index: Int, note: AskNote)] {
+        guard isVisible, isAnswered else { return [] }
+        return (notes ?? []).enumerated().filter { $0.element.page >= 0 }.map { ($0.offset, $0.element) }
+    }
     /// Hier gestellt, nie am Server angekommen, und das bleibt so (abgelehnt, Bilder fehlen): Verschieben und Löschen
     /// gehen nur hier
     var failedHere: Bool { v == nil && status != "local" }
@@ -212,6 +249,19 @@ final class AskStore: ObservableObject {
         refresh(doc)
     }
 
+    /// Eine Notiz von „Claude schreiben lassen“ entfernen, auf allen Geräten (die Antwort bleibt)
+    func deleteNote(_ doc: UUID, _ id: String, note: AskNote) {
+        edit(doc) { list in
+            guard let i = list.firstIndex(where: { $0.id == id }), var notes = list[i].notes,
+                  let index = notes.firstIndex(where: { $0.wire == note.wire })
+            else { return }
+            notes.remove(at: index)
+            list[i].notes = notes
+            if list[i].v != nil { list[i].moved = true }
+        }
+        refresh(doc)
+    }
+
     func markSeen(_ doc: UUID, _ id: String) {
         edit(doc) { list in
             guard let i = list.firstIndex(where: { $0.id == id }), list[i].isAnswered, list[i].seen != true else { return }
@@ -227,12 +277,27 @@ final class AskStore: ObservableObject {
         var hidden: [String] = []
         edit(doc) { list in
             for i in list.indices where list[i].deleting != true && list[i].hidden != true && list[i].anchor.page >= 0 {
+                // Notizen rücken mit ihrer Seite; die auf gelöschten Seiten warten mit Seite −1 auf Rückgängig
+                if var notes = list[i].notes, !notes.isEmpty {
+                    var parked = false
+                    for n in notes.indices where notes[n].page >= 0 {
+                        if let j = mapping(notes[n].page) {
+                            notes[n].page = max(j, 0)
+                        } else {
+                            notes[n].parked = notes[n].page
+                            notes[n].page = -1
+                            parked = true
+                        }
+                    }
+                    list[i].notes = notes
+                    if parked { hidden.append(list[i].id) }
+                }
                 list[i].pv = pv
                 guard let j = mapping(list[i].anchor.page) else {
                     list[i].hidden = true
                     // Noch nicht am Server: Sie geht erst hinauf, wenn Rückgängig sie zurückbringt
                     list[i].moved = list[i].v == nil ? nil : true
-                    hidden.append(list[i].id)
+                    if hidden.last != list[i].id { hidden.append(list[i].id) }
                     continue
                 }
                 list[i].anchor.page = max(j, 0)
@@ -248,7 +313,20 @@ final class AskStore: ObservableObject {
     func unhide(_ doc: UUID, _ ids: [String], pv: Int) {
         guard !ids.isEmpty else { return }
         edit(doc) { list in
-            for i in list.indices where ids.contains(list[i].id) && list[i].hidden == true {
+            for i in list.indices where ids.contains(list[i].id) {
+                // Notizen auf den gelöschten Seiten kommen an ihre alte Seite zurück
+                if let notes = list[i].notes, notes.contains(where: { $0.parked != nil }) {
+                    list[i].notes = notes.map { n in
+                        guard let old = n.parked, n.page < 0 else { return n }
+                        var m = n
+                        m.page = old
+                        m.parked = nil
+                        return m
+                    }
+                    list[i].pv = pv
+                    if list[i].v != nil { list[i].moved = true }
+                }
+                guard list[i].hidden == true else { continue }
                 list[i].hidden = nil
                 list[i].pv = pv
                 list[i].moved = list[i].failedHere ? nil : true
@@ -261,7 +339,13 @@ final class AskStore: ObservableObject {
     func dropHidden(_ doc: UUID, _ ids: [String]) {
         guard !ids.isEmpty else { return }
         edit(doc) { list in
-            for i in list.indices where ids.contains(list[i].id) && list[i].hidden == true {
+            for i in list.indices where ids.contains(list[i].id) {
+                // Notizen auf gelöschten Seiten gehen mit ihnen
+                if let notes = list[i].notes, notes.contains(where: { $0.parked != nil || $0.page < 0 }) {
+                    list[i].notes = notes.filter { $0.page >= 0 }
+                    if list[i].v != nil, list[i].deleting != true { list[i].moved = true }
+                }
+                guard list[i].hidden == true else { continue }
                 list[i].hidden = nil
                 list[i].deleting = true
             }
@@ -511,11 +595,16 @@ final class AskStore: ObservableObject {
                 if a.hidden == true { anchor.page = -1 }
                 return (a.id, anchor)
             }, uniquingKeysWith: { a, _ in a })
-            let list = try await sync.moveAsks(doc, pv: pv, anchors: anchors)
+            // Notizen der Fragen von „Claude schreiben lassen“ an ihren Stellen (gelöschte Seite: −1)
+            let notes = Dictionary(group.compactMap { a -> (String, [AskNote])? in
+                guard a.isWrite, let n = a.notes else { return nil }
+                return (a.id, n.map(\.wire))
+            }, uniquingKeysWith: { a, _ in a })
+            let list = try await sync.moveAsks(doc, pv: pv, anchors: anchors, notes: notes)
             edit(doc) { l in
                 for a in group {
                     guard let i = l.firstIndex(where: { $0.id == a.id }), l[i].anchor == a.anchor, l[i].pv == a.pv,
-                          l[i].hidden == a.hidden
+                          l[i].hidden == a.hidden, l[i].notes == a.notes
                     else { continue }
                     l[i].moved = nil
                 }
@@ -578,6 +667,15 @@ final class AskStore: ObservableObject {
                 }
                 // Gelesen bleibt gelesen, solange die Antwort dieselbe ist
                 if r.isAnswered, l.isAnswered, l.answer == r.answer { r.seen = l.seen }
+                // Notizen auf gelöschten Seiten: Ihre alte Seite (für Rückgängig) kennt nur dieses Gerät
+                if let local = l.notes, local.contains(where: { $0.parked != nil }), var notes = r.notes {
+                    var parked = local.filter { $0.parked != nil }
+                    for i in notes.indices where notes[i].page < 0 {
+                        guard let j = parked.firstIndex(where: { $0.wire == notes[i].wire }) else { continue }
+                        notes[i].parked = parked.remove(at: j).parked
+                    }
+                    r.notes = notes
+                }
                 // Hier noch nicht hochgeladen, am Server aber schon (die Antwort aufs Hochladen ging verloren): Die
                 // Bilder braucht es nicht mehr
                 if l.status == "local" { forgetImages(doc, l.id) }
@@ -585,6 +683,8 @@ final class AskStore: ObservableObject {
                     r.anchor = l.anchor
                     r.pv = l.pv
                     r.hidden = l.hidden
+                    // Notizen hier verschoben oder entfernt: bleiben, bis der Server sie hat
+                    if l.isWrite, l.notes != nil { r.notes = l.notes }
                     // Wurde sie hier verschoben oder ihre Seite gelöscht, bevor sie oben war, geht die Stelle gleich
                     // hinauf (gelöschte Seite: −1)
                     r.moved = l.status == "local" ? true : l.moved

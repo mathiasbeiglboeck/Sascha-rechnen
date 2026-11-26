@@ -418,7 +418,8 @@ async function answer(ask) {
   } else {
     const title = job.doc.title || "Dokument";
     const where = job.anchor.page >= 0 ? `Seite ${job.anchor.page + 1}` : "Seite gelöscht";
-    log(ask.id, `übernommen: „${title}“, ${where}, ${ask.effort === "thorough" ? "gründlich" : "schnell"}`);
+    log(ask.id, `übernommen: „${title}“, ${where}, ${ask.effort === "thorough" ? "gründlich" : "schnell"}` +
+      (job.mode === "write" ? ", schreibt ins Dokument" : ""));
   }
   const t0 = Date.now();
   // Frist verlängern, solange Claude arbeitet
@@ -460,8 +461,12 @@ async function answer(ask) {
     if (current.cancelled) return;
     if (result.ok) {
       localPause = 0;
-      await reply(ask.id, { claim: job.claim, markdown: result.text });
+      // „Claude schreiben lassen“: die Notizen fürs Dokument aus der Antwort lösen
+      const write = !lern && !vok && job.mode === "write" ? splitNotes(result.text, job) : null;
+      await reply(ask.id, write ? { claim: job.claim, markdown: write.markdown, notes: write.notes }
+        : { claim: job.claim, markdown: result.text });
       log(ask.id, `beantwortet nach ${Math.round((Date.now() - t0) / 1000)} s (${result.text.length} Zeichen)` +
+        (write ? `, ${write.notes.length} Notizen ins Dokument${write.problem ? ` (${write.problem})` : ""}` : "") +
         (result.denied?.length ? `, abgelehnt: ${result.denied.join(", ")}` : ""));
     } else if (result.auth || result.setup) {
       // Abgemeldet oder nicht installiert: Ein neuer Versuch hilft erst danach. Pause, bis es wieder geht (höchstens
@@ -960,12 +965,112 @@ function prompt(job, files, fresh) {
       ? ": Seine Seitennummern können von denen hier abweichen. Es gelten die Seitennummern in dieser Nachricht." : "."));
   }
   lines.push("");
+  if (job.mode === "write") {
+    lines.push(WRITE_PROMPT(count));
+    lines.push("");
+    lines.push(job.effort === "thorough"
+      ? "Arbeite gründlich: prüf sorgfältig, rechne nach und lies dafür die Seiten, die der Auftrag braucht."
+      : "Arbeite zügig: das Wesentliche, knapp formuliert.");
+    return lines.join("\n");
+  }
   lines.push(
     job.effort === "thorough"
       ? "Antworte gründlich: mit Begründung oder Beweisskizze und, wo es hilft, einem Beispiel."
       : "Antworte knapp: das Wesentliche in wenigen Sätzen.",
   );
   return lines.join("\n");
+}
+
+// ---------- Claude schreibt ins Dokument ----------
+
+/// Auftrag bei „Claude schreiben lassen“ (in der Nachricht zur Frage, nicht im Systemprompt: der bleibt für den Chat
+/// gleich). `count`: Seiten des Dokuments, wenn bekannt
+const WRITE_PROMPT = (count) => `Diesmal schreibst du ins Dokument: Mathias hat „Claude schreiben lassen“ gewählt. Die \
+markierte Schrift ist ein Auftrag an dich (etwa „rechne das fertig“ oder „finde Fehler im Dokument und markiere sie am \
+Rand“). Was du schreibst, setzt die App gedruckt und ohne Hintergrund an die Stellen der Seiten, die du angibst.
+
+Antworte so:
+1. Zuerst ein bis drei Sätze für die Sprechblase neben dem Auftrag: was du wohin geschrieben hast (oder warum nichts).
+2. Danach genau ein Block \`\`\`notizen mit einem JSON-Array, ein Objekt je Notiz:
+   {"seite": Nummer wie in dieser Nachricht (ab 1), "x": linker Rand, "y": oberer Rand, "breite": Breite,
+    "text": Markdown mit Formeln ($…$, $$…$$), "farbe": "blau" (Vorgabe), "rot", "grün", "schwarz", "orange" oder "lila",
+    "größe": "klein", "normal" (Vorgabe) oder "groß", "kasten": [x1, y1, x2, y2] (wahlweise: umrandet eine Stelle)}
+   x, y, breite und kasten in Prozent der Seite (0 links bzw. oben, 100 rechts bzw. unten), so wie die ganze Seite im \
+Bild der Seite, in den Seiten zum Nachlesen und im PDF zu sehen ist.
+
+Wohin:
+- Nur in freie Flächen, nie über vorhandene Schrift, Tinte oder Abbildungen. Lass etwas Abstand.
+- Größe „normal“ ist etwa 10 pt: Eine Zeile braucht auf einer A4-Seite hochkant etwa 1,7 % der Seitenhöhe, „klein“ \
+etwa 1,3 %, „groß“ 2,1 %; bei breite 80 passen in „normal“ etwa 90 Zeichen in eine Zeile. Plane die Höhe deines Texts \
+so, dass er in die freie Fläche passt.
+- Randnotizen (etwa zu Fehlern): „klein“, schmal (breite 10 bis 18) in den Rand auf Höhe der Stelle, in „rot“; dazu ein \
+kasten um die Stelle selbst, großzügig. Kurz: was falsch ist und, wenn es passt, wie es richtig heißt.
+- Lösungen und Fortsetzungen: in die freie Fläche unter dem Auftrag; reicht sie nicht, auf der nächsten Seite weiter \
+(eine leere Seite danach ist recht${count ? `; das Dokument hat ${seiten(count)}, darüber hinaus gibt es keine` : ""}).
+- Im Text keine Überschrift wie „Antwort“ und keine Einleitung, nur was auf die Seite gehört. Schreib nur, worum der \
+Auftrag bittet. Findest du nichts (etwa keine Fehler), sag es in den Sätzen für die Sprechblase und gib [] an.`;
+
+const NOTE_COLORS = { blau: "blue", rot: "red", grün: "green", gruen: "green", schwarz: "black", orange: "orange",
+  lila: "purple", blue: "blue", red: "red", green: "green", black: "black", purple: "purple" };
+const NOTE_SIZES = { klein: "small", normal: "normal", groß: "large", gross: "large", small: "small", large: "large" };
+
+/// Trennt die Antwort bei „Claude schreiben lassen“: der Text für die Sprechblase und die Notizen aus dem letzten
+/// Block ```notizen (oder ```json), umgerechnet für den Server: Seite ab 0, Lage als Anteil (0…1). Notizen
+/// außerhalb des Dokuments fallen weg. `problem`: was nicht ging (fürs Protokoll; die Sprechblase sagt es auch)
+function splitNotes(text, job) {
+  const blocks = [...text.matchAll(/```(?:notizen|json)[^\n]*\n([\s\S]*?)```/g)];
+  const block = blocks.at(-1);
+  let markdown = block ? (text.slice(0, block.index) + text.slice(block.index + block[0].length)).trim() : text.trim();
+  let raw = null, problem = null;
+  if (!block) {
+    problem = "kein Block mit Notizen";
+  } else {
+    try {
+      raw = JSON.parse(block[1]);
+      if (raw && !Array.isArray(raw) && Array.isArray(raw.notizen)) raw = raw.notizen;
+      if (!Array.isArray(raw)) throw new Error("kein Array");
+    } catch (e) {
+      problem = `Notizen nicht lesbar: ${e.message}`;
+      raw = null;
+    }
+  }
+  const pageCount = Number(job?.doc?.pageCount) || 0;
+  const num = (v) => (typeof v === "number" ? v : typeof v === "string" ? Number(v.replace(",", ".").replace("%", "")) : NaN);
+  const frac = (v) => { const n = num(v); return Number.isFinite(n) ? Math.min(Math.max(n / 100, -0.2), 1.2) : NaN; };
+  const notes = [];
+  let outside = 0;
+  for (const n of raw || []) {
+    if (!n || typeof n !== "object") continue;
+    const page = Math.round(num(n.seite ?? n.page)) - 1;
+    const x = frac(n.x), y = frac(n.y), w = frac(n.breite ?? n.width ?? n.w);
+    const t = n.text ?? n.markdown;
+    const text = typeof t === "string" ? t.trim() : "";
+    const k = Array.isArray(n.kasten ?? n.box) ? (n.kasten ?? n.box).map(frac) : null;
+    const box = k && k.length === 4 && k.every(Number.isFinite)
+      ? [Math.min(k[0], k[2]), Math.min(k[1], k[3]), Math.max(k[0], k[2]), Math.max(k[1], k[3])] : null;
+    if (!Number.isInteger(page) || page < 0 || !Number.isFinite(x) || !Number.isFinite(y) || (!text && !box)) continue;
+    // Ein Notizbuch hat unten meist eine leere Seite mehr, als der Server kennt (sie entsteht beim Schreiben)
+    if (pageCount && page > pageCount - (job.doc.kind === "pdf" ? 1 : 0)) {
+      outside++;
+      continue;
+    }
+    const note = { page, x, y, w: Number.isFinite(w) && w >= 0.01 ? Math.min(w, 1.2) : Math.max(0.05, Math.min(0.9, 0.95 - x)), text };
+    const color = NOTE_COLORS[String(n.farbe ?? n.color ?? "").toLowerCase()];
+    note.color = color || "blue";
+    const size = NOTE_SIZES[String(n.größe ?? n.groesse ?? n.size ?? "").toLowerCase()];
+    if (size && size !== "normal") note.size = size;
+    if (box) note.box = box;
+    notes.push(note);
+  }
+  if (outside) problem = `${outside} außerhalb des Dokuments weggelassen` + (problem ? `; ${problem}` : "");
+  if (!markdown) {
+    markdown = notes.length ? `${notes.length === 1 ? "Eine Notiz" : `${notes.length} Notizen`} ins Dokument geschrieben.`
+      : "Nichts ins Dokument geschrieben.";
+  }
+  if (!notes.length && raw === null) {
+    markdown += "\n\n*(Ins Dokument kam nichts: Die Antwort enthielt keine lesbaren Notizen.)*";
+  }
+  return { markdown, notes, problem };
 }
 
 /// Ungefähr, wie viel diese Frage dem Chat an Dateien hinzufügt (Bytes): ihre Bilder und PDF-Auszüge. Ein kleines PDF

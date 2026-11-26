@@ -80,6 +80,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private var infinityNext: [Int: (drawing: PKDrawing, k: CGFloat)] = [:]
     /// Die Markierungen der Fragen an Claude, über der Tinte
     private let askOverlay = AskOverlay()
+    /// Was Claude bei „Claude schreiben lassen“ ins Dokument geschrieben hat: über den Seiten, unter der Tinte
+    private let notesOverlay = NotesOverlay()
     private let askTap = MarkTapGesture()
     private var askWatch: AnyCancellable?
     private weak var answerCard: AnswerCardController?
@@ -187,6 +189,9 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         pagesView.isUserInteractionEnabled = false
         pagesView.layer.anchorPoint = .zero
         canvas.insertSubview(pagesView, at: 0)
+        // Notizen von Claude: gleich über den Seiten, unter der Tinte, wie die Seiten mitskaliert
+        notesOverlay.layer.anchorPoint = .zero
+        canvas.insertSubview(notesOverlay, aboveSubview: pagesView)
 
         // Eigener Radierer: kleiner Kreis, löscht jeden Strich, den der Kreis berührt
         eraserGesture.addTarget(self, action: #selector(handleErase(_:)))
@@ -1019,7 +1024,9 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         let before = pausedPencilKitHover.count
         // Bei jedem Aufruf nachsehen: PencilKit könnte eine Geste neu anlegen oder wieder einschalten
         let onCanvas = (canvas.gestureRecognizers ?? []).filter { $0 !== appHover && Self.watchesPencil($0) }
-        let pencilKitViews = canvas.subviews.filter { $0 !== pagesView && $0 !== pointerOverlay && $0 !== askOverlay }
+        let pencilKitViews = canvas.subviews.filter {
+            $0 !== pagesView && $0 !== pointerOverlay && $0 !== askOverlay && $0 !== notesOverlay
+        }
         for g in onCanvas + pencilKitViews.flatMap({ Self.pencilWatchers(in: $0) })
         where g.isEnabled && !pausedPencilKitHover.contains(where: { $0 === g }) {
             g.isEnabled = false
@@ -1330,6 +1337,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     private func updatePixelScale() {
         for case let page as PageView in pagesView.subviews { page.pixelScale = k }
+        notesOverlay.pixelScale = k
     }
 
     private func updateContentSize() {
@@ -1342,6 +1350,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         pointerOverlay.bounds = pagesView.bounds
         pointerOverlay.layer.position = .zero
         pointerOverlay.transform = CGAffineTransform(scaleX: s, y: s)
+        notesOverlay.transform = .identity
+        notesOverlay.bounds = pagesView.bounds
+        notesOverlay.layer.position = .zero
+        notesOverlay.transform = CGAffineTransform(scaleX: s, y: s)
         askOverlay.layout(scale: s)
         canvas.contentSize = CGSize(width: PageLayout.width * s, height: layout.totalHeight * s)
     }
@@ -1382,6 +1394,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         let s = k * scrollView.zoomScale
         pagesView.transform = CGAffineTransform(scaleX: s, y: s)
         pointerOverlay.transform = CGAffineTransform(scaleX: s, y: s)
+        notesOverlay.transform = CGAffineTransform(scaleX: s, y: s)
         askOverlay.layout(scale: s)
     }
 
@@ -1441,7 +1454,12 @@ extension CanvasController {
 
     private var exporter: PageExport {
         PageExport(frames: layout.frames, pdf: pdf,
-                   ink: canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k)))
+                   ink: canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k)), notes: exportNotes)
+    }
+
+    /// Notizen von Claude für Export, Briefkasten, Übersicht und die Seiten, die Claude zu einer Frage bekommt
+    var exportNotes: [Int: [PageExport.Note]] {
+        NotesOverlay.forExport(sync.asks.asks(doc.id), frames: layout.frames)
     }
 
     /// Aktueller Name (inzwischen vielleicht umbenannt, auch auf einem anderen Gerät)
@@ -1633,9 +1651,12 @@ struct OverviewSource: @unchecked Sendable {
     /// Zeichnung der Leinwand und wie sie in Seitenpunkte umzurechnen ist
     let ink: PKDrawing
     let toPage: CGAffineTransform
+    var notes: [Int: [PageExport.Note]] = [:]
 
     func build() -> PageExport {
-        PageExport(frames: frames, pdf: pdf, ink: ink.transformed(using: toPage)).indexed()
+        var export = PageExport(frames: frames, pdf: pdf, ink: ink.transformed(using: toPage)).indexed()
+        export.notes = notes
+        return export
     }
 }
 
@@ -1645,7 +1666,8 @@ extension CanvasController {
         applyPending()
         saveNow()
         return OverviewSource(frames: layout.frames, pdf: pdf, ink: canvas.drawing,
-                              toPage: CGAffineTransform(scaleX: 1 / max(k, 0.0001), y: 1 / max(k, 0.0001)))
+                              toPage: CGAffineTransform(scaleX: 1 / max(k, 0.0001), y: 1 / max(k, 0.0001)),
+                              notes: exportNotes)
     }
 
     var canUndoPageChange: Bool { pageUndo != nil }
@@ -2286,12 +2308,15 @@ extension CanvasController: UIGestureRecognizerDelegate {
     /// Seitenstand dieses Dokuments jetzt (ms; 0 = nie Seiten geändert)
     private var currentPagesVersion: Int { store.documents.first { $0.id == doc.id }?.pagesVersion ?? 0 }
 
-    /// „Claude fragen“ und „Claude gründlich fragen“ vorn im Menü einer Lasso-Auswahl
+    /// „Claude fragen“ und „Claude gründlich fragen“ vorn im Menü einer Lasso-Auswahl, dazu „Claude schreiben lassen“
+    /// (schnell und gründlich): Die markierte Schrift ist dann ein Auftrag, Claude schreibt ins Dokument
     private func askMenuItems(_ context: SelectionMenuContext) -> [UIMenuElement] {
-        [("quick", "Claude fragen", "questionmark.bubble"),
-         ("thorough", "Claude gründlich fragen", "text.bubble")].map { effort, title, symbol in
+        [("quick", nil, "Claude fragen", "questionmark.bubble"),
+         ("thorough", nil, "Claude gründlich fragen", "text.bubble"),
+         ("quick", "write", "Claude schreiben lassen", "pencil.line"),
+         ("thorough", "write", "Claude gründlich schreiben lassen", "square.and.pencil")].map { effort, mode, title, symbol in
             UIAction(title: title, image: UIImage(systemName: symbol)) { [weak self] _ in
-                self?.askClaude(effort: effort, from: context)
+                self?.askClaude(effort: effort, mode: mode, from: context)
             }
         }
     }
@@ -2352,7 +2377,7 @@ extension CanvasController: UIGestureRecognizerDelegate {
     /// Die markierte Frage an Claude: Striche im Lasso, ihre Stelle, zwei Bilder (nur die Frage; die ganze Seite mit
     /// der Frage hervorgehoben). Die Markierung erscheint, sobald die Bilder fertig sind; hochgeladen wird gleich
     /// danach (ohne Netz später)
-    private func askClaude(effort: String, from menu: SelectionMenuContext) {
+    private func askClaude(effort: String, mode: String? = nil, from menu: SelectionMenuContext) {
         guard k > 0, !viewOnly else { return }
         guard sync.isConfigured else {
             onFlashTimed("Erst den Server einrichten (Zahnrad in der Übersicht)", 2.5)
@@ -2403,12 +2428,12 @@ extension CanvasController: UIGestureRecognizerDelegate {
         let spanArea = layout.frames[span.lowerBound].union(layout.frames[span.upperBound]).applying(toCanvas)
         let export = PageExport(frames: layout.frames, pdf: pdf,
                                 ink: PKDrawing(strokes: strokes.filter { $0.renderBounds.intersects(spanArea) })
-                                    .transformed(using: toPage))
+                                    .transformed(using: toPage), notes: exportNotes)
         let ask = Ask(id: UUID().uuidString, status: "local",
                       anchor: AskAnchor(page: page, x: Double(local.minX), y: Double(local.minY),
                                         w: Double(local.width), h: Double(local.height)),
                       pv: currentPagesVersion, effort: effort, created: Date().timeIntervalSince1970,
-                      from: isPad ? "iPad" : "iPhone")
+                      from: isPad ? "iPad" : "iPhone", mode: mode)
         lassoPath = nil
         // Auswahl aufheben, sobald das Menü weg ist
         DispatchQueue.main.async { [weak self] in self?.endLassoSelection() }
@@ -2432,7 +2457,8 @@ extension CanvasController: UIGestureRecognizerDelegate {
                 }
                 // Die Markierung gleich; hinauf geht die Frage, sobald die Seiten um sie fertig sind
                 asks.add(id, ask, preparing: true)
-                flash(effort == "thorough" ? "Frage an Claude geschickt (gründlich)" : "Frage an Claude geschickt", 2)
+                let what = mode == "write" ? "Auftrag" : "Frage"
+                flash(effort == "thorough" ? "\(what) an Claude geschickt (gründlich)" : "\(what) an Claude geschickt", 2)
             } catch {
                 flash("Frage konnte nicht vorbereitet werden: \(error.localizedDescription)", 3)
                 return
@@ -2566,7 +2592,7 @@ extension CanvasController: UIGestureRecognizerDelegate {
         let spanArea = layout.frames[span.lowerBound].union(layout.frames[span.upperBound]).applying(toCanvas)
         let export = PageExport(frames: layout.frames, pdf: pdf,
                                 ink: PKDrawing(strokes: strokes.filter { $0.renderBounds.intersects(spanArea) })
-                                    .transformed(using: toPage))
+                                    .transformed(using: toPage), notes: exportNotes)
         let ask = Ask(id: UUID().uuidString, status: "local",
                       anchor: AskAnchor(page: page, x: Double(spot.minX), y: Double(spot.minY),
                                         w: Double(spot.width), h: Double(spot.height)),
@@ -2618,6 +2644,8 @@ extension CanvasController: UIGestureRecognizerDelegate {
         askOverlay.set(list, frames: layout.frames, pagesVersion: currentPagesVersion)
         askOverlay.layout(scale: k * canvas.zoomScale)
         if canvas.subviews.last !== askOverlay { canvas.bringSubviewToFront(askOverlay) }
+        // Notizen von Claude; was noch gesetzt werden muss, kommt danach
+        notesOverlay.set(list, frames: layout.frames) { [weak self] in self?.reloadAskMarks() }
         // Neue Antwort, während das Dokument offen ist. Gesammelt, nicht ersetzt: Eine Markierung, die mit ihrer Seite
         // kurz verschwand (Seite gelöscht, dann Rückgängig), meldet sich danach nicht als neue Antwort
         let answered = Set(list.filter { $0.isAnswered && $0.isVisible }.map(\.id))
@@ -2647,33 +2675,58 @@ extension CanvasController: UIGestureRecognizerDelegate {
         // bleibt dann schmal, damit ein Punkt gleich daneben Tinte wird. Sonst (Finger am iPad, nur Lesen) ist er
         // breiter, zum leichteren Treffen
         let canDraw = !viewOnly && (touch.type == .pencil || !isPad)
+        // Eine Notiz von Claude öffnet ihre Karte nur mit einer Berührung, die nicht schreibt (Finger am iPad): Mit
+        // dem Pencil schreibt man auf sie wie auf die Seite
+        if !canDraw, askOverlay.mark(at: touch.location(in: canvas), padding: 10) == nil,
+           notesOverlay.hit(touch.location(in: notesOverlay)) != nil {
+            if askTap.state == .possible { askTap.touchCanDraw = false }
+            return true
+        }
         guard askOverlay.mark(at: touch.location(in: canvas), padding: canDraw ? 2 : 10) != nil else { return false }
         if askTap.state == .possible { askTap.touchCanDraw = canDraw }
         return true
     }
 
     @objc private func handleAskTap(_ g: MarkTapGesture) {
-        guard g.state == .ended, let id = askOverlay.mark(at: g.location(in: canvas), padding: 10) else { return }
-        showAnswer(id)
+        guard g.state == .ended else { return }
+        if let id = askOverlay.mark(at: g.location(in: canvas), padding: 10) {
+            showAnswer(id)
+        } else if let note = notesOverlay.hit(g.location(in: notesOverlay)) {
+            showAnswer(note.ask, note: note)
+        }
     }
 
     /// Karte mit der Antwort: am iPad neben der Markierung, am iPhone von unten (halb hoch, die Seite bleibt
     /// bedienbar; eine andere Markierung tauscht nur den Inhalt)
-    private func showAnswer(_ id: String) {
-        guard let mark = askOverlay.view(for: id) else { return }
+    private func showAnswer(_ id: String, note: NotesOverlay.Placed? = nil) {
+        // Angetippt an einer Notiz: Die Karte zeigt auf die Notiz, sonst auf die Markierung
+        let source: (view: UIView, rect: CGRect)
+        if let note {
+            source = (notesOverlay, note.place.text ?? note.place.bounds)
+        } else {
+            guard let mark = askOverlay.view(for: id) else { return }
+            source = (mark, mark.bounds)
+        }
         if let card = answerCard {
             card.model.askID = id
+            card.model.note = note?.note
             askOverlay.highlight(id)
             // Am iPad wandert die Karte zur neuen Markierung
             if let pop = card.popoverPresentationController {
-                pop.sourceView = mark
-                pop.sourceRect = mark.bounds
+                pop.sourceView = source.view
+                pop.sourceRect = source.rect
                 pop.containerView?.setNeedsLayout()
             }
             return
         }
         guard presentedViewController == nil else { return }
         let model = AnswerCardModel(doc: doc.id, askID: id, asks: sync.asks)
+        model.note = note?.note
+        model.onDeleteNote = { [weak self, weak model] askID, note in
+            guard let self else { return }
+            self.sync.asks.deleteNote(self.doc.id, askID, note: note)
+            model?.note = nil
+        }
         let card = AnswerCardController(model: model)
         model.onDelete = { [weak self, weak card] askID in
             guard let self else { return }
@@ -2685,8 +2738,8 @@ extension CanvasController: UIGestureRecognizerDelegate {
         card.preferredContentSize = CGSize(width: min(480, view.bounds.width - 40),
                                            height: min(520, view.bounds.height * 0.7))
         if let pop = card.popoverPresentationController {
-            pop.sourceView = mark
-            pop.sourceRect = mark.bounds
+            pop.sourceView = source.view
+            pop.sourceRect = source.rect
             pop.permittedArrowDirections = .any
             let sheet = pop.adaptiveSheetPresentationController
             sheet.detents = [.medium(), .large()]
@@ -2704,7 +2757,8 @@ extension CanvasController: UIGestureRecognizerDelegate {
 
 extension CanvasController {
     /// Befehle über Links, etwa `xcrun simctl openurl booted "notizbuch://debug/ask?page=1"`:
-    /// - `debug/ask?page=N&effort=quick|thorough`: Frage zu Seite N wie mit dem Lasso (steht dort nichts, erst Probeschrift)
+    /// - `debug/ask?page=N&effort=quick|thorough[&mode=write]`: Frage zu Seite N wie mit dem Lasso (steht dort nichts, erst
+    ///   Probeschrift); mit mode=write wie „Claude schreiben lassen“
     /// - `debug/infinity?page=N&x=X&y=Y&w=W&rot=R`: ∞ mit dem Lasso auf Seite N (ab 0 wie bei ask), Mitte X, Y und
     ///   Breite W in Seitenpunkten (Vorgabe 200, 200, 80), um R Grad geneigt; Protokoll „Lasso-∞: …“
     /// - `debug/card?ask=<id>|first|last`: Karte der Frage zeigen
@@ -2952,7 +3006,8 @@ extension CanvasController {
             let corners = [CGPoint(x: box.minX, y: box.minY), CGPoint(x: box.maxX, y: box.minY),
                            CGPoint(x: box.maxX, y: box.maxY), CGPoint(x: box.minX, y: box.maxY)]
             lassoPath = LassoPath(points: corners, bounds: box, inkPrint: inkPrint(near: box))
-            askClaude(effort: value("effort") ?? "quick", from: SelectionMenuContext(space: nil, sourcePoint: .zero))
+            askClaude(effort: value("effort") ?? "quick", mode: value("mode"),
+                      from: SelectionMenuContext(space: nil, sourcePoint: .zero))
             log("ask: Seite \(n), \(onPage.count) Striche")
         case "/infinity":
             guard k > 0, let n = value("page").flatMap({ Int($0) }), layout.frames.indices.contains(n) else {

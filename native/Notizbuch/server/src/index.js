@@ -35,6 +35,12 @@ const MAX_ANSWER_CHARS = 200000;
 // Markdown im Eingang (die App setzt es auf A4-Seiten): höchstens so groß
 const MAX_MARKDOWN_BYTES = 512 * 1024;
 const EFFORTS = ["quick", "thorough"];
+// „Claude schreiben lassen“: Claude antwortet mit Notizen, die die App gedruckt auf die Seiten setzt (siehe cleanNotes)
+const MODES = ["write"];
+const MAX_NOTES = 100;
+const MAX_NOTE_CHARS = 8000;
+const NOTE_COLORS = ["blue", "red", "green", "black", "orange", "purple"];
+const NOTE_SIZES = ["small", "normal", "large"];
 // Lernwörter: Das geschriebene Wort geht als Frage an den Helfer, im Pseudo-Dokument LERN_DOC (kein echtes Dokument,
 // deren Kennungen sind UUIDs) und nur dort mit dieser Art
 const LERN_DOC = "lernwoerter";
@@ -796,13 +802,27 @@ export class Store extends DurableObject {
   }
 
   /// Nach dem Löschen oder Einfügen von Seiten: body {pv, anchors: {askId: anchor | null}}, null heißt, die Seite der
-  /// Frage ist weg (die Frage mit). Wie bei pagesVersion nie zurück zu einer älteren Seitenordnung
+  /// Frage ist weg (die Frage mit). Wie bei pagesVersion nie zurück zu einer älteren Seitenordnung. Dazu, für Fragen von
+  /// „Claude schreiben lassen“, notes: {askId: [Notiz]} (siehe cleanNotes, Seite −1 erlaubt): die Notizen an ihren neuen
+  /// Stellen, auch ohne Seitenänderung (eine Notiz gelöscht). Sie ersetzen die bisherigen
   moveAsks(doc, body) {
     const pv = Math.max(0, Math.trunc(Number(body?.pv) || 0));
     const entries = body?.anchors && typeof body.anchors === "object" ? Object.entries(body.anchors) : [];
+    const noteEntries = body?.notes && typeof body.notes === "object" ? Object.entries(body.notes) : [];
     const gone = [];
     let v = 0;
     this.ctx.storage.transactionSync(() => {
+      for (const [askId, list] of noteEntries) {
+        const row = this.sql.exec("SELECT id, pv, info FROM asks WHERE id = ? AND doc = ?", askId, doc).toArray()[0];
+        const notes = cleanNotes(list, true);
+        if (!row || row.pv > pv || !notes) continue;
+        const info = JSON.parse(row.info || "{}");
+        if (info.mode !== "write") continue;
+        info.notes = notes;
+        v = v || this.nextAsksV();
+        this.sql.exec("UPDATE asks SET info = ?, updated = ?, v = ? WHERE id = ?",
+          JSON.stringify(info), Date.now() / 1000, v, askId);
+      }
       for (const [askId, a] of entries) {
         const row = this.sql.exec("SELECT id, status, pv FROM asks WHERE id = ? AND doc = ?", askId, doc).toArray()[0];
         // Seite −1: Die Seite der Frage wurde gelöscht, Rückgängig ist noch möglich (die Apps zeigen sie nicht)
@@ -886,7 +906,7 @@ export class Store extends DurableObject {
     const info = JSON.parse(row.info || "{}"), anchor = JSON.parse(row.anchor);
     return json({
       id: askId, claim, leaseUntil: now + lease, anchor, pv: row.pv, effort: row.effort,
-      created: row.created, from: info.from || null,
+      created: row.created, from: info.from || null, mode: info.mode || null,
       // Seit wie vielen Sekunden die Frage am Server liegt (ältere Fragen: seit dem Fragen auf dem Gerät)
       age: Math.max(0, now - (Number(info.arrived) || Number(row.created) || now)),
       ...(row.doc === KARTEN_DOC ? { karten: { hinweis: info.hinweis || null } } : {}),
@@ -953,7 +973,9 @@ export class Store extends DurableObject {
     }
     if (typeof body.markdown === "string" && body.markdown.trim()) {
       if (body.markdown.length > MAX_ANSWER_CHARS) return fail("Antwort zu lang", "too-large", 413);
-      return json({ ok: true, v: this.finishAsk(row, "answered", { answer: body.markdown }) });
+      // Notizen fürs Dokument („Claude schreiben lassen“): Nur bei Fragen dieser Art
+      const notes = JSON.parse(row.info || "{}").mode === "write" ? cleanNotes(body.notes) : null;
+      return json({ ok: true, v: this.finishAsk(row, "answered", { answer: body.markdown, notes }) });
     }
     if (typeof body.error === "string") {
       return json({ ok: true, v: this.finishAsk(row, "failed", { note: body.error.slice(0, 2000) || "Fehler" }) });
@@ -961,13 +983,15 @@ export class Store extends DurableObject {
     return fail("markdown, error oder release fehlt", "bad-body", 400);
   }
 
-  finishAsk(row, status, { answer = null, note = null } = {}) {
+  finishAsk(row, status, { answer = null, note = null, notes = null } = {}) {
     let v;
     this.ctx.storage.transactionSync(() => {
       v = this.nextAsksV();
+      const info = JSON.parse(row.info || "{}");
+      if (notes) info.notes = notes;
       this.sql.exec(
-        "UPDATE asks SET status = ?, answer = ?, note = ?, lease = 0, updated = ?, v = ? WHERE id = ?",
-        status, answer, note, Date.now() / 1000, v, row.id,
+        "UPDATE asks SET status = ?, answer = ?, note = ?, lease = 0, updated = ?, v = ?, info = ? WHERE id = ?",
+        status, answer, note, Date.now() / 1000, v, JSON.stringify(info), row.id,
       );
       this.deleteAskImages(row.id);
     });
@@ -1304,6 +1328,7 @@ async function contextPart(part, list, span) {
 /// Was zu einer Frage gespeichert wird: das Gerät, bei Lernwörtern auch das Wort (der Helfer braucht es für den Hinweis)
 function askInfo(doc, meta) {
   const info = { from: String(meta.from || "").slice(0, 40) };
+  if (doc !== LERN_DOC && MODES.includes(meta.mode)) info.mode = meta.mode;
   if (doc === LERN_DOC) {
     const t = lernTarget(meta);
     info.wort = t.wort;
@@ -1346,11 +1371,42 @@ function cleanLernEvent(e) {
 
 /// Was die Apps von einer Frage sehen (ohne den claim des Helfers)
 function publicAsk(r) {
+  const info = JSON.parse(r.info || "{}");
   return {
     id: r.id, doc: r.doc, status: r.status, anchor: JSON.parse(r.anchor), pv: r.pv, effort: r.effort,
     created: r.created, updated: r.updated, answer: r.answer, note: r.note,
-    from: JSON.parse(r.info || "{}").from || null, v: r.v,
+    from: info.from || null, v: r.v,
+    ...(info.mode ? { mode: info.mode } : {}),
+    ...(Array.isArray(info.notes) ? { notes: info.notes } : {}),
   };
+}
+
+/// Notizen von „Claude schreiben lassen“: je {page, x, y, w, text, color?, size?, box?}. page ab 0 (mit `detached`
+/// auch −1: Seite gelöscht, Rückgängig noch möglich); x, y (linke obere Ecke) und w als Anteil der Seitenbreite bzw.
+/// -höhe (0…1, etwas darüber hinaus erlaubt); text Markdown mit Formeln; box [x1, y1, x2, y2] (Anteile) umrandet eine
+/// Stelle. Ungültige Notizen fallen weg; kein Array: null
+function cleanNotes(list, detached = false) {
+  if (!Array.isArray(list)) return null;
+  const frac = (v, lo = -0.2, hi = 1.2) => typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi;
+  const out = [];
+  let chars = 0;
+  for (const n of list.slice(0, MAX_NOTES)) {
+    if (!n || typeof n !== "object") continue;
+    const page = n.page;
+    if (!Number.isInteger(page) || page < (detached ? -1 : 0) || page > 100000) continue;
+    if (!frac(n.x) || !frac(n.y) || !frac(n.w, 0.01, 1.2)) continue;
+    const text = typeof n.text === "string" ? n.text.slice(0, MAX_NOTE_CHARS) : "";
+    const box = Array.isArray(n.box) && n.box.length === 4 && n.box.every((v) => frac(v)) ? n.box : null;
+    if (!text.trim() && !box) continue;
+    chars += text.length;
+    if (chars > MAX_ANSWER_CHARS) break;
+    const note = { page, x: n.x, y: n.y, w: n.w, text };
+    if (NOTE_COLORS.includes(n.color)) note.color = n.color;
+    if (NOTE_SIZES.includes(n.size)) note.size = n.size;
+    if (box) note.box = box;
+    out.push(note);
+  }
+  return out;
 }
 
 /// Übernimmt in `target` die Seitenangaben aus `other`, wo sie neuer sind
