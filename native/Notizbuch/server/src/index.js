@@ -1045,22 +1045,31 @@ export class Store extends DurableObject {
   /// POST /api/lernen/woerter {add: [{wort, satz?}] oder ["Wort", …], remove: ["Wort", …]}. Ein schon bekanntes Wort
   /// behält seinen Lernstand (sein Satz wird ersetzt, wenn ein neuer kommt); ein entferntes kommt so zurück
   lernWords(body) {
+    // Mehr als die ganze Liste auf einmal ergibt keinen Sinn und hielte das Durable Object (und damit den Sync) auf
+    if ((Array.isArray(body.add) && body.add.length > MAX_LERN_WORDS) || (Array.isArray(body.remove) && body.remove.length > MAX_LERN_WORDS)) {
+      throw new Error(`Höchstens ${MAX_LERN_WORDS} Wörter auf einmal`);
+    }
     const add = Array.isArray(body.add) ? body.add : [];
     const remove = Array.isArray(body.remove) ? body.remove.map(cleanWord).filter(Boolean) : [];
     const now = Date.now() / 1000;
     const added = [], removed = [];
     this.ctx.storage.transactionSync(() => {
       let ord = this.sql.exec("SELECT COALESCE(MAX(ord), 0) AS o FROM lern_words").one().o;
+      let count = this.sql.exec("SELECT COUNT(*) AS n FROM lern_words").one().n;
       for (const item of add) {
         const wort = cleanWord(typeof item === "string" ? item : item?.wort);
         if (!wort) continue;
         const satz = typeof item === "object" && typeof item.satz === "string" ? item.satz.trim().slice(0, 300) || null : null;
         const row = this.sql.exec("SELECT wort, satz, removed FROM lern_words WHERE wort = ?", wort).toArray()[0];
         if (row) {
-          this.sql.exec("UPDATE lern_words SET satz = COALESCE(?, satz), removed = NULL WHERE wort = ?", satz, wort);
+          // Nur schreiben, wenn sich etwas ändert (zurückholen oder neuer Satz)
+          if (row.removed || (satz !== null && satz !== row.satz)) {
+            this.sql.exec("UPDATE lern_words SET satz = COALESCE(?, satz), removed = NULL WHERE wort = ?", satz, wort);
+          }
         } else {
-          if (this.sql.exec("SELECT COUNT(*) AS n FROM lern_words").one().n >= MAX_LERN_WORDS) break;
+          if (count >= MAX_LERN_WORDS) break;
           this.sql.exec("INSERT INTO lern_words (wort, satz, added, ord) VALUES (?, ?, ?, ?)", wort, satz, now, ++ord);
+          count++;
         }
         added.push(wort);
       }

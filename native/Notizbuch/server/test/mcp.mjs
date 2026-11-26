@@ -139,6 +139,19 @@ res = await call("notizbuch_ausgang_holen", { name: "fremd.png" });
 ok(res.isError, "Datei aus dem Ordner chatgpt nicht erreichbar");
 res = await call("notizbuch_ausgang_holen", { name: "../chatgpt/fremd.png" });
 ok(res.isError, "auch nicht über ../");
+for (const bad of ["..", "."]) {
+  res = await call("notizbuch_ausgang_holen", { name: bad });
+  ok(res.isError && !/chatgpt/.test(JSON.stringify(res)), `Name "${bad}" verrät keine anderen Ausgänge`, res);
+}
+const big = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from(Array.from({ length: 1200000 }, (_, i) => (i * 7919) & 255))]);
+await fetch(`${BASE}/api/outbox/claude/gross.png`, { method: "PUT", headers: { ...H, "content-type": "image/png" }, body: big });
+res = await call("notizbuch_ausgang_holen", { name: "gross.png" });
+ok(Buffer.from(res.content?.[0]?.data || "", "base64").equals(big), "1,2-MB-PNG kommt unverändert an");
+await call("notizbuch_ausgang_loeschen", { name: "gross.png" });
+const bigPdf = Buffer.concat([pdf, Buffer.from(Array.from({ length: 900000 }, (_, i) => (i * 31) & 255))]);
+res = await call("notizbuch_pdf_senden", { title: "Groß", pdf_base64: bigPdf.toString("base64") });
+const gp = (await (await fetch(`${BASE}/api/library`, { headers: H })).json()).docs.find((d) => d.title === "Groß");
+ok(!res.isError && Buffer.from(await (await fetch(`${BASE}/api/pdf/${gp?.id}`, { headers: H })).arrayBuffer()).equals(bigPdf), "900-KB-PDF über base64 unverändert");
 res = await call("notizbuch_ausgang_loeschen", { name });
 ok(!res.isError, "löschen");
 list = JSON.parse(txt(await call("notizbuch_ausgang_liste", {})));
@@ -153,6 +166,13 @@ res = await call("notizbuch_lernwoerter_ablegen", { add: [{ wort: "Fahrrad", sat
 ok(JSON.parse(txt(res)).abgelegt?.length === 2, "zwei Wörter abgelegt", res);
 res = await call("notizbuch_lernwoerter_ablegen", { remove: ["Meer"] });
 ok(JSON.parse(txt(res)).entfernt?.[0] === "Meer", "eines entfernt");
+res = await call("notizbuch_lernwoerter_ablegen", { add: Array.from({ length: 501 }, () => ({ wort: "Fahrrad" })) });
+ok(res.isError && /500/.test(txt(res)), "mehr als 500 auf einmal → Fehler");
+const direct = await fetch(`${BASE}/api/lernen/woerter`, { method: "POST", headers: { ...H, "content-type": "application/json" }, body: JSON.stringify({ remove: Array(501).fill("x") }) });
+ok(direct.status === 400, "auch über /api: mehr als 500 → 400");
+res = await call("notizbuch_lernwoerter_ablegen", { add: [{ wort: "Meer", satz: "Das Meer ist blau." }] });
+ok(JSON.parse(txt(res)).abgelegt?.[0] === "Meer", "entferntes Wort kommt mit add zurück");
+res = await call("notizbuch_lernwoerter_ablegen", { remove: ["Meer"] });
 res = await call("notizbuch_lernwoerter_ablegen", {});
 ok(res.isError, "ohne add/remove → Fehler");
 const st = JSON.parse(txt(await call("notizbuch_lernstand", {})));
