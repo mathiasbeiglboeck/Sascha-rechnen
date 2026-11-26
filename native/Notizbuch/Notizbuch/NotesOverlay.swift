@@ -63,12 +63,14 @@ final class NotesOverlay: UIView {
     required init?(coder: NSCoder) { fatalError("init(coder:) wird nicht verwendet") }
 
     /// Alle Notizen der sichtbaren, beantworteten Fragen; was noch nicht gesetzt ist, wird gesetzt und kommt mit
-    /// `typeset` (dann `set` noch einmal aufrufen)
+    /// `typeset` (dann `set` noch einmal aufrufen). Nur Fragen, deren Seiten zu diesem Seitenstand gehören (wie die
+    /// Markierungen, AskOverlay.set): Ein anderes Gerät nummeriert die Notizen nach einer Seitenänderung gleich um, die
+    /// neuen Seiten kommen erst danach; bis dahin stünden sie auf falschen Seiten
     @MainActor
-    func set(_ asks: [Ask], frames: [CGRect], typeset: @escaping () -> Void) {
+    func set(_ asks: [Ask], frames: [CGRect], pagesVersion: Int, typeset: @escaping () -> Void) {
         var list: [Placed] = []
         var missing: [AskNote] = []
-        for ask in asks where ask.isWrite {
+        for ask in asks where ask.isWrite && ask.pv <= pagesVersion {
             for (index, note) in ask.shownNotes where frames.indices.contains(note.page) {
                 let t = NoteTypesetter.cached(note)
                 if t == nil, !note.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { missing.append(note) }
@@ -127,11 +129,12 @@ final class NotesOverlay: UIView {
         }
     }
 
-    /// Wo Notizen auf einer Seite stehen, für den Export: je Seite die Notizen mit Lage relativ zur Seite
+    /// Wo Notizen auf einer Seite stehen, für den Export: je Seite die Notizen mit Lage relativ zur Seite (nur zu diesem
+    /// Seitenstand, wie in `set`)
     @MainActor
-    static func forExport(_ asks: [Ask], frames: [CGRect]) -> [Int: [PageExport.Note]] {
+    static func forExport(_ asks: [Ask], frames: [CGRect], pagesVersion: Int) -> [Int: [PageExport.Note]] {
         var out: [Int: [PageExport.Note]] = [:]
-        for ask in asks where ask.isWrite {
+        for ask in asks where ask.isWrite && ask.pv <= pagesVersion {
             for (_, note) in ask.shownNotes where frames.indices.contains(note.page) {
                 let frame = frames[note.page]
                 let t = NoteTypesetter.cached(note)

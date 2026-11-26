@@ -222,6 +222,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         canvas.addGestureRecognizer(lassoTracker)
         canvas.selectionMenuItems = { [weak self] context in self?.askMenuItems(context) ?? [] }
         canvas.selectionArea = { [weak self] in self?.lassoAreaOnCanvas() }
+        canvas.onPanelHover = { [weak self] hovering in self?.panelHover(hovering) }
         // Markierungen der Fragen über der Tinte; Antippen öffnet die Antwort
         canvas.addSubview(askOverlay)
         askTap.drawing = canvas.drawingGestureRecognizer
@@ -489,11 +490,13 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private var inkSettling: Bool { Date().timeIntervalSince(lastInkEnd) < 0.5 }
     /// Schwebt der Pencil gerade über der Fläche (eigene Schwebe-Geste der App)?
     private var pencilHovering = false
+    /// Schwebt er über der Liste einer Lasso-Auswahl (sie liegt neben der Fläche, siehe panelHover)?
+    private var panelHovered = false
     /// Wann er zuletzt aufgehört hat zu schweben: aufgesetzt, weggehoben oder zur Leiste gewandert
     private var lastHoverEnd = Date.distantPast
     /// Schwebt der Pencil, oder schwebte er eben noch? Die kurze Nachfrist deckt den Moment zwischen dem Ende des
     /// Schwebens und dem Aufsetzen ab, in dem der neue Strich noch nicht gemeldet ist, und PencilKits Aufräumen danach
-    private var pencilNear: Bool { pencilHovering || Date().timeIntervalSince(lastHoverEnd) < 0.25 }
+    private var pencilNear: Bool { pencilHovering || panelHovered || Date().timeIntervalSince(lastHoverEnd) < 0.25 }
     /// Zählt im Schweben, ob der Pencil Pro zweimal hin und her gedreht wird (dann zum Lasso)
     private var roll = PencilRoll()
     private var pendingWork: DispatchWorkItem?
@@ -802,6 +805,23 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
         sendView()
+    }
+
+    // Die Liste einer Lasso-Auswahl steht fest im Fenster; scrollt oder zoomt die Seite, passt sie nicht mehr zur
+    // Auswahl. Am iPad schließt ein Finger sie nicht schon beim Aufsetzen (Handballen, siehe InkCanvasView)
+
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        if scrollView === canvas { canvas.dismissSelectionMenu("Scrollen") }
+    }
+
+    func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
+        if scrollView === canvas { canvas.dismissSelectionMenu("Zoomen") }
+    }
+
+    /// Tippen auf die Statusleiste (iPhone) scrollt nach oben, ohne Berührung im Fenster
+    func scrollViewShouldScrollToTop(_ scrollView: UIScrollView) -> Bool {
+        if scrollView === canvas { canvas.dismissSelectionMenu("nach oben") }
+        return true
     }
 
     func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
@@ -1268,15 +1288,32 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         canvas.pinchGestureRecognizer?.isEnabled = false
     }
 
-    /// Kurz warten: zwischen Schweben und Aufsetzen (und zwischen zwei Wörtern) soll nichts freigegeben werden
+    /// Kurz warten: zwischen Schweben und Aufsetzen (und zwischen zwei Wörtern) soll nichts freigegeben werden. Schwebt
+    /// der Pencil inzwischen über der Liste einer Auswahl, gibt erst das Ende davon frei
     private func unlockScrollingSoon() {
         unlockWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            self?.canvas.isScrollEnabled = true
-            self?.canvas.pinchGestureRecognizer?.isEnabled = true
+            guard let self, !self.panelHovered else { return }
+            self.canvas.isScrollEnabled = true
+            self.canvas.pinchGestureRecognizer?.isEnabled = true
         }
         unlockWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+    }
+
+    /// Der Pencil schwebt über der Liste einer Lasso-Auswahl (oder nicht mehr). Sie liegt neben der Fläche, deren
+    /// Schwebe-Geste dort endet: Ohne das hier gäbe die Seite 0,6 s später den Handballen frei, und ein Neuzeichnen nach
+    /// dem Radieren (wartet auf pencilNear) hebe Auswahl und Liste auf, während der Pencil zur Liste geht
+    private func panelHover(_ hovering: Bool) {
+        guard isPad else { return }
+        if hovering {
+            panelHovered = true
+            lockScrolling()
+        } else if panelHovered {
+            panelHovered = false
+            lastHoverEnd = Date()
+            unlockScrollingSoon()
+        }
     }
 
     func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
@@ -1386,6 +1423,9 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
         guard !settingDrawing else { return }
+        #if DEBUG
+        if lasso { NSLog("Asks-Debug: Zeichnung geändert (Lasso), %ld Striche", canvas.drawing.strokes.count) }
+        #endif
         dirty = true
         localChanged = true
         syncSoon()
@@ -1465,7 +1505,7 @@ extension CanvasController {
 
     /// Notizen von Claude für Export, Briefkasten, Übersicht und die Seiten, die Claude zu einer Frage bekommt
     var exportNotes: [Int: [PageExport.Note]] {
-        NotesOverlay.forExport(sync.asks.asks(doc.id), frames: layout.frames)
+        NotesOverlay.forExport(sync.asks.asks(doc.id), frames: layout.frames, pagesVersion: currentPagesVersion)
     }
 
     /// Aktueller Name (inzwischen vielleicht umbenannt, auch auf einem anderen Gerät)
@@ -2327,9 +2367,13 @@ extension CanvasController: UIGestureRecognizerDelegate {
         }
     }
 
-    /// Rechteck des zuletzt gezogenen Lassos auf der Leinwand (nil: keins): Das Menü der Auswahl geht daneben auf
-    private func lassoAreaOnCanvas() -> CGRect? {
-        lassoPath.map { pagesView.convert($0.bounds, to: canvas) }
+    /// Rechteck des zuletzt gezogenen Lassos auf der Leinwand (nil: keins): Das Menü der Auswahl geht daneben auf. Dazu,
+    /// ob die Tinte darunter noch dieselbe ist; sonst wurde die Auswahl verschoben oder dupliziert (ein kurzer Zug zählt
+    /// nicht als Weg und lässt den alten stehen), und nur seine Größe taugt noch. Einmal je geöffnetem Menü, nicht beim
+    /// Schreiben
+    private func lassoAreaOnCanvas() -> (rect: CGRect, unchanged: Bool)? {
+        guard let path = lassoPath else { return nil }
+        return (pagesView.convert(path.bounds, to: canvas), inkPrint(near: path.bounds) == path.inkPrint)
     }
 
     /// Ein Weg des Lassos beginnt (auch Antippen): die Zeichnung merken, für ein ∞. Für ein ∞, über das noch nicht
@@ -2350,6 +2394,12 @@ extension CanvasController: UIGestureRecognizerDelegate {
         guard k > 0 else { return }
         let s = k * canvas.zoomScale
         let points = LassoGeometry.simplified(raw, minStep: 2 / s)
+        #if DEBUG
+        // Wann PencilKit eine verschobene Auswahl übernimmt (vor oder nach dem Ende des Wegs), zeigt der Vergleich mit
+        // „Zeichnung geändert (Lasso)“
+        NSLog("Asks-Debug: Lasso-Weg zu Ende, %ld Punkte, Fläche %.0f pt²", points.count,
+              Double(LassoGeometry.area(points) * s * s))
+        #endif
         guard points.count >= 8 else { return }
         lassoPaths += 1
         // ∞: vor der Flächenprüfung, denn die beiden Schleifen eines ∞ heben sich dort auf
@@ -2370,6 +2420,8 @@ extension CanvasController: UIGestureRecognizerDelegate {
         }
         let box = LassoGeometry.bounds(points)
         lassoPath = LassoPath(points: points, bounds: box, inkPrint: inkPrint(near: box))
+        // Die Liste einer früheren Auswahl taugt nicht mehr als Schätzung, wo die Auswahl liegt
+        canvas.forgetSelection()
     }
 
     /// Kennzahl der Tinte, die `box` (Seitenpunkte) berührt, in Seitenpunkten gerechnet (übersteht Drehen)
@@ -2652,11 +2704,12 @@ extension CanvasController: UIGestureRecognizerDelegate {
     private func reloadAskMarks() {
         guard k > 0 else { return }
         let list = sync.asks.asks(doc.id)
-        askOverlay.set(list, frames: layout.frames, pagesVersion: currentPagesVersion)
+        let pv = currentPagesVersion
+        askOverlay.set(list, frames: layout.frames, pagesVersion: pv)
         askOverlay.layout(scale: k * canvas.zoomScale)
         if canvas.subviews.last !== askOverlay { canvas.bringSubviewToFront(askOverlay) }
         // Notizen von Claude; was noch gesetzt werden muss, kommt danach
-        notesOverlay.set(list, frames: layout.frames) { [weak self] in self?.reloadAskMarks() }
+        notesOverlay.set(list, frames: layout.frames, pagesVersion: pv) { [weak self] in self?.reloadAskMarks() }
         // Neue Antwort, während das Dokument offen ist. Gesammelt, nicht ersetzt: Eine Markierung, die mit ihrer Seite
         // kurz verschwand (Seite gelöscht, dann Rückgängig), meldet sich danach nicht als neue Antwort
         let answered = Set(list.filter { $0.isAnswered && $0.isVisible }.map(\.id))
@@ -2989,7 +3042,13 @@ extension CanvasController {
             // Lasso auch mit dem Finger (im Simulator ist jede Berührung ein Finger), um das Menü einer Auswahl zu
             // prüfen; vorher debug/tool?mode=lasso&edit. &ink: vorher Probeschrift oben links auf Seite 1. Das Protokoll
             // nennt, wo sie im Fenster liegt (Punkte), zum Umkreisen, und wie viele Striche auf der Leinwand sind. Den
-            // Weg des Lassos merkt sich die App dann auch vom Finger (wohin das Menü geht, „Claude fragen“)
+            // Weg des Lassos merkt sich die App dann auch vom Finger (wohin das Menü geht, „Claude fragen“). &off: wieder
+            // wie sonst (am iPad zeichnet nur der Pencil), etwa um bei offener Liste zu prüfen, was ein Finger am iPad tut
+            if has("off") {
+                canvas.drawingPolicy = isPad ? .pencilOnly : .anyInput
+                if isPad { lassoTracker.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)] }
+                return log("fingerlasso: aus, " + (isPad ? "nur der Pencil zeichnet" : "Finger zeichnet (iPhone)"))
+            }
             canvas.drawingPolicy = .anyInput
             lassoTracker.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue),
                                               NSNumber(value: UITouch.TouchType.pencil.rawValue)]
@@ -3081,6 +3140,14 @@ extension CanvasController {
                 discardPageUndo()
                 log("pages: Rückgängig verworfen")
             }
+        case "/setdrawing":
+            // Hebt das Setzen der Zeichnung (wie beim Einfügen fremder Striche) PencilKits Lasso-Auswahl auf? Nur die
+            // Zeichnung, ohne die Liste der Auswahl zu schließen (das täte setDrawing): danach Foto, ob die gestrichelte
+            // Auswahl noch da ist
+            settingDrawing = true
+            canvas.drawing = canvas.drawing
+            settingDrawing = false
+            return log("setdrawing: Zeichnung neu gesetzt, \(canvas.drawing.strokes.count) Striche")
         case "/state":
             break
         default:

@@ -199,10 +199,12 @@ extension PageExport {
         }
     }
 
-    /// Die Seiten mit Tinte im Bereich `span` außer der Frage auf Seite `q` als ein PDF für Claude: je Seite ein JPEG
-    /// (contextJPEG), darüber ein Streifen „Seite N“. Würde es größer als `maxBytes`, rückt der Bereich von außen nach
-    /// innen (an beiden Enden gleich weit), bis es passt. Gibt den Bereich, die Seiten darin (ab 0) und das PDF zurück,
-    /// ohne Seiten mit Tinte kein PDF; nil, wenn das PDF unerwartet groß wird oder nur die Seite der Frage bliebe
+    /// Die Seiten mit Tinte oder Notizen von Claude im Bereich `span` außer der Frage auf Seite `q` als ein PDF für
+    /// Claude: je Seite ein JPEG (contextJPEG), darüber ein Streifen „Seite N“. Eine Seite nur mit Notizen zählt mit: Sonst
+    /// hielte Claude sie für leer und schriebe womöglich über seine eigene frühere Lösung. Würde es größer als
+    /// `maxBytes`, rückt der Bereich von außen nach innen (an beiden Enden gleich weit), bis es passt. Gibt den Bereich,
+    /// die Seiten darin (ab 0) und das PDF zurück, ohne solche Seiten kein PDF; nil, wenn das PDF unerwartet groß wird
+    /// oder nur die Seite der Frage bliebe
     func contextPDF(span: ClosedRange<Int>, question q: Int,
                     maxBytes: Int) -> (span: ClosedRange<Int>, pages: [Int], pdf: Data?)? {
         var range = span
@@ -211,7 +213,7 @@ extension PageExport {
         // Von der Frage nach außen
         let order = span.filter { $0 != q && frames.indices.contains($0) }
             .sorted { (abs($0 - q), $0) < (abs($1 - q), $1) }
-        for i in order where hasInk(page: i) {
+        for i in order where hasInk(page: i) || notes[i]?.isEmpty == false {
             let shot = autoreleasepool { contextJPEG(page: i) }
             if total + shot.jpeg.count > maxBytes {
                 let reach = abs(i - q) - 1
