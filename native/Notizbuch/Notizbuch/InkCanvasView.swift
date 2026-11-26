@@ -196,10 +196,13 @@ final class InkCanvasView: PKCanvasView {
     private func show(_ panel: SelectionMenuPanel, from space: UIView, source: CGPoint, target: CGRect?) {
         guard let host = superview, let window else { return }
         let point = space.convert(source, to: self)
-        let estimate = selectionEstimate(at: point, target: target.map { space.convert($0, to: self) })
+        // Einmal pro Liste: Dafür wird die ganze Tinte durchgesehen
+        let lasso = selectionArea?()
+        let estimate = selectionEstimate(at: point, target: target.map { space.convert($0, to: self) }, lasso: lasso)
         let area = estimate.area.union(CGRect(origin: point, size: .zero))
         var touchArea = area
-        if let lasso = selectionArea?(), !lasso.rect.isNull, !lasso.rect.isInfinite,
+        // Nur ein Lasso, unter dem noch dieselbe Tinte liegt: Nach einem Verschieben liegt es, wo die Auswahl vorher war
+        if let lasso, lasso.unchanged, !lasso.rect.isNull, !lasso.rect.isInfinite,
            lasso.rect.insetBy(dx: -60, dy: -60).contains(point) {
             touchArea = touchArea.union(lasso.rect)
         }
@@ -247,8 +250,10 @@ final class InkCanvasView: PKCanvasView {
     /// aufgehen soll, der Reihe nach: PencilKits eigene Angabe `target`, wenn sie zum Punkt passt; das zuletzt gezogene
     /// Lasso, wenn die Tinte darunter dieselbe ist und das Menü an ihm aufgeht; die Auswahl der vorigen Liste,
     /// mitgewandert (verschoben); ein Rechteck so groß wie das Lasso, oben mittig am Punkt (die Auswahl wurde verschoben
-    /// oder dupliziert, bevor eine Liste aufging); sonst nur dieser Punkt. `kind` fürs Protokoll
-    private func selectionEstimate(at point: CGPoint, target: CGRect?) -> (area: CGRect, kind: String) {
+    /// oder dupliziert, bevor eine Liste aufging); sonst nur dieser Punkt. `lasso`: was selectionArea lieferte.
+    /// `kind` fürs Protokoll
+    private func selectionEstimate(at point: CGPoint, target: CGRect?,
+                                   lasso: (rect: CGRect, unchanged: Bool)?) -> (area: CGRect, kind: String) {
         let z = max(zoomScale, 0.01)
         let unzoomed = CGPoint(x: point.x / z, y: point.y / z)
         func remembered(_ rect: CGRect, _ kind: String) -> (area: CGRect, kind: String) {
@@ -260,7 +265,6 @@ final class InkCanvasView: PKCanvasView {
            abs(target.minY - point.y) <= 40, point.x >= target.minX - 40, point.x <= target.maxX + 40 {
             return remembered(target, "von PencilKit")
         }
-        let lasso = selectionArea?()
         if let lasso, lasso.unchanged, !lasso.rect.isNull, !lasso.rect.isInfinite,
            lasso.rect.insetBy(dx: -60, dy: -60).contains(point) {
             return remembered(lasso.rect, "Lasso")
@@ -403,7 +407,8 @@ final class InkCanvasView: PKCanvasView {
     /// schließen. Ein Finger schließt sie dort erst mit einem kurzen Tippen (tapWhilePanelOpen) oder wenn die Seite zu
     /// scrollen beginnt (CanvasController). Am iPhone nie, solange eine Zeile der Liste gedrückt ist: Deren Wahl ginge
     /// sonst verloren. Am iPad drückt dann ein Finger oder der Handballen die Zeile (der Pencil kann nicht zugleich
-    /// woanders aufsetzen): Der Pencil schließt trotzdem, und die Zeile wählt beim Abheben nichts mehr
+    /// woanders aufsetzen): Der Pencil schließt trotzdem, ebenso ein kurzes Tippen mit einem anderen Finger, und die
+    /// Zeile wählt beim Abheben nichts mehr
     private func touchDownWhilePanelOpen(_ touch: UITouch) {
         guard let panel, !isFingerOnPencilCanvas(touch), drawingPolicy == .pencilOnly || !panel.isPressingRow,
               !panel.bounds.contains(touch.location(in: panel)) else { return }
@@ -412,9 +417,11 @@ final class InkCanvasView: PKCanvasView {
 
     /// Ein kurzes Tippen (unter 0,35 s, kaum bewegt) endete, während die Liste offen ist; `start`: wo es begann, in
     /// Fensterkoordinaten. So schließt am iPad ein Finger die Liste. Einen aufliegenden Handballen bricht iPadOS meist ab
-    /// oder er bleibt länger liegen; beides zählt nicht als Tippen
+    /// oder er bleibt länger liegen; beides zählt nicht als Tippen. Auch während ein Handballen oder Daumen eine Zeile
+    /// drückt (der tippende Finger auf der Fläche ist nicht die Berührung auf der Zeile): Sonst führte deren Abheben die
+    /// Zeile aus
     private func tapWhilePanelOpen(_ touch: UITouch, startedAt start: CGPoint) {
-        guard let panel, isFingerOnPencilCanvas(touch), !panel.isPressingRow,
+        guard let panel, isFingerOnPencilCanvas(touch),
               !panel.bounds.contains(panel.convert(start, from: nil)) else { return }
         closeByTouch(at: convert(start, from: nil))
     }
