@@ -18,6 +18,7 @@ const MAX_PDF_BYTES = 30 * 1024 * 1024;
 // Hochlade-Links gelten so lange (Sekunden)
 const UPLOAD_TTL = 3600;
 const MAX_LOG = 150;
+const MAX_LERN = 500;
 
 const INSTRUCTIONS = `Notizbuch ist Mathias' Notiz-App auf iPad und iPhone (er schreibt dort mit dem Stift).
 - Notizen, Erklärungen, Antworten mit Formeln: notizbuch_markdown_senden (Markdown mit $…$ und $$…$$). Das ist der
@@ -156,15 +157,24 @@ async function hmac(secret, text, len) {
 }
 
 function b64url(bytes) {
-  let s = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return b64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+/// base64 einer Seite (bis einige MB) muss in die 10 ms CPU des Gratis-Tarifs passen: eingebaut, wo es das gibt,
+/// sonst über apply in Stücken (ein Spread kostete etwa 35 ms je MB)
 function b64(bytes) {
-  let s = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  return btoa(s);
+  if (typeof bytes.toBase64 === "function") return bytes.toBase64();
+  const parts = [];
+  for (let i = 0; i < bytes.length; i += 0x8000) parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
+  return btoa(parts.join(""));
+}
+
+function fromB64(s) {
+  if (typeof Uint8Array.fromBase64 === "function") return Uint8Array.fromBase64(s);
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
 }
 
 function sameText(a, b) {
@@ -261,7 +271,11 @@ const str = (v, what) => {
   if (typeof v !== "string" || !v.trim()) throw new Error(`${what} fehlt`);
   return v;
 };
-const outName = (name) => `/api/outbox/claude/${encodeURIComponent(str(name, "name"))}`;
+// "." und ".." machte new Request() zu /api/outbox/ (die Liste aller Ausgänge samt chatgpt)
+const outName = (name) => {
+  if (str(name, "name") === "." || name === "..") throw new Error("Diese Datei gibt es nicht");
+  return `/api/outbox/claude/${encodeURIComponent(name)}`;
+};
 
 async function callTool(name, a, { env, store, origin }) {
   switch (name) {
@@ -275,13 +289,11 @@ async function callTool(name, a, { env, store, origin }) {
       let bytes;
       if (typeof a.pdf_base64 === "string" && a.pdf_base64.trim()) {
         const clean = a.pdf_base64.replace(/^data:[^,]*,/, "").replace(/\s+/g, "");
-        let bin;
         try {
-          bin = atob(clean.replace(/-/g, "+").replace(/_/g, "/"));
+          bytes = fromB64(clean.replace(/-/g, "+").replace(/_/g, "/"));
         } catch {
           throw new Error("pdf_base64 ist kein gültiges base64");
         }
-        bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
       } else if (typeof a.pdf_url === "string" && a.pdf_url.trim()) {
         let u;
         try {
@@ -343,6 +355,7 @@ async function callTool(name, a, { env, store, origin }) {
     case "notizbuch_lernwoerter_ablegen": {
       const body = { add: Array.isArray(a.add) ? a.add : [], remove: Array.isArray(a.remove) ? a.remove : [] };
       if (!body.add.length && !body.remove.length) throw new Error("add oder remove angeben");
+      if (body.add.length > MAX_LERN || body.remove.length > MAX_LERN) throw new Error(`Höchstens ${MAX_LERN} Wörter auf einmal`);
       const { data } = await api(store, "POST", "/api/lernen/woerter", JSON.stringify(body), "application/json; charset=utf-8");
       return text({ abgelegt: data.added, entfernt: data.removed });
     }
