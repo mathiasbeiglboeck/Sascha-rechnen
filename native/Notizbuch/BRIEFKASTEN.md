@@ -2,6 +2,24 @@
 
 Über den Briefkasten bekommt Mathias PDFs und Markdown direkt in seine Notizbuch-App auf iPad und iPhone, und er schickt beschriebene Seiten zurück.
 
+## Am einfachsten: der Connector „Notizbuch“
+
+Ist in claude.ai der Connector „Notizbuch“ eingetragen, hat jeder Claude (Chats, Cloud-Threads aller Projekte, Claude Code am Mac mit claude.ai-Anmeldung) die Werkzeuge direkt, ohne URL, Schlüssel oder Netzwerk-Freigabe:
+
+| Werkzeug | wofür |
+|---|---|
+| `notizbuch_markdown_senden` | Markdown in den Eingang (der Normalfall für Notizen und Antworten mit Formeln) |
+| `notizbuch_pdf_senden` | PDF in den Eingang, über `pdf_url` (öffentlich) oder `pdf_base64` (nur kleine Dateien) |
+| `notizbuch_hochlade_link` | Adresse (1 Stunde gültig) samt curl-Befehl, um eine größere Datei aus der Shell hochzuladen |
+| `notizbuch_ausgang_liste` / `_holen` / `_loeschen` | Ausgang `claude`: Liste, Datei holen (PNG kommt als Bild), aufräumen |
+| `notizbuch_lernwoerter_ablegen` / `notizbuch_lernstand` | Lernwörter für Sascha (Regeln wie unten) |
+
+Gibt es den Connector, nimm ihn. Die curl-Aufrufe unten bleiben für Agenten ohne Connector (etwa Codex).
+
+Einrichten (nur Mathias, einmal): Server mit dem Connector einspielen, dann am Mac `zsh native/Notizbuch/claude-fragen/connector-link.sh` im Checkout `notizbuch-build`. Das legt die Connector-Adresse in die Zwischenablage. In claude.ai: Einstellungen → Connectors → „Benutzerdefinierten Connector hinzufügen“, Name „Notizbuch“, URL einsetzen, keine OAuth-Angaben. Die Adresse enthält einen aus dem Schlüssel abgeleiteten Zugang: nie in Chats, Dateien oder Repos. Sie kann nur den Briefkasten und die Lernwörter, nicht Sync, Bibliothek oder Striche. Sperren: auf dem Server eine Variable `MCP_VERSION` setzen (`npx wrangler secret put MCP_VERSION`), dann gilt nur noch die neue Adresse (`MCP_VERSION=<Wert> zsh …/connector-link.sh`).
+
+## Ohne Connector: direkt über HTTP
+
 Du brauchst zwei Werte von Mathias. Schreib sie nie ins Repo:
 - `NOTIZBUCH_URL`, zum Beispiel `https://notizbuch.<name>.workers.dev`
 - `NOTIZBUCH_KEY`, den geheimen Schlüssel
