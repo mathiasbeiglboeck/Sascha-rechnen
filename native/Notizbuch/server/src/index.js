@@ -15,9 +15,12 @@
 //
 // Alle /api-Adressen brauchen den Header  Authorization: Bearer <SECRET>. Nur /api/karten/… geht auch mit dem
 // Lernkarten-Schlüssel (aus SECRET abgeleitet, siehe kartenKey): Er darf nichts anderes, steckt im Handy eines Kindes.
+// Der Connector für Claude (/mcp/<Schlüssel>, siehe mcp.js) kann ohne Header einen kleinen Teil davon (Briefkasten,
+// Lernwörter); sein Schlüssel ist ebenfalls aus SECRET abgeleitet.
 
 import { DurableObject } from "cloudflare:workers";
 import viewerHTML from "./viewer.html";
+import { handleMCP, handleUpload } from "./mcp.js";
 
 const CHUNK = 1024 * 1024;
 const RECIPIENTS = ["claude", "chatgpt"];
@@ -83,6 +86,15 @@ export default {
       });
     }
     if (url.pathname.startsWith("/s/")) return store.fetch(request);
+    // Connector für Claude (MCP), der Schlüssel steht im Pfad; Hochlade-Adressen daraus (siehe mcp.js)
+    let m = url.pathname.match(/^\/mcp\/([A-Za-z0-9_-]{16,64})\/?$/);
+    if (m) return handleMCP(request, env, store, m[1], url.origin);
+    m = url.pathname.match(/^\/up\/(\d{1,12})\/([A-Za-z0-9_-]{16,64})\/?$/);
+    if (m) return handleUpload(request, env, store, m[1], m[2]);
+    // Keine OAuth-Anmeldung hier: Clients, die danach suchen, sollen das klar erfahren
+    if (url.pathname.startsWith("/.well-known/") || url.pathname.startsWith("/mcp")) {
+      return new Response("Nicht gefunden\n", { status: 404, headers: { "content-type": "text/plain; charset=utf-8" } });
+    }
     if (!url.pathname.startsWith("/api/")) {
       return new Response("Notizbuch-Server läuft.\n", { headers: { "content-type": "text/plain; charset=utf-8" } });
     }

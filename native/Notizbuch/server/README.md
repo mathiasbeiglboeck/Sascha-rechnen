@@ -30,8 +30,10 @@ Adresse und Schlüssel trägst du dann in der App ein (Zahnrad in der Übersicht
 | PUT/GET/DELETE | `/api/outbox/:to/:name` | Datei im Ausgang eines Empfängers |
 | POST/DELETE | `/api/share/:id` | Link für Gäste erzeugen (`{token}`) bzw. Teilen beenden |
 | GET (WebSocket) | `/api/doc/:id/ws` | Live-Verbindung der App (Änderungen, Gäste, Ansicht) |
+| POST | `/mcp/:schlüssel` | Connector für Claude (MCP, Streamable HTTP ohne Sitzungen, nur JSON-Antworten), ohne Header: Schlüssel = HMAC(SECRET, `mcp-connector[:MCP_VERSION]`), siehe `src/mcp.js` und `../claude-fragen/connector-link.sh` |
+| POST | `/up/:ablauf/:signatur` | Hochlade-Adresse aus dem Connector-Werkzeug `notizbuch_hochlade_link` (1 Stunde gültig), Parameter wie `/api/inbox` |
 | GET | `/s/:token` | Web-Ansicht für Gäste (ohne Schlüssel; dazu `/s/:token/data`, `/pdf`, `/ws`) |
 
-Lokal testen: `echo SECRET=test > .dev.vars && npx wrangler dev`.
+Lokal testen: `echo SECRET=test > .dev.vars && npx wrangler dev`. Connector: `test/mcp.mjs` (Aufruf im Kopf der Datei).
 
 Die Web-Ansicht kann alle Seiten mit den Notizen als PDF sichern (Knopf mit Download-Symbol, solange sie verbunden ist). Das geschieht ganz im Browser mit dem, was die Ansicht schon geladen hat, und pdf-lib, das erst beim ersten Sichern lädt; der Server bekommt davon nichts mit. Test dafür: `test/export.mjs` (Playwright mit Chromium, poppler und python3 mit pypdf; Aufruf im Kopf der Datei).
