@@ -183,7 +183,9 @@ final class TabsModel: ObservableObject {
     var tabsClosable: Bool { editorShown && Date().timeIntervalSince(presentedAt) > 0.6 }
 
     private func presentEditor() {
+        // Der Editor geht immer mit Leiste auf, auch wenn sie zuletzt mit dem Datum ausgeblendet war
         tools.menusHidden = false
+        tools.barHidden = false
         tools.prepareForDocument()
         presentedAt = Date()
         editorShown = true

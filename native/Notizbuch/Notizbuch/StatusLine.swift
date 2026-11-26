@@ -4,8 +4,9 @@ import UIKit
 
 /// Am iPad steht im Editor statt der Statusleiste des Systems eine eigene Zeile: links Uhrzeit und Datum, rechts WLAN
 /// und Akku, dazwischen die Tabs (Wunsch 19.11.). In die Statusleiste des Systems lassen sich die Tabs nicht setzen:
-/// Ein Tippen dort gehört iPadOS (es scrollt nach oben), die Tabs würden nicht reagieren. Ein Tippen auf Uhrzeit oder
-/// Akku scrollt hier ebenso nach oben.
+/// Ein Tippen dort gehört iPadOS (es scrollt nach oben), die Tabs würden nicht reagieren. Seit dem Wunsch vom 25.11.
+/// führt ein Tippen auf die Uhrzeit zu den Notizbüchern, auf das Datum blendet es die Leiste aus und ein, auf WLAN und
+/// Akku wechselt es zwischen Stift und Radierer (siehe EditorView).
 struct StatusLine: View {
     /// Höhe der Zeile: Die Statusleiste des Systems ist am iPad 24 Punkte hoch, die Tabs brauchen 26
     static let height: CGFloat = 28
@@ -14,20 +15,27 @@ struct StatusLine: View {
     /// Tabs zeigen (nicht bei eingeklappter Leiste)
     let showTabs: Bool
     @ObservedObject var device = DeviceStatus.shared
-    /// Antippen von Uhrzeit oder Akku: nach oben (nil: nichts)
-    var onTop: (() -> Void)? = nil
+    /// Antippen der Uhrzeit, des Datums, von WLAN und Akku (nil: nichts, etwa über der Seitenübersicht)
+    var onClock: (() -> Void)? = nil
+    var onDate: (() -> Void)? = nil
+    var onDevice: (() -> Void)? = nil
     @Environment(\.horizontalSizeClass) private var sizeClass
+
+    /// Abstand zum Rand links und rechts
+    private static let edge: CGFloat = 20
 
     var body: some View {
         row
             .font(.system(size: 14))
-            .padding(.horizontal, 20)
+            .padding(.horizontal, Self.edge)
             .frame(height: Self.height)
     }
 
     @ViewBuilder private var row: some View {
         let line = HStack(spacing: 12) {
-            clock.fixedSize().scrollsToTop(onTop)
+            // Waagrecht so breit wie der Inhalt, senkrecht über die ganze Zeile: Dort nehmen Uhrzeit und Datum das
+            // Tippen an
+            clock.fixedSize(horizontal: true, vertical: false)
             ZStack {
                 if showTabs {
                     TabStrip(tabs: tabs)
@@ -35,7 +43,11 @@ struct StatusLine: View {
                 }
             }
             .frame(maxWidth: .infinity)
-            deviceState.fixedSize().scrollsToTop(onTop)
+            // Die Fläche zum Tippen reicht bis an den Rand, die Zeichnung bleibt, wo sie ist
+            deviceState.fixedSize()
+                .padding(.trailing, Self.edge)
+                .tappable(onDevice, hint: "Stift oder Radierer")
+                .padding(.trailing, -Self.edge)
         }
         if #available(iOS 26, *) {
             // Im Fenster sitzen links oben die Fensterknöpfe von iPadOS: Die Zeile beginnt dann rechts davon und wird
@@ -46,15 +58,26 @@ struct StatusLine: View {
         }
     }
 
+    /// Im schmalen Fenster nur die Uhrzeit, damit für die Tabs Platz bleibt; ohne Tabs (etwa bei mit dem Datum
+    /// ausgeblendeter Leiste) auch dort das Datum, sonst käme die Leiste dort nicht mehr zurück
+    private var showDate: Bool { sizeClass != .compact || !showTabs }
+
     private var clock: some View {
         TimelineView(.everyMinute) { context in
-            HStack(spacing: 6) {
+            // Zwischen Uhrzeit und Datum 6 Punkte, je zur Hälfte Fläche zum Tippen der beiden. Die Fläche der Uhrzeit
+            // reicht bis an den Rand, die Zeichnung bleibt, wo sie ist
+            HStack(spacing: 0) {
                 Text(context.date, format: .dateTime.hour().minute())
                     .fontWeight(.semibold)
                     .monospacedDigit()
-                // Im schmalen Fenster nur die Uhrzeit, damit für die Tabs Platz bleibt
-                if sizeClass != .compact {
+                    .padding(.trailing, showDate ? 3 : 0)
+                    .padding(.leading, Self.edge)
+                    .tappable(onClock, hint: "Zu den Notizbüchern")
+                    .padding(.leading, -Self.edge)
+                if showDate {
                     Text(Self.day.string(from: context.date))
+                        .padding(.leading, 3)
+                        .tappable(onDate, hint: "Leiste aus- oder einblenden")
                 }
             }
         }
@@ -90,14 +113,14 @@ struct StatusLine: View {
 }
 
 private extension View {
-    /// Antippen führt nach oben wie bei der Statusleiste des Systems; die ganze Höhe der Zeile nimmt es an
-    @ViewBuilder func scrollsToTop(_ action: (() -> Void)?) -> some View {
+    /// Nimmt das Tippen auf der ganzen Höhe der Zeile an; ohne Aktion bleibt alles, wie es ist
+    @ViewBuilder func tappable(_ action: (() -> Void)?, hint: String) -> some View {
         if let action {
             frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
                 .onTapGesture(perform: action)
                 .accessibilityAddTraits(.isButton)
-                .accessibilityHint("Nach oben")
+                .accessibilityHint(hint)
         } else {
             self
         }

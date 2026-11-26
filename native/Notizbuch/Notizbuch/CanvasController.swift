@@ -12,6 +12,8 @@ import Combine
 final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilInteractionDelegate {
     var onToggleMenus: () -> Void = {}
     var onToggleEraser: () -> Void = {}
+    /// Pencil Pro zweimal hin und her gedreht: Lasso ↔ Stift
+    var onToggleLasso: () -> Void = {}
     var onFlash: (String) -> Void = { _ in }
     /// Hinweis mit eigener Anzeigedauer; leerer Text blendet ihn aus
     var onFlashTimed: (String, Double) -> Void = { _, _ in }
@@ -416,6 +418,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         pointerFlush?.cancel()
         // Verschwindet die Fläche, während der Pencil schwebt, kommt das Ende des Schwebens vielleicht nie an
         pencilHovering = false
+        roll.reset()
         busyRetry?.cancel()
         busyRetry = nil
         applyPending()
@@ -490,6 +493,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     /// Schwebt der Pencil, oder schwebte er eben noch? Die kurze Nachfrist deckt den Moment zwischen dem Ende des
     /// Schwebens und dem Aufsetzen ab, in dem der neue Strich noch nicht gemeldet ist, und PencilKits Aufräumen danach
     private var pencilNear: Bool { pencilHovering || Date().timeIntervalSince(lastHoverEnd) < 0.25 }
+    /// Zählt im Schweben, ob der Pencil Pro zweimal hin und her gedreht wird (dann zum Lasso)
+    private var roll = PencilRoll()
     private var pendingWork: DispatchWorkItem?
     private var pending = RemoteChanges()
     /// Seitenzahl, die ein anderes Gerät nach Löschen oder Einfügen gemeldet hat (nur Notizbücher)
@@ -796,12 +801,6 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
         sendView()
-    }
-
-    /// Wie ein Tippen auf die Statusleiste des Systems: ganz nach oben. Am iPad steht statt ihr die eigene Zeile, und
-    /// ein Tippen auf deren Uhrzeit oder Akku tut dasselbe
-    func scrollToTop() {
-        canvas.setContentOffset(CGPoint(x: canvas.contentOffset.x, y: -canvas.contentInset.top), animated: true)
     }
 
     func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
@@ -1223,13 +1222,32 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         case .began, .changed:
             pencilHovering = true
             lockScrolling()
-            if erasing && eraseStart == nil { moveCursor(to: g.location(in: view)) }
+            let point = g.location(in: view)
+            if erasing && eraseStart == nil { moveCursor(to: point) }
+            // Pencil Pro zweimal hin und her gedreht? Andere Pencils (und Maus, Trackpad) melden immer 0
+            if #available(iOS 17.5, *) {
+                if roll.add(roll: Double(g.rollAngle), time: CACurrentMediaTime(), x: Double(point.x), y: Double(point.y)) {
+                    rolled(at: point)
+                }
+            }
         default:
             if pencilHovering { lastHoverEnd = Date() }
             pencilHovering = false
+            roll.reset()
             unlockScrollingSoon()
             if eraseStart == nil { eraserCursor.isHidden = true }
         }
+    }
+
+    /// Pencil Pro zweimal hin und her gedreht (Wunsch 25.11.): zum Lasso, vom Lasso zurück zum Stift, mit einem kurzen
+    /// Tippen im Pencil. Nicht im Nur-Sehen-Modus: Dort gibt es kein Lasso
+    private func rolled(at point: CGPoint) {
+        guard !viewOnly else { return }
+        if #available(iOS 17.5, *), let feedback = holdFeedback as? UICanvasFeedbackGenerator {
+            feedback.pathCompleted(at: point)
+        }
+        Log.ink.info("Pencil zweimal hin und her gedreht: Lasso umschalten")
+        onToggleLasso()
     }
 
     // MARK: Handballen: solange der Pencil schwebt oder schreibt, bewegt sich die Seite nicht
@@ -1680,6 +1698,8 @@ extension CanvasController {
 
     /// Löscht Seiten samt ihren Notizen; die Seiten darunter rücken nach
     func deletePages(_ pages: Set<Int>, done: @escaping (String?) -> Void) {
+        // Schon verlassen (etwa die Uhrzeit getippt, während ein Menü noch zuging): nichts mehr an der Datei ändern
+        guard !left else { done("Das Dokument ist schon geschlossen"); return }
         guard !restructuring else { done("Einen Moment, die letzte Änderung läuft noch"); return }
         var gone = pages.filter { layout.frames.indices.contains($0) }
         guard !gone.isEmpty else { done(nil); return }
@@ -1727,6 +1747,7 @@ extension CanvasController {
 
     /// Fügt eine leere karierte Seite ein, sodass sie Seite `index` wird
     func insertBlankPage(at index: Int, done: @escaping (String?) -> Void) {
+        guard !left else { done("Das Dokument ist schon geschlossen"); return }
         guard !restructuring else { done("Einen Moment, die letzte Änderung läuft noch"); return }
         let j = min(max(index, 0), layout.frames.count)
         let mapping: (Int) -> Int? = { i in i >= j ? i + 1 : i }
@@ -1778,6 +1799,7 @@ extension CanvasController {
 
     /// Macht die letzte Seitenänderung rückgängig
     func undoPageChange(done: @escaping (String?) -> Void) {
+        guard !left else { done("Das Dokument ist schon geschlossen"); return }
         guard let undo = pageUndo, !restructuring else { done(nil); return }
         pageUndo = nil
         restructuring = true
@@ -2746,6 +2768,7 @@ extension CanvasController {
     /// Danach steht der Stand der Fragen im Protokoll („Asks-Debug: …“)
     /// - `debug/link…`: Vorschau auf das Ziel eines Links (siehe `debugLink`, Protokoll „Link-Debug: …“)
     /// - `debug/pen`: die fünf Stiftbreiten, wie PencilKit sie hier zeichnet (Protokoll „Link-Debug: Stift …“)
+    /// - `debug/roll…`: Pencil Pro zweimal hin und her drehen (siehe `debugRoll`, Protokoll „Rolle-Debug: …“)
     func debugCommand(_ url: URL) {
         let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         func value(_ name: String) -> String? { items.first { $0.name == name }?.value }
@@ -2931,10 +2954,8 @@ extension CanvasController {
             // Zum Prüfen im Simulator: Was kosten die Aliase beim Erfassen der IDs? &n= Striche (Vorgabe 20000)
             let n = value("n").flatMap { Int($0) } ?? 20000
             return NSLog("Link-Debug: IDs Zeit: %@", DebugMeasure.idTiming(n: n))
-        case "/top":
-            // Wie ein Tippen auf Uhrzeit oder Akku der eigenen Zeile am iPad
-            scrollToTop()
-            return NSLog("Link-Debug: nach oben, Ziel y %.0f", Double(-canvas.contentInset.top))
+        case "/roll":
+            return debugRoll(items)
         case "/pen":
             // Wie dick die fünf Stufen hier eingestellt werden: PencilKit begrenzt die Breite je Tinte
             let pen = PKInkingTool.InkType.pen.validWidthRange
@@ -3037,6 +3058,60 @@ extension CanvasController {
             }
             log("Stand: pv \(self.currentPagesVersion), \(self.layout.frames.count) Seiten, "
                 + "\(self.askOverlay.subviews.count) Markierungen: " + state.joined(separator: "; "))
+        }
+    }
+
+    /// - `debug/roll?deg=40&n=4&ms=200&move=0`: Pencil Pro im Schweben gedreht (der Simulator kennt keinen Rollwinkel):
+    ///   n Drehungen zu je deg Grad im Wechsel, jede ms Millisekunden lang, 120 Werte je Sekunde; die Spitze wandert
+    ///   dabei move Punkte nach rechts. `&around`: um die Ruhelage (+deg, −deg, +deg, …) statt 0, deg, 0, …
+    ///   `&hover=2500`: danach so viele Millisekunden still weiter schweben (der Rest der Drehungen darf auch dann nicht
+    ///   noch einmal zählen). Geht durch dieselbe Zählung wie das Schweben und schaltet wie dort um. Protokoll
+    ///   „Rolle-Debug: …“: wie oft erkannt, und kurz danach das Werkzeug
+    private func debugRoll(_ items: [URLQueryItem]) {
+        // Nur endliche Werte in vernünftigen Grenzen (Int(Double) bräche bei nan oder 1e300 ab)
+        func number(_ name: String, _ fallback: Double, _ range: ClosedRange<Double>) -> Double {
+            guard let v = items.first(where: { $0.name == name })?.value.flatMap({ Double($0) }), v.isFinite else {
+                return fallback
+            }
+            return min(max(v, range.lowerBound), range.upperBound)
+        }
+        let deg = number("deg", 40, -360...360), ms = number("ms", 200, 10...5000), move = number("move", 0, -2000...2000)
+        let n = Int(number("n", 4, 0...100)), hover = number("hover", 0, 0...10_000)
+        let around = items.contains { $0.name == "around" }
+        let steps = max(Int((ms / 1000 * 120).rounded()), 1)
+        let x0 = Double(view.bounds.midX), y = Double(view.bounds.midY)
+        var time = CACurrentMediaTime()
+        var hits = 0
+        var angle = 0.0, x = x0
+        roll.reset()
+        for i in 0..<n {
+            let low = around ? -deg : 0.0
+            let from = i == 0 ? 0.0 : (i % 2 == 0 ? low : deg), to = i % 2 == 0 ? deg : low
+            for s in 1...steps {
+                time += 1.0 / 120
+                let u = Double(s) / Double(steps)
+                angle = (from + (to - from) * (1 - cos(Double.pi * u)) / 2) * Double.pi / 180
+                x = x0 + move * (Double(i) + u) / Double(n)
+                if roll.add(roll: angle, time: time, x: x, y: y) {
+                    hits += 1
+                    rolled(at: CGPoint(x: x, y: y))
+                }
+            }
+        }
+        for _ in 0..<Int((hover / 1000 * 120).rounded()) {
+            time += 1.0 / 120
+            if roll.add(roll: angle, time: time, x: x, y: y) {
+                hits += 1
+                rolled(at: CGPoint(x: x, y: y))
+            }
+        }
+        roll.reset()
+        NSLog("Rolle-Debug: %ld Drehungen zu %.0f°%@ je %.0f ms, Spitze %.0f Punkte%@: erkannt %ld×", n, deg,
+              around ? " um die Ruhelage" : "", ms, move, hover > 0 ? ", dann \(Int(hover)) ms schwebend" : "", hits)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            let tool = self.lasso ? "Lasso" : self.erasing ? "Radierer" : self.pointing ? "Zeigestift" : "Stift"
+            NSLog("Rolle-Debug: Werkzeug jetzt %@ (PencilKit: %@)", tool, String(describing: type(of: self.canvas.tool)))
         }
     }
 
