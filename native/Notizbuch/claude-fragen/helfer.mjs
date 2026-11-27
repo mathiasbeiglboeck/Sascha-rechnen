@@ -2005,6 +2005,21 @@ try {
   W = weitere = null;
   log("Weitere Seiten aus:", e.message);
 }
+// LaTeX-Modus (latex.mjs): Projektordner mit notizbuch.json beobachten und ins Notizbuch setzen. Fehlt das Modul oder
+// geht es nicht, läuft alles andere wie bisher
+try {
+  const X = await import(new URL("./latex.mjs", import.meta.url));
+  const upload = async (p, bytes) => {
+    const res = await fetch(config.url + p, {
+      method: "PUT", headers: { Authorization: `Bearer ${config.key}`, "content-type": "application/pdf" }, body: bytes,
+      signal: AbortSignal.timeout(120000),
+    });
+    if (!res.ok) throw new HTTPError(res.status, await res.text().catch(() => ""));
+  };
+  X.create({ api, upload, log, getConfig: () => config }).start();
+} catch (e) {
+  log("LaTeX-Modus aus:", e.message);
+}
 prune();
 {
   const bin = findClaude();
