@@ -2,28 +2,36 @@ import AVFoundation
 import SwiftUI
 
 /// Runs the camera, keeps the last minutes as compressed frames in memory,
-/// shows them live or delayed, records, and saves replays to Photos.
+/// shows them delayed (not mirrored, like a played-back video) and saves
+/// replays to Photos. A small live preview helps to set the phone up.
 ///
 /// Threads: `sessionQueue` configures the capture session; everything about
-/// frames (encoder, buffer, replay, recorder) lives on the serial `dataQueue`;
+/// frames (encoder, buffer, replay) lives on the serial `dataQueue`;
 /// @Published properties change on the main thread only.
 final class CameraEngine: NSObject, ObservableObject,
                           AVCaptureVideoDataOutputSampleBufferDelegate,
                           AVCaptureAudioDataOutputSampleBufferDelegate,
                           @unchecked Sendable {
 
-    static let delayChoices = [5, 10, 15, 20, 30, 45, 60, 90, 120]
-    /// Saving a replay starts this many seconds before the moment being shown.
-    static let saveLeadIn = 30.0
+    /// Volume up/down walk through these steps.
+    static let delayChoices = [20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80, 90, 100, 110, 120]
+    static let defaultDelay = 40
+    /// The buffer always holds the longest delay (plus a little), so a longer
+    /// delay can be shown at once.
+    private static let keepSec = Double(delayChoices.last!) + 10
 
     // MARK: Main thread state
+    @Published private(set) var bufferedSeconds: Double = 0
     @Published private(set) var isRecording = false
     @Published private(set) var recordingStart = Date()
-    @Published private(set) var bufferedSeconds: Double = 0
     @Published private(set) var toast: String?
     @Published private(set) var permissionDenied = false
-    /// Delay in seconds, 0 = live.
-    @Published private(set) var delay = 0
+    /// Delay in seconds.
+    @Published private(set) var delay = CameraEngine.defaultDelay
+    /// Width / height of the upright picture (3/4 for a 4:3 sensor format).
+    @Published private(set) var aspect: CGFloat = 3.0 / 4.0
+    /// Bumped on every delay change, so the view can flash the new value.
+    @Published private(set) var delayChangeCount = 0
 
     let session = AVCaptureSession()
     let previewLayer = AVCaptureVideoPreviewLayer()
@@ -50,13 +58,15 @@ final class CameraEngine: NSObject, ObservableObject,
     private var generation = 0
     private var frames: [Frame] = []
     private var firstSeq = 0                 // sequence number of frames[0]
-    private var audio: [CMSampleBuffer] = []
+    private struct Sound { let sb: CMSampleBuffer; let t: Double }
+    private var audio: [Sound] = []
     private var hasAudio = false
-    private var delaySec = 0.0
-    private var keepSec = 100.0              // how much the buffer holds
+    private var delaySec = Double(CameraEngine.defaultDelay)
     private var feedSeq: Int?                // next frame to hand to the replay
     private var hideBefore = 0.0             // frames before this are decoded but not shown
     private var recorder: ClipWriter?
+    private var recSeq: Int?                 // next frame for the recording
+    private var recAudioT = -Double.infinity // audio up to this time is in the recording
     private var feedTimer: DispatchSourceTimer?
     private var lastPublish = 0.0
 
@@ -73,7 +83,6 @@ final class CameraEngine: NSObject, ObservableObject,
         previewLayer.videoGravity = .resizeAspect
         displayLayer.videoGravity = .resizeAspect
         displayLayer.controlTimebase = timebase
-        displayLayer.isHidden = true
 
         // Center Stage would follow and crop the picture: keep the full, fixed view.
         AVCaptureDevice.centerStageControlMode = .app
@@ -124,97 +133,76 @@ final class CameraEngine: NSObject, ObservableObject,
         }
     }
 
-    /// `remembered` is the last delay other than live: the buffer keeps that much
-    /// even in live mode, so switching back shows the replay right away.
-    func setDelay(_ seconds: Int, remembered: Int) {
+    func setDelay(_ seconds: Int) {
+        guard seconds != delay else { return }
         delay = seconds
-        displayLayer.isHidden = seconds == 0
-        previewLayer.isHidden = seconds != 0
+        delayChangeCount += 1
         dataQueue.async {
-            let changed = self.delaySec != Double(seconds)
             self.delaySec = Double(seconds)
-            self.keepSec = Double(max(seconds, remembered)) + Self.saveLeadIn + 10
-            if seconds == 0 {
-                self.feedSeq = nil
-                self.renderer.flush(removingDisplayedImage: true, completionHandler: nil)
-            } else if changed {
-                self.resync()
-            }
+            self.resync()
         }
     }
 
-    /// Volume button or the big button: stop a recording, otherwise save the
-    /// replay (delayed mode) or start a recording (live mode).
-    func primaryAction() {
-        let angle = rotationCoordinator?.videoRotationAngleForHorizonLevelCapture ?? 90
-        if isRecording {
-            stopRecording()
-        } else if delay > 0 {
-            saveReplay(angle: angle)
+    /// Volume up (+1) and down (-1): one step longer or shorter.
+    func stepDelay(_ direction: Int) {
+        let steps = Self.delayChoices
+        let i = steps.firstIndex(where: { $0 >= delay }) ?? steps.count - 1
+        let j: Int
+        if direction > 0 {
+            j = steps[i] > delay ? i : min(i + 1, steps.count - 1)
         } else {
-            startRecording(angle: angle)
+            j = max(i - 1, 0)
+        }
+        if steps[j] == delay {
+            delayChangeCount += 1          // still flash the value at the end of the range
+        } else {
+            setDelay(steps[j])
         }
     }
 
-    private func startRecording(angle: CGFloat) {
+    /// The record button: records the delayed video, from the moment shown
+    /// when pressed until the moment shown at the second press.
+    func toggleRecording() {
+        if isRecording { stopRecording() } else { startRecording() }
+    }
+
+    private func startRecording() {
+        let angle = rotationCoordinator?.videoRotationAngleForHorizonLevelCapture ?? 90
+        let transform = Self.transform(forAngle: angle)
         isRecording = true
         recordingStart = Date()
-        let transform = Self.transform(forAngle: angle)
         dataQueue.async {
-            self.recorder = ClipWriter(transform: transform, audioSettings: self.audioSettings(),
-                                       waitWhenBusy: false)
-            self.encoder?.forceKeyframe = true
+            guard let writer = ClipWriter(transform: transform, audioSettings: self.audioSettings(),
+                                          waitWhenBusy: false) else {
+                self.show("Aufnahme fehlgeschlagen.")
+                DispatchQueue.main.async { self.isRecording = false }
+                return
+            }
+            self.recorder = writer
+            let shown = CMTimebaseGetTime(self.timebase).seconds
+            // Start at the keyframe just before the moment on screen (at most 1 s earlier).
+            if let i = self.frames.lastIndex(where: { $0.key && $0.t <= shown })
+                ?? self.frames.firstIndex(where: { $0.key }) {
+                self.recSeq = self.firstSeq + i
+                self.recAudioT = self.frames[i].t - 0.001
+            } else {
+                self.recSeq = self.firstSeq + self.frames.count
+                self.recAudioT = -.infinity
+            }
         }
     }
 
     private func stopRecording() {
         isRecording = false
         dataQueue.async {
+            self.feedRecorder(upTo: CMTimebaseGetTime(self.timebase).seconds)
             guard let r = self.recorder else { return }
             self.recorder = nil
+            self.recSeq = nil
             r.finish { url in
-                guard let url else { self.show("Aufnahme fehlgeschlagen."); return }
+                guard let url else { self.show("Nichts aufgenommen."); return }
                 ClipWriter.saveToPhotos(url) { ok, msg in
                     self.show(ok ? "Aufnahme in Fotos gespeichert" : (msg ?? ""))
-                }
-            }
-        }
-    }
-
-    /// Saves from `saveLeadIn` seconds before the moment being replayed up to now.
-    private func saveReplay(angle: CGFloat) {
-        show("Speichere …", seconds: 10)
-        let transform = Self.transform(forAngle: angle)
-        dataQueue.async {
-            guard let newest = self.frames.last?.t else { self.show("Noch nichts aufgenommen."); return }
-            let from = newest - self.delaySec - Self.saveLeadIn
-            guard let start = self.frames.lastIndex(where: { $0.key && $0.t <= from })
-                    ?? self.frames.firstIndex(where: { $0.key }) else {
-                self.show("Noch nichts aufgenommen.")
-                return
-            }
-            let startTime = self.frames[start].t
-            let video = self.frames[start...].map(\.sb)
-            let sound = self.audio.filter { $0.ptsSeconds >= startTime }
-            let settings = self.audioSettings()
-            DispatchQueue.global(qos: .userInitiated).async {
-                guard let w = ClipWriter(transform: transform, audioSettings: settings, waitWhenBusy: true) else {
-                    self.show("Speichern fehlgeschlagen.")
-                    return
-                }
-                var i = 0, j = 0
-                while i < video.count || j < sound.count {
-                    if j >= sound.count || (i < video.count && video[i].ptsSeconds <= sound[j].ptsSeconds) {
-                        w.appendVideo(video[i]); i += 1
-                    } else {
-                        w.appendAudio(sound[j]); j += 1
-                    }
-                }
-                w.finish { url in
-                    guard let url else { self.show("Speichern fehlgeschlagen."); return }
-                    ClipWriter.saveToPhotos(url) { ok, msg in
-                        self.show(ok ? "Wiederholung in Fotos gespeichert" : (msg ?? ""))
-                    }
                 }
             }
         }
@@ -249,23 +237,33 @@ final class CameraEngine: NSObject, ObservableObject,
         return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
     }
 
-    /// The largest 4:3 format up to 1920 wide that does 30 fps; then the widest field of view.
+    /// The format that shows the most of the scene (widest field of view in
+    /// both directions, so nothing is cut off), up to 1920 pixels on the long
+    /// side and 30 fps; among equals the sharper one.
     private static func bestFormat(_ device: AVCaptureDevice) -> AVCaptureDevice.Format? {
         func dims(_ f: AVCaptureDevice.Format) -> CMVideoDimensions {
             CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+        }
+        func coverage(_ f: AVCaptureDevice.Format) -> Double {
+            let d = dims(f)
+            let h = Double(f.videoFieldOfView) * .pi / 180
+            let v = 2 * atan(tan(h / 2) * Double(d.height) / Double(d.width))
+            return (h * v * 100).rounded()        // tiny differences count as equal
         }
         let candidates = device.formats.filter { f in
             let d = dims(f)
             let sub = CMFormatDescriptionGetMediaSubType(f.formatDescription)
             guard sub == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
                     || sub == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange else { return false }
-            guard Int(d.width) * 3 == Int(d.height) * 4, d.width <= 1920 else { return false }
+            guard max(d.width, d.height) <= 1920, d.width > 0, d.height > 0 else { return false }
             return f.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }
         }
         return candidates.max { a, b in
+            let ca = coverage(a), cb = coverage(b)
+            if ca != cb { return ca < cb }
             let da = dims(a), db = dims(b)
-            if da.width != db.width { return da.width < db.width }
-            if a.videoFieldOfView != b.videoFieldOfView { return a.videoFieldOfView < b.videoFieldOfView }
+            let pa = Int(da.width) * Int(da.height), pb = Int(db.width) * Int(db.height)
+            if pa != pb { return pa < pb }
             return CMFormatDescriptionGetMediaSubType(a.formatDescription) != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         }
     }
@@ -309,7 +307,13 @@ final class CameraEngine: NSObject, ObservableObject,
             let frame = CMTime(value: 1, timescale: 30)
             device.activeVideoMinFrameDuration = frame
             device.activeVideoMaxFrameDuration = frame
+            if device.isGeometricDistortionCorrectionSupported {
+                device.isGeometricDistortionCorrectionEnabled = false   // correction trims the edges
+            }
             device.unlockForConfiguration()
+            let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            let upright = CGFloat(min(d.width, d.height)) / CGFloat(max(d.width, d.height))
+            DispatchQueue.main.async { self.aspect = upright }
         } else {
             session.sessionPreset = .high
         }
@@ -353,7 +357,6 @@ final class CameraEngine: NSObject, ObservableObject,
             encoder = VideoEncoder(width: w, height: h) { [weak self] encoded in
                 self?.dataQueue.async { self?.handleEncoded(encoded, generation: gen) }
             }
-            if recorder != nil { encoder?.forceKeyframe = true }
         }
         encoder?.encode(pb, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
     }
@@ -363,9 +366,8 @@ final class CameraEngine: NSObject, ObservableObject,
         let t = sb.ptsSeconds
         if let last = frames.last, t <= last.t { return }
         frames.append(Frame(sb: sb, t: t, key: sb.isKeyframe))
-        recorder?.appendVideo(sb)
 
-        let limit = t - keepSec
+        let limit = t - Self.keepSec
         var drop = 0
         while drop < frames.count - 1, frames[drop].t < limit { drop += 1 }
         if drop > 0 {
@@ -373,7 +375,7 @@ final class CameraEngine: NSObject, ObservableObject,
             firstSeq += drop
         }
         var dropAudio = 0
-        while dropAudio < audio.count, audio[dropAudio].ptsSeconds < limit { dropAudio += 1 }
+        while dropAudio < audio.count, audio[dropAudio].t < limit { dropAudio += 1 }
         if dropAudio > 0 { audio.removeFirst(dropAudio) }
 
         if t - lastPublish > 0.25 {
@@ -385,8 +387,7 @@ final class CameraEngine: NSObject, ObservableObject,
 
     private func handleAudio(_ sb: CMSampleBuffer) {
         guard let copy = sb.audioDeepCopy() else { return }
-        audio.append(copy)
-        recorder?.appendAudio(copy)
+        audio.append(Sound(sb: copy, t: copy.ptsSeconds))
     }
 
     private func audioSettings() -> [String: Any]? {
@@ -410,8 +411,8 @@ final class CameraEngine: NSObject, ObservableObject,
     private func resync() {
         feedSeq = nil
         guard delaySec > 0, let newest = frames.last?.t else { return }
-        renderer.flush(removingDisplayedImage: true, completionHandler: nil)
         let target = newest - delaySec
+        renderer.flush(removingDisplayedImage: target < frames[0].t, completionHandler: nil)
         CMTimebaseSetTime(timebase, time: CMTime(seconds: target, preferredTimescale: 90_000))
         CMTimebaseSetRate(timebase, rate: 1)
         guard let start = frames.lastIndex(where: { $0.key && $0.t <= target })
@@ -420,9 +421,32 @@ final class CameraEngine: NSObject, ObservableObject,
         hideBefore = target
     }
 
+    /// The recording follows the replay: every frame (and its sound) that has
+    /// reached the screen goes into the file. A shorter delay makes the replay
+    /// jump ahead, the recording then still gets the frames in between; a longer
+    /// delay makes it wait, nothing is recorded twice.
+    private func feedRecorder(upTo shown: Double) {
+        guard let r = recorder, var seq = recSeq else { return }
+        seq = max(seq, firstSeq)
+        while seq - firstSeq < frames.count {
+            let f = frames[seq - firstSeq]
+            if f.t > shown { break }
+            for a in audio {
+                if a.t <= recAudioT { continue }
+                if a.t > f.t { break }
+                r.appendAudio(a.sb)
+                recAudioT = a.t
+            }
+            r.appendVideo(f.sb)
+            seq += 1
+        }
+        recSeq = seq
+    }
+
     /// Called every 10 ms: hands the replay the frames due in the next half second.
     private func feed() {
         guard delaySec > 0, !frames.isEmpty else { return }
+        if recorder != nil { feedRecorder(upTo: CMTimebaseGetTime(timebase).seconds) }
         if renderer.status == .failed || renderer.requiresFlushToResumeDecoding { resync(); return }
         guard var seq = feedSeq, seq >= firstSeq else { resync(); return }
         let now = CMTimebaseGetTime(timebase).seconds

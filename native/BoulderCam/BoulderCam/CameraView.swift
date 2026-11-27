@@ -2,30 +2,45 @@ import AVFoundation
 import AVKit
 import SwiftUI
 
-/// Hosts the live preview and the delayed replay, and listens to the volume buttons.
-struct CameraView: UIViewRepresentable {
+/// The delayed replay. Also listens to the volume buttons: up = longer delay,
+/// down = shorter delay.
+struct ReplayView: UIViewRepresentable {
     let engine: CameraEngine
 
-    func makeUIView(context: Context) -> CameraHostView { CameraHostView(engine: engine) }
-    func updateUIView(_ view: CameraHostView, context: Context) {}
+    func makeUIView(context: Context) -> LayerHostView {
+        let view = LayerHostView(hosted: engine.displayLayer)
+        // Only delivered while the capture session runs and the app is in front.
+        // Primary = volume down (and Camera Control), secondary = volume up.
+        let interaction = AVCaptureEventInteraction(
+            primary: { [weak engine] event in
+                if event.phase == .began { engine?.stepDelay(-1) }
+            },
+            secondary: { [weak engine] event in
+                if event.phase == .began { engine?.stepDelay(+1) }
+            })
+        view.addInteraction(interaction)
+        return view
+    }
+
+    func updateUIView(_ view: LayerHostView, context: Context) {}
 }
 
-final class CameraHostView: UIView {
-    private let engine: CameraEngine
+/// The small live picture for aiming the phone.
+struct LiveView: UIViewRepresentable {
+    let engine: CameraEngine
 
-    init(engine: CameraEngine) {
-        self.engine = engine
+    func makeUIView(context: Context) -> LayerHostView { LayerHostView(hosted: engine.previewLayer) }
+    func updateUIView(_ view: LayerHostView, context: Context) {}
+}
+
+final class LayerHostView: UIView {
+    private let hosted: CALayer
+
+    init(hosted: CALayer) {
+        self.hosted = hosted
         super.init(frame: .zero)
         backgroundColor = .black
-        layer.addSublayer(engine.previewLayer)
-        layer.addSublayer(engine.displayLayer)
-
-        // Volume up and down (and the Camera Control button where there is one).
-        // Only delivered while the capture session runs and the app is in front.
-        let interaction = AVCaptureEventInteraction { [weak engine] event in
-            if event.phase == .ended { engine?.primaryAction() }
-        }
-        addInteraction(interaction)
+        layer.addSublayer(hosted)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -34,8 +49,7 @@ final class CameraHostView: UIView {
         super.layoutSubviews()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        engine.previewLayer.frame = bounds
-        engine.displayLayer.frame = bounds
+        hosted.frame = bounds
         CATransaction.commit()
     }
 }
