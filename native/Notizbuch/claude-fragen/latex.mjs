@@ -576,8 +576,40 @@ export function create({ api, upload, log, getConfig, now = Date.now, run = runF
     return { strokes: out, top };
   }
 
-  /// Setzt ein Dokument neu und tauscht es im Notizbuch aus. Grund: für das Protokoll
-  async function build(project, file, why) {
+  /// Striche löschen und zur Sicherheit aufheben (.notizbuch/<Name>/geloescht/<Zeit>.json: id und Daten je Strich)
+  async function eraseStrokes(dir, docId, list, top) {
+    if (!list.length) return 0;
+    const backup = path.join(dir, "geloescht");
+    fs.mkdirSync(backup, { recursive: true });
+    fs.writeFileSync(path.join(backup, `${new Date(now()).toISOString().replace(/[:.]/g, "-")}.json`),
+      JSON.stringify(list.map((it) => ({ id: it.id, data: JSON.stringify(it.wire) }))));
+    for (let k = 0; k < list.length; k += 300) {
+      await api("POST", `/api/doc/${docId}/sync`, { json: { since: top, add: [], remove: list.slice(k, k + 300).map((it) => it.id) } });
+    }
+    return list.length;
+  }
+
+  /// Rechteck einer Frage (anchor: Seite ab 0, x/y/w/h auf der Seite) in Koordinaten des Dokuments
+  const anchorRect = (anchor, pages) => {
+    const f = pages && anchor && anchor.page >= 0 ? pageFrames(pages)[anchor.page] : null;
+    return f ? { x0: anchor.x - 4, y0: f.top + anchor.y - 4, x1: anchor.x + anchor.w + 4, y1: f.top + anchor.y + anchor.h + 4 } : null;
+  };
+  const inside = (b, r) => r && b.x0 >= r.x0 && b.x1 <= r.x1 && b.y0 >= r.y0 && b.y1 <= r.y1;
+
+  function wiresOf(all) {
+    const items = [];
+    for (const [id, data] of all.strokes) {
+      let wire;
+      try { wire = JSON.parse(data); } catch { continue; }
+      const box = wire && wire.p ? strokeBox(wire) : null;
+      if (box) items.push({ id, wire, box });
+    }
+    return items;
+  }
+
+  /// Setzt ein Dokument neu und tauscht es im Notizbuch aus. Grund: für das Protokoll. opts (nach einem umgesetzten
+  /// Auftrag): erase = Stelle des Auftrags (anchor), dessen Striche weg; dropChanged = Striche an umgeschriebenen Stellen weg
+  async function build(project, file, why, opts = {}) {
     const key = path.join(project.dir, file);
     if (busy.has(key)) return { skipped: true };
     busy.add(key);
@@ -601,7 +633,17 @@ export function create({ api, upload, log, getConfig, now = Date.now, run = runF
         try { fs.copyFileSync(r.a4pdf, path.join(project.dir, file.replace(/\.tex$/, ".pdf"))); } catch {}
       }
       const hash = hashFiles(project.dir, inputs) + ":" + createHash("sha256").update(fs.readFileSync(r.pdf)).digest("hex");
-      if (zustand.hash === hash && zustand.doc) return { ok: true, unchanged: true };
+      if (zustand.hash === hash && zustand.doc) {
+        // Der Auftrag stand hier, geändert wurde ein anderes Dokument: nur den Auftrag wegräumen
+        let erased = 0;
+        const rect = opts.erase && anchorRect(opts.erase, zustand.pages);
+        if (rect) {
+          const all = await strokes(zustand.doc);
+          erased = await eraseStrokes(dir, zustand.doc, wiresOf(all).filter((it) => inside(it.box, rect)), all.top);
+          if (erased) log(`LaTeX: ${project.name}/${file}: ${erased} Striche des Auftrags gelöscht`);
+        }
+        return { ok: true, unchanged: true, erased };
+      }
       const sync = readSynctex(r.synctex);
       const pageCount = Math.max(1, ...sync.rows.map((x) => x.page));
       const pages = pagesFromAux(r.aux, pageCount);
@@ -620,7 +662,7 @@ export function create({ api, upload, log, getConfig, now = Date.now, run = runF
       const title = file.replace(/\.tex$/, "");
       const nowS = now() / 1000;
       const version = Math.max(now(), (meta?.pagesVersion || 0) + 1, (meta?.pdfVersion || 0) + 1);
-      let moved = 0, changed = 0;
+      let moved = 0, changed = 0, erased = 0;
       if (!meta) {
         const id = randomUUID().toUpperCase();
         await upload(`/api/pdf/${id}`, fs.readFileSync(r.pdf));
@@ -633,6 +675,7 @@ export function create({ api, upload, log, getConfig, now = Date.now, run = runF
         const oldSync = fs.existsSync(path.join(dir, "stand", "synctex.gz")) ? readSynctex(path.join(dir, "stand", "synctex.gz")) : null;
         let plan = [];
         let all = null;
+        const gone = []; // Striche, die nach einem Auftrag wegkommen
         if (oldSync && zustand.pages) {
           const oldFiles = new Map();
           for (const [tag, p] of oldSync.inputs) {
@@ -647,12 +690,12 @@ export function create({ api, upload, log, getConfig, now = Date.now, run = runF
             if (before !== null) maps.set(rel, lineMap(before, after));
           }
           all = await strokes(meta.id);
-          const items = [];
-          for (const [id, data] of all.strokes) {
-            let wire;
-            try { wire = JSON.parse(data); } catch { continue; }
-            const box = wire && wire.p ? strokeBox(wire) : null;
-            if (box) items.push({ id, wire, box });
+          let items = wiresOf(all);
+          // Der umgesetzte Auftrag selbst: weg statt verschieben
+          const rect = opts.erase && anchorRect(opts.erase, zustand.pages);
+          if (rect) {
+            gone.push(...items.filter((it) => inside(it.box, rect)));
+            items = items.filter((it) => !inside(it.box, rect));
           }
           plan = planMoves(groupStrokes(items), { sync: oldSync, frames: pageFrames(zustand.pages), files: oldFiles }, neu, maps);
         }
@@ -668,6 +711,8 @@ export function create({ api, upload, log, getConfig, now = Date.now, run = runF
           const taken = new Set(all.strokes.keys());
           for (const mv of plan) {
             if (mv.changed) changed += mv.items.length;
+            // Korrekturen an Stellen, die der Auftrag umgeschrieben hat (etwa Durchgestrichenes): weg
+            if (mv.changed && opts.dropChanged) { gone.push(...mv.items); continue; }
             if (Math.abs(mv.dy) < 0.5) continue;
             for (const it of mv.items) {
               const wire = shifted(it.wire, 0, mv.dy);
@@ -684,8 +729,9 @@ export function create({ api, upload, log, getConfig, now = Date.now, run = runF
               json: { since: all.top, add: add.slice(k, k + 300), remove: remove.slice(k, k + 300) } });
           }
         }
+        if (gone.length) erased = await eraseStrokes(dir, meta.id, gone, all.top);
         log(`LaTeX: ${project.name}/${file} neu gesetzt (${pageCount} S., ${moved} Striche verschoben, ${changed} an ` +
-          `umgeschriebenen Stellen, ${Math.round((now() - t0) / 1000)} s, ${why})`);
+          `umgeschriebenen Stellen, ${erased} gelöscht, ${Math.round((now() - t0) / 1000)} s, ${why})`);
       }
       // Stand festhalten: Quellen und SyncTeX dieses PDFs
       const stand = path.join(dir, "stand");
@@ -700,7 +746,7 @@ export function create({ api, upload, log, getConfig, now = Date.now, run = runF
       fs.rmSync(stand, { recursive: true, force: true });
       fs.renameSync(stand + ".neu", stand);
       writeJSON(zustandFile, { doc: meta.id, hash, pages, version, gesetzt: new Date(now()).toISOString() });
-      return { ok: true, doc: meta.id, moved, changed };
+      return { ok: true, doc: meta.id, moved, changed, erased };
     } finally {
       busy.delete(key);
     }
@@ -809,10 +855,11 @@ export function create({ api, upload, log, getConfig, now = Date.now, run = runF
   }
 
   /// Gleich alle Dokumente des Projekts neu setzen (nach einem Auftrag), ohne die Ruhezeit. Ergebnis je Datei
-  async function buildProject(project, why) {
+  /// opts gilt nur für die Datei opts.file (das Dokument des Auftrags)
+  async function buildProject(project, why, opts = {}) {
     const results = [];
     for (const file of mainFiles(project)) {
-      try { results.push({ file, ...(await build(project, file, why)) }); }
+      try { results.push({ file, ...(await build(project, file, why, file === opts.file ? opts : {})) }); }
       catch (e) { results.push({ file, ok: false, error: e.message }); }
     }
     return results;

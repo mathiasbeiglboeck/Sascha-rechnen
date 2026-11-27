@@ -118,6 +118,28 @@ if (!fs.existsSync(path.join(texbin, "latexmk"))) {
   ok(lib.get(r.doc).pdfVersion > meta.pdfVersion && lib.get(r.doc).pagesVersion === lib.get(r.doc).pdfVersion, "neue PDF-Version");
   ok([...strokes.values()].every((v) => { const w = JSON.parse(v.data); return w.dy !== undefined; }), "dx/dy gesetzt");
 
+  // Nach einem Auftrag: Auftrag (in seinem Rechteck) und Korrekturen an umgeschriebenen Stellen weg, Rest bleibt
+  {
+    const z3 = JSON.parse(fs.readFileSync(path.join(proj, ".notizbuch", "antrag", "zustand.json"), "utf8"));
+    const yA = rowY(z3.pages, "ZIELZEILE");
+    const auftrag = [wire(100, yA - 30), wire(130, yA - 28)];
+    const ids = auftrag.map(put);
+    const n0 = strokes.size;
+    // Korrektur auf der Zeile, die gleich umgeschrieben wird (die mit „Ganz anders“)
+    put(wire(300, rowY(z3.pages, "Ganz anders") - 2));
+    const top = L.pageFrames(z3.pages)[0].top;
+    const anchor = { page: 0, x: 95, y: yA - 30 - top - 5, w: 70, h: 12 };
+    fs.writeFileSync(path.join(proj, "antrag.tex"), fs.readFileSync(path.join(proj, "antrag.tex"), "utf8")
+      .replace("Ganz anders formuliert.", "Noch einmal neu formuliert, etwas länger als vorher."));
+    const r5 = await H.build(project, "antrag.tex", "Auftrag", { erase: anchor, dropChanged: true });
+    // Gelöscht: der Auftrag (2), die Korrektur (1) und der frühere Strich, der schon an dieser Stelle hing (1)
+    ok(r5.ok && r5.erased === 4, "Auftrag und Korrekturen gelöscht", JSON.stringify(r5));
+    ok(ids.every((id) => !strokes.has(id)) && strokes.size === n0 + 1 - 4, "Wort an der Zielzeile bleibt", `${strokes.size} vs ${n0}`);
+    const backups = fs.readdirSync(path.join(proj, ".notizbuch", "antrag", "geloescht"));
+    ok(backups.length === 1 && JSON.parse(fs.readFileSync(path.join(proj, ".notizbuch", "antrag", "geloescht", backups[0]), "utf8")).length === 4,
+      "gelöschte Striche aufgehoben");
+  }
+
   // Fehler im Dokument: nichts ausgetauscht, fehler.txt da
   const before = lib.get(r.doc).pdfVersion;
   fs.writeFileSync(path.join(proj, "antrag.tex"), doc(["\\undefinedmacro"]));

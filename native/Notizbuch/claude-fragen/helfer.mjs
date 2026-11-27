@@ -1099,8 +1099,14 @@ async function latexClaudeHeld(job, dir, files, level, lx) {
   let text = result.text;
   if (LX.projectStamp(project) === before) return { ...result, latex: true };
   // Geändert: gleich neu setzen; bei einem LaTeX-Fehler bekommt Claude ihn zurück (höchstens zweimal)
+  // Das Dokument des Auftrags: danach der Auftrag selbst und Korrekturen an umgeschriebenen Stellen weg (aufgehoben in
+  // .notizbuch/<Name>/geloescht/), nur einmal, im ersten gelungenen Lauf
+  let cleaned = false, erased = 0;
   for (let round = 0; ; round++) {
-    const built = await LX.buildProject(project, "Auftrag");
+    const built = await LX.buildProject(project, "Auftrag",
+      cleaned ? {} : { file, erase: job.anchor, dropChanged: true });
+    const mine = built.find((b) => b.file === file);
+    if (mine && mine.ok) { cleaned = true; erased += mine.erased || 0; }
     const bad = built.filter((b) => b.ok === false);
     if (!bad.length) break;
     if (round >= 2 || current?.cancelled) {
@@ -1114,7 +1120,7 @@ async function latexClaudeHeld(job, dir, files, level, lx) {
   }
   const hash = await LX.commit(project, `Auftrag vom iPad (${job.doc.title || file}): ${text.split("\n")[0].slice(0, 120)}`)
     .catch(() => null);
-  log(job.id, `LaTeX-Auftrag umgesetzt in ${project.name}${hash ? ` (git ${hash})` : ""}`);
+  log(job.id, `LaTeX-Auftrag umgesetzt in ${project.name}${hash ? ` (git ${hash})` : ""}, ${erased} Striche weggeräumt`);
   return { ...result, text, latex: true };
 }
 
