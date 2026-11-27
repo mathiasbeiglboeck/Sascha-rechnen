@@ -15,7 +15,7 @@ struct BoulderCamApp: App {
 struct ContentView: View {
     @StateObject private var cam = CameraEngine()
     @Environment(\.scenePhase) private var scenePhase
-    @AppStorage("verzoegerung") private var savedDelay = CameraEngine.defaultDelay
+    @AppStorage("verzoegerungSekunden") private var savedDelay = CameraEngine.defaultDelay
     @AppStorage("useBack") private var useBack = false
     @State private var flashDelay = false
     @State private var flashToken = 0

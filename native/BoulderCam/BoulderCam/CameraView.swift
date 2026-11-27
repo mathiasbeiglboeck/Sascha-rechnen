@@ -29,7 +29,7 @@ struct ReplayView: UIViewRepresentable {
 struct LiveView: UIViewRepresentable {
     let engine: CameraEngine
 
-    func makeUIView(context: Context) -> LayerHostView { LayerHostView(hosted: engine.previewLayer) }
+    func makeUIView(context: Context) -> LayerHostView { LayerHostView(hosted: engine.liveLayer) }
     func updateUIView(_ view: LayerHostView, context: Context) {}
 }
 

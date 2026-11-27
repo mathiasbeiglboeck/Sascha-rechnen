@@ -15,7 +15,7 @@ final class CameraEngine: NSObject, ObservableObject,
 
     /// Volume up/down walk through these steps.
     static let delayChoices = [20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80, 90, 100, 110, 120]
-    static let defaultDelay = 40
+    static let defaultDelay = 30
     /// The buffer always holds the longest delay (plus a little), so a longer
     /// delay can be shown at once.
     private static let keepSec = Double(delayChoices.last!) + 10
@@ -34,9 +34,12 @@ final class CameraEngine: NSObject, ObservableObject,
     @Published private(set) var delayChangeCount = 0
 
     let session = AVCaptureSession()
-    let previewLayer = AVCaptureVideoPreviewLayer()
+    /// The live picture: the same upright frames as the replay, shown at once.
+    let liveLayer = AVSampleBufferDisplayLayer()
     let displayLayer: AVSampleBufferDisplayLayer
     private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+    /// Last clear portrait/landscape orientation (flat on a table does not count).
+    private var lastOrientation = UIDeviceOrientation.portrait
     private var toastToken = 0
     private var wantBack = false
 
@@ -79,8 +82,7 @@ final class CameraEngine: NSObject, ObservableObject,
                                         sourceClock: CMClockGetHostTimeClock(), timebaseOut: &tb)
         timebase = tb!
         super.init()
-        previewLayer.session = session
-        previewLayer.videoGravity = .resizeAspect
+        liveLayer.videoGravity = .resizeAspect
         displayLayer.videoGravity = .resizeAspect
         displayLayer.controlTimebase = timebase
 
@@ -93,7 +95,17 @@ final class CameraEngine: NSObject, ObservableObject,
         timer.setEventHandler { [weak self] in self?.feed() }
         timer.resume()
         feedTimer = timer
+
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        NotificationCenter.default.addObserver(forName: UIDevice.orientationDidChangeNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            let o = UIDevice.current.orientation
+            if o.isPortrait || o.isLandscape { self?.lastOrientation = o }
+        }
     }
+
+    /// Diagnose output (shows in `devicectl device process launch --console`).
+    static func diag(_ text: String) { NSLog("BoulderCam-DIAG %@", text) }
 
     // MARK: - Controls (main thread)
 
@@ -167,8 +179,8 @@ final class CameraEngine: NSObject, ObservableObject,
     }
 
     private func startRecording() {
-        let angle = rotationCoordinator?.videoRotationAngleForHorizonLevelCapture ?? 90
-        let transform = Self.transform(forAngle: angle)
+        let transform = Self.transform(for: lastOrientation, back: wantBack)
+        Self.diag("record start: orientation=\(lastOrientation.rawValue) back=\(wantBack) coordinatorCapture=\(rotationCoordinator?.videoRotationAngleForHorizonLevelCapture ?? -1)")
         isRecording = true
         recordingStart = Date()
         dataQueue.async {
@@ -219,12 +231,19 @@ final class CameraEngine: NSObject, ObservableObject,
         }
     }
 
-    /// Frames are always stored upright for portrait. When the phone stands
-    /// sideways, the file gets a rotation so Photos shows it the right way up.
-    private static func transform(forAngle angle: CGFloat) -> CGAffineTransform {
-        var extra = (angle - 90).truncatingRemainder(dividingBy: 360)
-        if extra < 0 { extra += 360 }
-        return CGAffineTransform(rotationAngle: extra * .pi / 180)
+    /// Frames are stored upright for a phone standing in portrait. When it
+    /// stands sideways, the file gets a rotation so Photos shows it the right
+    /// way up. The front camera's frames are not mirrored, which turns the
+    /// direction of the needed rotation around.
+    private static func transform(for orientation: UIDeviceOrientation, back: Bool) -> CGAffineTransform {
+        let degrees: CGFloat
+        switch orientation {
+        case .landscapeLeft: degrees = back ? -90 : 90     // top of the phone points left
+        case .landscapeRight: degrees = back ? 90 : -90
+        case .portraitUpsideDown: degrees = 180
+        default: degrees = 0
+        }
+        return CGAffineTransform(rotationAngle: degrees * .pi / 180)
     }
 
     // MARK: - Session setup (session queue)
@@ -318,7 +337,16 @@ final class CameraEngine: NSObject, ObservableObject,
             session.sessionPreset = .high
         }
 
+        Self.diag("device=\(device.deviceType.rawValue) pos=\(device.position.rawValue) formats:")
+        for f in device.formats {
+            let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+            let sub = CMFormatDescriptionGetMediaSubType(f.formatDescription)
+            Self.diag("  \(d.width)x\(d.height) sub=\(String(format: "%08x", sub)) fov=\(f.videoFieldOfView) maxfps=\(f.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0)")
+        }
+        let ad = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+        Self.diag("active=\(ad.width)x\(ad.height) fov=\(device.activeFormat.videoFieldOfView)")
         if let c = videoOut.connection(with: .video) {
+            Self.diag("conn before: angle=\(c.videoRotationAngle) sup90=\(c.isVideoRotationAngleSupported(90)) sup0=\(c.isVideoRotationAngleSupported(0)) mirrored=\(c.isVideoMirrored)")
             if c.isVideoRotationAngleSupported(90) { c.videoRotationAngle = 90 }
             if c.isVideoMirroringSupported {
                 c.automaticallyAdjustsVideoMirroring = false
@@ -327,17 +355,14 @@ final class CameraEngine: NSObject, ObservableObject,
             if c.isVideoStabilizationSupported { c.preferredVideoStabilizationMode = .off }
         }
         session.commitConfiguration()
+        if let c = videoOut.connection(with: .video) {
+            Self.diag("conn after commit: angle=\(c.videoRotationAngle) mirrored=\(c.isVideoMirrored)")
+        }
 
         DispatchQueue.main.async {
-            if let c = self.previewLayer.connection {
-                if c.isVideoRotationAngleSupported(90) { c.videoRotationAngle = 90 }
-                if c.isVideoMirroringSupported {
-                    c.automaticallyAdjustsVideoMirroring = false
-                    c.isVideoMirrored = false
-                }
-            }
-            self.rotationCoordinator = AVCaptureDevice.RotationCoordinator(device: device,
-                                                                           previewLayer: self.previewLayer)
+            let coord = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil)
+            self.rotationCoordinator = coord
+            Self.diag("orientation=\(UIDevice.current.orientation.rawValue) coordinatorCapture=\(coord.videoRotationAngleForHorizonLevelCapture) coordinatorPreview=\(coord.videoRotationAngleForHorizonLevelPreview)")
         }
     }
 
@@ -350,8 +375,10 @@ final class CameraEngine: NSObject, ObservableObject,
             return
         }
         guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        showLive(sampleBuffer)
         let w = Int32(CVPixelBufferGetWidth(pb)), h = Int32(CVPixelBufferGetHeight(pb))
         if encoder == nil || encoder?.width != w || encoder?.height != h {
+            Self.diag("first frame: buffer=\(w)x\(h) connAngle=\(connection.videoRotationAngle) mirrored=\(connection.isVideoMirrored)")
             generation += 1
             let gen = generation
             encoder = VideoEncoder(width: w, height: h) { [weak self] encoded in
@@ -359,6 +386,21 @@ final class CameraEngine: NSObject, ObservableObject,
             }
         }
         encoder?.encode(pb, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+    }
+
+    private func showLive(_ sb: CMSampleBuffer) {
+        let live = liveLayer.sampleBufferRenderer
+        if live.status == .failed || live.requiresFlushToResumeDecoding {
+            live.flush(removingDisplayedImage: false, completionHandler: nil)
+        }
+        guard live.isReadyForMoreMediaData,
+              let arr = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true),
+              CFArrayGetCount(arr) > 0 else { return }
+        let dict = unsafeBitCast(CFArrayGetValueAtIndex(arr, 0), to: CFMutableDictionary.self)
+        CFDictionarySetValue(dict,
+                             Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                             Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        live.enqueue(sb)
     }
 
     private func handleEncoded(_ sb: CMSampleBuffer, generation gen: Int) {
