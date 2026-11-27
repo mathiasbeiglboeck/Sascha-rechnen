@@ -42,6 +42,8 @@ const EFFORTS = ["quick", "thorough"];
 const MODES = ["write"];
 const MAX_NOTES = 100;
 const MAX_NOTE_CHARS = 8000;
+/// So oft schreibt Claude eine Antwort noch einmal, weil sich die Seiten änderten, während es schrieb (answerAsk)
+const MAX_REWRITES = 2;
 const NOTE_COLORS = ["blue", "red", "green", "black", "orange", "purple"];
 const NOTE_SIZES = ["small", "normal", "large"];
 // Lernwörter: Das geschriebene Wort geht als Frage an den Helfer, im Pseudo-Dokument LERN_DOC (kein echtes Dokument,
@@ -813,42 +815,61 @@ export class Store extends DurableObject {
     this.deleteBlob(`ask/${askId}/pages`);
   }
 
-  /// Nach dem Löschen oder Einfügen von Seiten: body {pv, anchors: {askId: anchor | null}}, null heißt, die Seite der
-  /// Frage ist weg (die Frage mit). Wie bei pagesVersion nie zurück zu einer älteren Seitenordnung. Dazu, für Fragen von
-  /// „Claude schreiben lassen“, notes: {askId: [Notiz]} (siehe cleanNotes, Seite −1 erlaubt): die Notizen an ihren neuen
-  /// Stellen, auch ohne Seitenänderung (eine Notiz gelöscht). Sie ersetzen die bisherigen
+  /// Nach dem Löschen oder Einfügen von Seiten: body {pv, anchors: {askId: anchor | null}, notes?, notesUnknown?}, null
+  /// heißt, die Seite der Frage ist weg (die Frage mit). Wie bei pagesVersion nie zurück zu einer älteren Seitenordnung.
+  /// Für Fragen von „Claude schreiben lassen“: notes: {askId: [Notiz]} (siehe cleanNotes, Seite −1 erlaubt), die Notizen
+  /// an ihren neuen Stellen, auch ohne Seitenänderung (eine Notiz gelöscht), werden mit den gespeicherten
+  /// zusammengeführt (mergeNotes: Es bleiben nur Notizen, die beide haben; die Seiten des Geräts gelten, wenn die Frage
+  /// danach auf seinem Seitenstand steht). notesUnknown: [askId], Fragen, deren Notizen das Gerät beim Verschieben nicht
+  /// kannte: Ihre Notizen auf der alten Seite der Frage rücken mit, die übrigen fallen weg (Hinweis in der Antwort).
+  /// Je Frage ein SELECT und höchstens ein UPDATE
   moveAsks(doc, body) {
     const pv = Math.max(0, Math.trunc(Number(body?.pv) || 0));
-    const entries = body?.anchors && typeof body.anchors === "object" ? Object.entries(body.anchors) : [];
-    const noteEntries = body?.notes && typeof body.notes === "object" ? Object.entries(body.notes) : [];
+    const anchors = body?.anchors && typeof body.anchors === "object" ? body.anchors : {};
+    const notesIn = body?.notes && typeof body.notes === "object" ? body.notes : {};
+    // notesUnknown: Fragen von „Claude schreiben lassen“, deren Notizen das Gerät beim Verschieben nicht kannte (die
+    // Antwort kam erst danach). Nur für sie ordnet der Server seine Notizen der neuen Stelle zu; ältere Apps schicken
+    // die Liste nicht, dann bleibt es wie bisher
+    const unknown = new Set(Array.isArray(body?.notesUnknown) ? body.notesUnknown.filter((id) => typeof id === "string") : []);
+    const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
     const gone = [];
     let v = 0;
     this.ctx.storage.transactionSync(() => {
-      for (const [askId, list] of noteEntries) {
-        const row = this.sql.exec("SELECT id, pv, info FROM asks WHERE id = ? AND doc = ?", askId, doc).toArray()[0];
-        const notes = cleanNotes(list, true);
-        if (!row || row.pv > pv || !notes) continue;
-        const info = JSON.parse(row.info || "{}");
-        if (info.mode !== "write") continue;
-        info.notes = notes;
-        v = v || this.nextAsksV();
-        this.sql.exec("UPDATE asks SET info = ?, updated = ?, v = ? WHERE id = ?",
-          JSON.stringify(info), Date.now() / 1000, v, askId);
-      }
-      for (const [askId, a] of entries) {
-        const row = this.sql.exec("SELECT id, status, pv FROM asks WHERE id = ? AND doc = ?", askId, doc).toArray()[0];
-        // Seite −1: Die Seite der Frage wurde gelöscht, Rückgängig ist noch möglich (die Apps zeigen sie nicht)
-        const anchor = a === null ? null : cleanAnchor(a, true);
-        if (!row || row.pv > pv || (a !== null && !anchor)) continue;
-        if (!anchor) {
-          gone.push(row);
+      for (const askId of new Set([...Object.keys(anchors), ...Object.keys(notesIn)])) {
+        const row = this.sql.exec("SELECT id, status, pv, anchor, answer, info FROM asks WHERE id = ? AND doc = ?",
+          askId, doc).toArray()[0];
+        if (!row) continue;
+        const a = own(anchors, askId) ? anchors[askId] : undefined;
+        if (a === null) {
+          if (row.pv <= pv) gone.push(row);
           continue;
         }
+        // Seite −1: Die Seite der Frage wurde gelöscht, Rückgängig ist noch möglich (die Apps zeigen sie nicht)
+        const anchor = a === undefined ? null : cleanAnchor(a, true);
+        const move = Boolean(anchor) && row.pv <= pv;
+        const sent = own(notesIn, askId);
+        let info = null, notes = null, answer = row.answer;
+        if (sent || (move && row.pv < pv && unknown.has(askId))) {
+          info = JSON.parse(row.info || "{}");
+          const stored = info.mode === "write" && Array.isArray(info.notes) ? info.notes : null;
+          if (sent && stored) {
+            const incoming = cleanNotes(notesIn[askId], true);
+            // Die Seiten des Geräts gelten, wenn die Frage danach auf seinem Seitenstand steht (sie zieht mit diesem
+            // PATCH dorthin um oder steht schon dort); sonst wirkt nur das Entfernen
+            if (incoming) notes = mergeNotes(stored, incoming, move || row.pv === pv);
+          } else if (!sent && stored?.length) {
+            const r = notesOnAnchorPage(stored, JSON.parse(row.anchor).page, anchor.page);
+            notes = r.kept;
+            answer = (answer || "") + pagesChangedHint(r.dropped);
+          }
+          if (notes && JSON.stringify(notes) === JSON.stringify(stored)) notes = null;
+        }
+        if (!move && !notes) continue;
+        if (notes) info.notes = notes;
         v = v || this.nextAsksV();
-        this.sql.exec(
-          "UPDATE asks SET anchor = ?, pv = ?, updated = ?, v = ? WHERE id = ?",
-          JSON.stringify(anchor), pv, Date.now() / 1000, v, askId,
-        );
+        this.sql.exec("UPDATE asks SET anchor = ?, pv = ?, answer = ?, info = ?, updated = ?, v = ? WHERE id = ?",
+          move ? JSON.stringify(anchor) : row.anchor, move ? pv : row.pv, answer,
+          notes ? JSON.stringify(info) : row.info, Date.now() / 1000, v, askId);
       }
     });
     if (v) this.asksChanged(doc, v);
@@ -901,13 +922,17 @@ export class Store extends DurableObject {
       return fail("Aufgegeben", "failed", 409);
     }
     const claim = crypto.randomUUID();
+    const info = JSON.parse(row.info || "{}"), anchor = JSON.parse(row.anchor);
+    // „Claude schreiben lassen“: Seitenstand und Seite der Frage, auf die sich Claudes Notizen beziehen (answerAsk)
+    const stored = info.mode === "write"
+      ? JSON.stringify({ ...info, claimPv: row.pv, claimPage: anchor?.page ?? -1 }) : row.info;
     let v;
     this.ctx.storage.transactionSync(() => {
       v = this.nextAsksV();
       this.sql.exec(
-        "UPDATE asks SET status = 'claimed', lease = ?, claim = ?, retries = ?, note = NULL, updated = ?, v = ? " +
-          "WHERE id = ?",
-        now + lease, claim, retries, now, v, askId,
+        "UPDATE asks SET status = 'claimed', lease = ?, claim = ?, retries = ?, note = NULL, updated = ?, v = ?, " +
+          "info = ? WHERE id = ?",
+        now + lease, claim, retries, now, v, stored, askId,
       );
     });
     this.asksChanged(row.doc, v);
@@ -915,11 +940,11 @@ export class Store extends DurableObject {
     const meta = d ? JSON.parse(d.meta) : {};
     const image = (name) =>
       this.sql.exec("SELECT size, type FROM blobmeta WHERE key = ?", `ask/${askId}/${name}`).toArray()[0] || null;
-    const info = JSON.parse(row.info || "{}"), anchor = JSON.parse(row.anchor);
     return json({
       id: askId, claim, leaseUntil: now + lease, anchor, pv: row.pv, effort: row.effort,
       created: row.created, from: info.from || null, mode: info.mode || null,
-      // Seit wie vielen Sekunden die Frage am Server liegt (ältere Fragen: seit dem Fragen auf dem Gerät)
+      // Seit wie vielen Sekunden die Frage am Server liegt (ältere Fragen: seit dem Fragen auf dem Gerät; nach
+      // pages-changed seit dem Neustellen, rewriteAsk)
       age: Math.max(0, now - (Number(info.arrived) || Number(row.created) || now)),
       ...(row.doc === KARTEN_DOC ? { karten: { hinweis: info.hinweis || null } } : {}),
       ...(row.doc === LERN_DOC ? { lern: { wort: info.wort, satz: info.satz || null, versuch: info.versuch || 1, gelesen: info.gelesen || null } } : {}),
@@ -943,7 +968,11 @@ export class Store extends DurableObject {
   /// Der Helfer meldet sich zurück, mit dem claim seines Auftrags. JSON {claim, markdown}: beantwortet;
   /// {claim, error}: gescheitert (die App zeigt den Text); {claim, release: true, note?, retryAfter?, count?}: zurück
   /// in die Warteschlange, frühestens nach retryAfter Sekunden (etwa am Nutzungslimit; die App zeigt note). Statt JSON geht
-  /// auch text/markdown mit ?claim=…. Wiederholt er eine Antwort (Antwort verloren), ändert sich nichts
+  /// auch text/markdown mit ?claim=…. Wiederholt er eine Antwort (Antwort verloren), ändert sich nichts.
+  /// „Claude schreiben lassen“ mit Notizen, nachdem sich der Seitenstand seit der Übernahme geändert hat: Stehen alle
+  /// Notizen auf der Seite der Frage, rücken sie mit ihr; sonst 409 pages-changed, und die Frage ist wieder offen (Claude
+  /// schreibt noch einmal, höchstens MAX_REWRITES-mal; danach nur die Notizen auf der Seite der Frage, mit Hinweis). Ist
+  /// die Seite der Frage gelöscht (−1), gleich ohne Notizen, mit Hinweis
   async answerAsk(askId, request, url) {
     const raw = (request.headers.get("content-type") || "").startsWith("text/markdown");
     const body = raw
@@ -977,7 +1006,7 @@ export class Store extends DurableObject {
           "UPDATE asks SET status = 'open', claim = NULL, lease = ?, retries = ?, note = ?, updated = ?, v = ? " +
             "WHERE id = ?",
           now + retryAfter, retries,
-          typeof body.note === "string" && body.note ? body.note.slice(0, 300) : null, now, v, askId,
+          typeof body.note === "string" && body.note ? clip(body.note, 300) : null, now, v, askId,
         );
       });
       this.asksChanged(row.doc, v);
@@ -986,13 +1015,41 @@ export class Store extends DurableObject {
     if (typeof body.markdown === "string" && body.markdown.trim()) {
       if (body.markdown.length > MAX_ANSWER_CHARS) return fail("Antwort zu lang", "too-large", 413);
       // Notizen fürs Dokument („Claude schreiben lassen“): Nur bei Fragen dieser Art
-      const notes = JSON.parse(row.info || "{}").mode === "write" ? cleanNotes(body.notes) : null;
-      return json({ ok: true, v: this.finishAsk(row, "answered", { answer: body.markdown, notes }) });
+      const info = JSON.parse(row.info || "{}");
+      let notes = info.mode === "write" ? cleanNotes(body.notes) : null, answer = body.markdown;
+      // Die Seiten änderten sich, während Claude schrieb: Seine Seitennummern gelten nicht mehr
+      if (notes?.length && Number.isInteger(info.claimPv) && info.claimPv !== row.pv) {
+        const anchor = JSON.parse(row.anchor);
+        const rewrites = Number(info.rewrites) || 0;
+        const { kept, dropped } = notesOnAnchorPage(notes, info.claimPage, anchor.page);
+        if (dropped && anchor.page >= 0 && rewrites < MAX_REWRITES) return this.rewriteAsk(row, info, rewrites + 1);
+        notes = kept;
+        answer += pagesChangedHint(dropped);
+      }
+      return json({ ok: true, v: this.finishAsk(row, "answered", { answer, notes }) });
     }
     if (typeof body.error === "string") {
-      return json({ ok: true, v: this.finishAsk(row, "failed", { note: body.error.slice(0, 2000) || "Fehler" }) });
+      return json({ ok: true, v: this.finishAsk(row, "failed", { note: clip(body.error, 2000) || "Fehler" }) });
     }
     return fail("markdown, error oder release fehlt", "bad-body", 400);
+  }
+
+  /// Zurück in die Warteschlange, damit Claude mit den neuen Seitennummern noch einmal schreibt (die Bilder bleiben).
+  /// Zählt nicht zu den Fehlversuchen (retries)
+  rewriteAsk(row, info, rewrites) {
+    const now = Date.now() / 1000;
+    let v;
+    this.ctx.storage.transactionSync(() => {
+      v = this.nextAsksV();
+      this.sql.exec(
+        "UPDATE asks SET status = 'open', claim = NULL, lease = ?, note = ?, updated = ?, v = ?, info = ? WHERE id = ?",
+        now, "Die Seiten haben sich geändert: Claude schreibt noch einmal", now, v,
+        JSON.stringify({ ...info, rewrites, arrived: now }), row.id,
+      );
+    });
+    this.asksChanged(row.doc, v);
+    this.broadcast(null, { type: "ask" }, "helper");
+    return json({ error: "Die Seiten haben sich geändert", code: "pages-changed" }, 409);
   }
 
   finishAsk(row, status, { answer = null, note = null, notes = null } = {}) {
@@ -1206,7 +1263,12 @@ export class Store extends DurableObject {
 /// Name eines Dokuments aus dem Eingang: höchstens 200 Zeichen, ohne ein halbes Zeichenpaar am Ende (etwa von einem
 /// Emoji). Das ergäbe JSON, das die Apps nicht lesen können, und damit hielte die ganze Bibliothek auf allen Geräten an
 function clipTitle(s) {
-  return s.slice(0, 200).replace(/[\uD800-\uDBFF]$/, "");
+  return clip(s, 200);
+}
+
+/// Höchstens n UTF-16-Einheiten, ohne ein halbes Zeichenpaar am Ende (siehe clipTitle)
+function clip(s, n) {
+  return s.slice(0, n).replace(/[\uD800-\uDBFF]$/, "");
 }
 
 /// Markdown im Eingang: ausdrücklich mit ?type=md, oder als Text geschickt (Content-Type text/markdown oder text/plain)
@@ -1416,7 +1478,7 @@ function cleanNotes(list, detached = false) {
     const page = n.page;
     if (!Number.isInteger(page) || page < (detached ? -1 : 0) || page > 100000) continue;
     if (!frac(n.x) || !frac(n.y) || !frac(n.w, 0.01, 1.2)) continue;
-    const text = typeof n.text === "string" ? n.text.slice(0, MAX_NOTE_CHARS) : "";
+    const text = typeof n.text === "string" ? clip(n.text, MAX_NOTE_CHARS) : "";
     const box = Array.isArray(n.box) && n.box.length === 4 && n.box.every((v) => frac(v)) ? n.box : null;
     if (!text.trim() && !box) continue;
     chars += text.length;
@@ -1428,6 +1490,49 @@ function cleanNotes(list, detached = false) {
     out.push(note);
   }
   return out;
+}
+
+/// Woran eine Notiz zu erkennen ist, gleich auf welcher Seite sie steht
+function noteKey(n) {
+  return JSON.stringify([n.text, n.x, n.y, n.w, n.color ?? null, n.size ?? null, n.box ?? null]);
+}
+
+/// Notizen eines Geräts mit denen am Server zusammenführen: Es bleiben nur Notizen, die beide haben (eine auf dem Gerät
+/// entfernte geht, eine anderswo entfernte kommt nicht wieder; Geräte fügen nie welche hinzu). `newer`: Die Seiten des
+/// Geräts gelten (die Frage steht danach auf seinem Seitenstand)
+function mergeNotes(stored, incoming, newer) {
+  const pages = new Map();
+  for (const n of incoming) {
+    const k = noteKey(n);
+    if (!pages.has(k)) pages.set(k, []);
+    pages.get(k).push(n.page);
+  }
+  const out = [];
+  for (const n of stored) {
+    const list = pages.get(noteKey(n));
+    if (!list?.length) continue;
+    const page = list.shift();
+    out.push(newer ? { ...n, page } : n);
+  }
+  return out;
+}
+
+/// Nach einer Seitenänderung, deren Zuordnung nur für die Seite der Frage bekannt ist (from → to): Deren Notizen rücken
+/// mit, die übrigen fallen weg (alle, wenn die Seite der Frage gelöscht ist). dropped: wie viele sichtbare wegfielen
+function notesOnAnchorPage(notes, from, to) {
+  const kept = [];
+  let dropped = 0;
+  for (const n of notes) {
+    if (Number.isInteger(from) && from >= 0 && to >= 0 && n.page === from) kept.push({ ...n, page: to });
+    else if (n.page >= 0) dropped++;
+  }
+  return { kept, dropped };
+}
+
+function pagesChangedHint(n) {
+  if (!n) return "";
+  return `\n\n*(${n === 1 ? "Eine Notiz fehlt" : `${n} Notizen fehlen`}: Die Seiten des Dokuments haben sich geändert, ` +
+    "als Claude schrieb. Bitte noch einmal fragen.)*";
 }
 
 /// Übernimmt in `target` die Seitenangaben aus `other`, wo sie neuer sind

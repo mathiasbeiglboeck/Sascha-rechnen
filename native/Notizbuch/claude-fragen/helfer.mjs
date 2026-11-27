@@ -435,9 +435,9 @@ async function answer(ask) {
       result = await vokabelClaude(job, level);
     } else {
       // Das PDF am Server ist noch vom Stand vor der Seitenänderung, nach der gefragt wurde (pdfBehind): erst ein
-      // wenig warten, anfangs 5 s, dann länger, höchstens pdfWaitSeconds, seit die Frage am Server ist (kommt der
-      // Seitenstand früher, weckt der Server den Helfer). Nicht, wenn die Seite der Frage gelöscht ist: Dann schneidet
-      // der Helfer nichts nach Seitennummern aus dem PDF
+      // wenig warten, anfangs 5 s, dann länger, höchstens pdfWaitSeconds, seit die Frage am Server ist (nach
+      // pages-changed seit dem Neustellen; kommt der Seitenstand früher, weckt der Server den Helfer). Nicht, wenn die
+      // Seite der Frage gelöscht ist: Dann schneidet der Helfer nichts nach Seitennummern aus dem PDF
       const now = Date.now() / 1000;
       const age = typeof job.age === "number" ? job.age : now - Math.min(Number(job.created) || 0, now);
       const most = typeof config.pdfWaitSeconds === "number" && config.pdfWaitSeconds >= 0
@@ -463,9 +463,20 @@ async function answer(ask) {
       localPause = 0;
       // „Claude schreiben lassen“: die Notizen fürs Dokument aus der Antwort lösen
       const write = !lern && !vok && job.mode === "write" ? splitNotes(result.text, job, files) : null;
-      await reply(ask.id, write ? { claim: job.claim, markdown: write.markdown, notes: write.notes }
+      const sent = await reply(ask.id, write ? { claim: job.claim, markdown: write.markdown, notes: write.notes }
         : { claim: job.claim, markdown: result.text });
-      log(ask.id, `beantwortet nach ${Math.round((Date.now() - t0) / 1000)} s (${result.text.length} Zeichen)` +
+      // „Claude schreiben lassen“: Die Antwort gilt nicht (die Seiten änderten sich, während Claude schrieb, oder die
+      // Frage ist inzwischen neu vergeben), steht aber im Chat: Der nächste Lauf beginnt einen neuen Chat, damit Claude
+      // nicht auf Notizen mit den alten Seitennummern aufbaut. Gelöscht (gone): Der Chat bleibt
+      if (write && (sent === "pages-changed" || sent === "taken")) {
+        const doc = state.docs[job.doc.id];
+        if (doc?.session) {
+          delete doc.session;
+          saveState(state);
+        }
+      }
+      if (sent === "pages-changed") log(ask.id, "Seiten haben sich geändert, während Claude schrieb: noch einmal, in einem neuen Chat");
+      else if (sent === "ok") log(ask.id, `beantwortet nach ${Math.round((Date.now() - t0) / 1000)} s (${result.text.length} Zeichen)` +
         (write ? `, ${write.notes.length} Notizen ins Dokument${write.problem ? ` (${write.problem})` : ""}` : "") +
         (result.denied?.length ? `, abgelehnt: ${result.denied.join(", ")}` : ""));
     } else if (result.auth || result.setup) {
@@ -541,16 +552,20 @@ async function answer(ask) {
   return true;
 }
 
+/// Was aus der Antwort wurde: "ok" angekommen; "pages-changed": Die Seiten änderten sich, während Claude schrieb (der
+/// Server stellt die Frage neu); "gone": inzwischen gelöscht; "taken": inzwischen neu vergeben. Außer bei "ok" verfällt
+/// diese Antwort
 async function reply(id, body) {
   for (let attempt = 0; ; attempt++) {
     try {
       await api("PUT", `/api/asks/${id}/answer`, { json: body });
-      return;
+      return "ok";
     } catch (e) {
+      if (e.status === 409 && e.body?.code === "pages-changed") return "pages-changed";
       // gelöscht (404) oder inzwischen neu vergeben (409): Diese Antwort verfällt
       if (e.status === 404 || e.status === 409) {
         log(id, e.status === 404 ? "inzwischen gelöscht" : "inzwischen neu vergeben");
-        return;
+        return e.status === 404 ? "gone" : "taken";
       }
       // Netz weg: noch zweimal versuchen, damit die Antwort nicht verloren geht
       if (attempt >= 2 || (e.status && e.status < 500)) throw e;
@@ -966,7 +981,8 @@ function prompt(job, files, fresh) {
   }
   lines.push("");
   if (job.mode === "write") {
-    lines.push(WRITE_PROMPT(count));
+    // Beim PDF zählt nur das PDF selbst (wie lastNotePage): Ohne PDFKit keine Zahl, statt einer geratenen
+    lines.push(WRITE_PROMPT(job.doc.kind === "pdf" && !files.pdfOld ? files.total || 0 : count));
     lines.push("");
     lines.push(job.effort === "thorough"
       ? "Arbeite gründlich: prüf sorgfältig, rechne nach und lies dafür die Seiten, die der Auftrag braucht."
@@ -1025,46 +1041,85 @@ function lastNotePage(job, files) {
   return count ? count : null;
 }
 
-/// Trennt die Antwort bei „Claude schreiben lassen“: der Text für die Sprechblase und die Notizen aus dem letzten
-/// Block ```notizen (oder ```json), umgerechnet für den Server: Seite ab 0, Lage als Anteil (0…1). Notizen
-/// außerhalb des Dokuments fallen weg (siehe lastNotePage), die Sprechblase sagt dann, wie viele. `problem`: was nicht
-/// ging (fürs Protokoll)
-function splitNotes(text, job, files) {
-  const blocks = [...text.matchAll(/```(?:notizen|json)[^\n]*\n([\s\S]*?)```/g)];
-  const block = blocks.at(-1);
-  let markdown = block ? (text.slice(0, block.index) + text.slice(block.index + block[0].length)).trim() : text.trim();
-  let raw = null, problem = null;
-  if (!block) {
-    problem = "kein Block mit Notizen";
-  } else {
-    try {
-      raw = JSON.parse(block[1]);
+// Wie der Server (cleanNotes): höchstens 100 Notizen, je 8000 Zeichen, zusammen 200 000
+const MAX_NOTES = 100, MAX_NOTE_CHARS = 8000, MAX_NOTES_CHARS = 200000;
+const clip = (s, n) => s.slice(0, n).replace(/[\uD800-\uDBFF]$/, "");
+
+/// Der Block mit den Notizen: der letzte ```notizen oder ```json, dessen Inhalt JSON mit einem Array ist (direkt oder
+/// unter "notizen"). Er endet am ersten ```, bis zu dem das JSON lesbar ist: So beendet ein ``` im Text einer Notiz
+/// (etwa ein Codeblock) den Block nicht. Ein Block innerhalb eines anderen zählt nicht
+function notesBlock(text) {
+  const found = [];
+  for (const m of text.matchAll(/```(?:notizen|json)[^\n]*\n/g)) {
+    const body = m.index + m[0].length;
+    for (let end = text.indexOf("```", body); end !== -1; end = text.indexOf("```", end + 3)) {
+      let raw;
+      try { raw = JSON.parse(text.slice(body, end)); } catch { continue; }
       if (raw && !Array.isArray(raw) && Array.isArray(raw.notizen)) raw = raw.notizen;
-      if (!Array.isArray(raw)) throw new Error("kein Array");
+      if (Array.isArray(raw)) found.push({ start: m.index, end: end + 3, raw });
+      break;
+    }
+  }
+  return found.filter((b) => !found.some((o) => o !== b && o.start < b.start && b.end <= o.end)).at(-1) || null;
+}
+
+/// Trennt die Antwort bei „Claude schreiben lassen“: der Text für die Sprechblase und die Notizen aus dem letzten
+/// Block ```notizen (oder ```json, siehe notesBlock), umgerechnet für den Server: Seite ab 0, Lage als Anteil (0…1).
+/// Notizen außerhalb des Dokuments fallen weg (siehe lastNotePage), ebenso unvollständige und solche über den Grenzen
+/// des Servers; eine zu lange wird gekürzt. Die Sprechblase sagt dann, wie viele. `problem`: was nicht ging (fürs
+/// Protokoll)
+function splitNotes(text, job, files) {
+  const valid = notesBlock(text);
+  const old = valid ? null : [...text.matchAll(/```(?:notizen|json)[^\n]*\n([\s\S]*?)```/g)].at(-1);
+  const block = valid || (old && { start: old.index, end: old.index + old[0].length });
+  let markdown = block ? (text.slice(0, block.start) + text.slice(block.end)).trim() : text.trim();
+  let raw = valid ? valid.raw : null, problem = null;
+  if (!block) problem = "kein Block mit Notizen";
+  else if (!valid) {
+    try {
+      JSON.parse(old[1]);
+      problem = "Notizen nicht lesbar: kein Array";
     } catch (e) {
       problem = `Notizen nicht lesbar: ${e.message}`;
-      raw = null;
     }
   }
   const last = lastNotePage(job, files);
   const num = (v) => (typeof v === "number" ? v : typeof v === "string" ? Number(v.replace(",", ".").replace("%", "")) : NaN);
   const frac = (v) => { const n = num(v); return Number.isFinite(n) ? Math.min(Math.max(n / 100, -0.2), 1.2) : NaN; };
   const notes = [];
-  let outside = 0;
-  for (const n of raw || []) {
-    if (!n || typeof n !== "object") continue;
+  let outside = 0, invalid = 0, over = 0, cut = 0, chars = 0;
+  for (const item of raw || []) {
+    if (!item || typeof item !== "object") { invalid++; continue; }
+    // Schlüssel gleich in welcher Schreibweise („Seite“, „Text“)
+    const n = Object.fromEntries(Object.entries(item).map(([k, v]) => [k.toLowerCase(), v]));
     const page = Math.round(num(n.seite ?? n.page)) - 1;
-    const x = frac(n.x), y = frac(n.y), w = frac(n.breite ?? n.width ?? n.w);
     const t = n.text ?? n.markdown;
-    const text = typeof t === "string" ? t.trim() : "";
+    const full = typeof t === "string" ? t.trim() : "";
+    const text = clip(full, MAX_NOTE_CHARS);
     const k = Array.isArray(n.kasten ?? n.box) ? (n.kasten ?? n.box).map(frac) : null;
     const box = k && k.length === 4 && k.every(Number.isFinite)
       ? [Math.min(k[0], k[2]), Math.min(k[1], k[3]), Math.max(k[0], k[2]), Math.max(k[1], k[3])] : null;
-    if (!Number.isInteger(page) || page < 0 || !Number.isFinite(x) || !Number.isFinite(y) || (!text && !box)) continue;
-    if (last !== null && page > last) {
+    let x = frac(n.x), y = frac(n.y), w = frac(n.breite ?? n.width ?? n.w);
+    // Nur ein Kasten, ohne Lage: dessen Ecke (die App braucht x und y auch dann)
+    if (!text && box) {
+      if (!Number.isFinite(x)) x = box[0];
+      if (!Number.isFinite(y)) y = box[1];
+      if (!Number.isFinite(w)) w = Math.max(0.01, box[2] - box[0]);
+    }
+    if (!Number.isInteger(page) || page < 0 || !Number.isFinite(x) || !Number.isFinite(y) || (!text && !box)) {
+      invalid++;
+      continue;
+    }
+    if ((last !== null && page > last) || page > 100000) {
       outside++;
       continue;
     }
+    if (notes.length >= MAX_NOTES || chars + text.length > MAX_NOTES_CHARS) {
+      over++;
+      continue;
+    }
+    if (text.length < full.length) cut++;
+    chars += text.length;
     const note = { page, x, y, w: Number.isFinite(w) && w >= 0.01 ? Math.min(w, 1.2) : Math.max(0.05, Math.min(0.9, 0.95 - x)), text };
     const color = NOTE_COLORS[String(n.farbe ?? n.color ?? "").toLowerCase()];
     note.color = color || "blue";
@@ -1074,6 +1129,9 @@ function splitNotes(text, job, files) {
     notes.push(note);
   }
   if (outside) problem = `${outside} außerhalb des Dokuments weggelassen` + (problem ? `; ${problem}` : "");
+  if (invalid) problem = `${invalid} unvollständig weggelassen` + (problem ? `; ${problem}` : "");
+  if (over) problem = `${over} über der Grenze des Servers weggelassen` + (problem ? `; ${problem}` : "");
+  if (cut) problem = `${cut} gekürzt` + (problem ? `; ${problem}` : "");
   if (!markdown) {
     markdown = notes.length ? `${notes.length === 1 ? "Eine Notiz" : `${notes.length} Notizen`} ins Dokument geschrieben.`
       : "Nichts ins Dokument geschrieben.";
@@ -1084,6 +1142,18 @@ function splitNotes(text, job, files) {
   if (outside) {
     markdown += outside === 1 ? "\n\n*(Eine Notiz stand auf einer Seite, die es nicht gibt, und fehlt.)*"
       : `\n\n*(${outside} Notizen standen auf Seiten, die es nicht gibt, und fehlen.)*`;
+  }
+  if (invalid) {
+    markdown += invalid === 1 ? "\n\n*(Eine Notiz war unvollständig und fehlt.)*"
+      : `\n\n*(${invalid} Notizen waren unvollständig und fehlen.)*`;
+  }
+  if (over) {
+    markdown += over === 1 ? "\n\n*(Eine Notiz passte nicht mehr ins Dokument und fehlt.)*"
+      : `\n\n*(${over} Notizen passten nicht mehr ins Dokument und fehlen.)*`;
+  }
+  if (cut) {
+    markdown += cut === 1 ? "\n\n*(Eine Notiz war zu lang und ist gekürzt.)*"
+      : `\n\n*(${cut} Notizen waren zu lang und sind gekürzt.)*`;
   }
   return { markdown, notes, problem };
 }

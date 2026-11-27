@@ -215,6 +215,58 @@ async function main() {
   ok(wn?.notes?.length === 2 && wn.notes[0].page === 1 && wn.notes[1].page === 0, "write, notebook with 2 pages: notes on pages 1 and 2 stay, 12 and 40 go", wn?.notes);
   ok(wn?.answer?.endsWith("*(2 Notizen standen auf Seiten, die es nicht gibt, und fehlen.)*"), "write, notebook: the speech bubble says that two notes are missing", wn?.answer);
   ok(/2 Notizen ins Dokument \(2 außerhalb des Dokuments weggelassen\)/.test(logText()), "write, notebook: logged", logText().split("\n").slice(-4));
+
+  console.log("== Claude schreiben lassen: Seiten ändern sich, während Claude schreibt: noch einmal, in einem neuen Chat");
+  {
+    const wpc = uuid();
+    await api("PUT", `/api/library/${wpc}`, { json: { id: wpc, title: "Seitenwechsel", kind: "notebook", created: now, modified: now, pageCount: 6 } });
+    setMode({ mode: "ok" });
+    const first = await createAsk(wpc, "quick", 1);
+    ok(await waitFor(async () => (await askOf(wpc, first.id)).status === "answered", 15000), "a first question opens the document's chat");
+    const before = calls().filter((x) => x.args).length;
+    setMode({ mode: "writePage", delayMs: 2500 });
+    a = await createAsk(wpc, "quick", 1, { mode: "write" });
+    ok(await waitFor(async () => (await askOf(wpc, a.id)).status === "claimed", 15000, 50), "claimed");
+    // Eine Seite davor eingefügt: Die App verschiebt die Stelle (Seitenstand 1, Seite 3)
+    const moved = await api("PATCH", `/api/doc/${wpc}/asks`, { json: { pv: 1, anchors: { [a.id]: { page: 2, x: 10, y: 20, w: 100, h: 30 } } } });
+    ok(moved.status === 200, "page change while Claude writes", moved.status);
+    setMode({ mode: "writePage" });
+    const done = await waitFor(async () => { const x = await askOf(wpc, a.id); return x.status === "answered" ? x : null; }, 30000);
+    const runs = calls().filter((x) => x.args).slice(before);
+    ok(runs.length === 2 && runs[0].args.includes("--resume") && runs[1].args.includes("--session-id"), "Claude ran twice: first in the document's chat, then in a new chat", runs.map((r) => r.args.filter((x) => /^--(resume|session-id)$/.test(x))));
+    ok(runs[1] && /die ganze Seite 3,/.test(promptOf(runs[1])) && /^Dokument: „Seitenwechsel“/.test(promptOf(runs[1])), "second run: fresh prompt, the question's page in the new numbering", runs[1] && promptOf(runs[1]).slice(0, 400));
+    ok(done && done.pv === 1 && done.anchor.page === 2 && done.notes?.map((n) => n.page).join() === "2,3", "notes in the new numbering: under the question (page 3) and on the page after it", done && { pv: done.pv, anchor: done.anchor.page, notes: done.notes?.map((n) => n.page) });
+    const lines = logText().split("\n").filter((l) => l.includes(a.id));
+    ok(lines.some((l) => /Seiten haben sich geändert, während Claude schrieb: noch einmal, in einem neuen Chat/.test(l)) && lines.filter((l) => /beantwortet nach/.test(l)).length === 1, "logged: the refused run, then one answer", lines);
+  }
+
+  console.log("== Claude schreiben lassen: Grenzfälle der Notizen (nur ein Kasten, andere Schreibweisen, Codeblock, Grenzen des Servers)");
+  {
+    const edge = uuid();
+    await api("PUT", `/api/library/${edge}`, { json: { id: edge, title: "Grenzfälle", kind: "notebook", created: now, modified: now, pageCount: 3 } });
+    const writeAsk = async (mode) => {
+      setMode({ mode });
+      const x = await createAsk(edge, "quick", 0, { mode: "write" });
+      return { id: x.id, done: await waitFor(async () => { const y = await askOf(edge, x.id); return y.status === "answered" ? y : null; }, 15000) };
+    };
+    const logOf = (id) => logText().split("\n").filter((l) => l.includes(id) && /beantwortet nach/.test(l)).join("\n");
+    let w = await writeAsk("writeEdge");
+    const n = w.done?.notes || [];
+    ok(n.length === 3 && n[0].page === 0 && n[0].x === 0.1 && n[0].y === 0.2 && Math.abs(n[0].w - 0.2) < 1e-9 && n[0].text === "" && n[0].box?.join() === "0.1,0.2,0.3,0.25", "a note with only a box: kept, x and y from the box's corner", n[0]);
+    ok(n[1]?.page === 1 && n[1].text === "Groß geschrieben" && n[1].color === "red" && n[1].x === 0.1 && n[1].w === 0.4, "keys in other spellings („Seite“, „Text“, „Farbe“) count", n[1]);
+    ok(n[2]?.text === "Code:\n```python\nprint(1)\n```", "a note with a code block arrives whole (the block does not end at its ```)", n[2]);
+    const bubble = w.done?.answer || "";
+    ok(bubble.startsWith("Drei Notizen gesetzt.\n") && bubble.includes("Zum Format etwa:\n```json\n{\"seite\": 1, \"x\": 10}\n```") && bubble.endsWith("\n\n*(Eine Notiz war unvollständig und fehlt.)*") && !/```notizen|print\(1\)|Groß geschrieben|kasten/.test(bubble), "speech bubble: nothing of the notes leaks into it, a later ```json example does not replace them, the incomplete note is named", bubble);
+    ok(/3 Notizen ins Dokument \(1 unvollständig weggelassen\)/.test(logOf(w.id)), "logged: one incomplete note left out", logOf(w.id));
+    w = await writeAsk("writeMany");
+    ok(w.done?.notes?.length === 100 && w.done.notes.at(-1).text === "Fehler 99" && w.done.answer.endsWith("*(50 Notizen passten nicht mehr ins Dokument und fehlen.)*"), "150 notes: the first 100 stored, the speech bubble says 50 are missing", w.done && { n: w.done.notes?.length, answer: w.done.answer });
+    ok(/100 Notizen ins Dokument \(50 über der Grenze des Servers weggelassen\)/.test(logOf(w.id)), "logged: 50 over the server's limit", logOf(w.id));
+    w = await writeAsk("writeLong");
+    ok(w.done?.notes?.length === 1 && w.done.notes[0].text.length === 7999 && /^a+$/.test(w.done.notes[0].text), "a note cut at 8000 UTF-16 units without half a surrogate pair: 7999 kept", w.done?.notes?.[0]?.text?.length);
+    ok(w.done?.answer?.endsWith("\n\n*(Eine Notiz war zu lang und ist gekürzt.)*"), "speech bubble: says the note was cut", w.done?.answer);
+    ok(/1 Notizen ins Dokument \(1 gekürzt\)/.test(logOf(w.id)), "logged: one note cut", logOf(w.id));
+    for (const x of (await api("GET", `/api/doc/${edge}/asks`)).data.asks) await api("DELETE", `/api/doc/${edge}/asks/${x.id}`);
+  }
   setMode({ mode: "ok" });
 
   console.log("== other document: its own chat; notebook without PDF");
@@ -506,6 +558,13 @@ async function main() {
     ok(promptOf(cw).startsWith("Dokument: „Skript 2“ (PDF).\nDas Dokument liegt in dokument.pdf.\n") && promptOf(cw).includes("\nVon Seite 7 bis 11 gibt es Notizen aus der App nur auf der Seite der Frage; dokument.pdf zeigt das PDF ohne die Notizen aus der App. Notizen auf weiter entfernten Seiten siehst du zu dieser Frage nicht.\ndokument.pdf ist noch der Stand vor der letzten Seitenänderung in der App (das neue PDF ist noch nicht angekommen): Seine Seitennummern können von denen hier abweichen. Es gelten die Seitennummern in dieser Nachricht.\n") && !/seiten-\d+-\d+\.pdf/.test(promptOf(cw)) && calls().filter((x) => x.osascript).length === cuts, "old PDF: no page count, not „das ganze“, no window cut from it, Claude is told", promptOf(cw));
     ok(logText().includes(`${w.id} Unterlagen: Nachbarseiten keine beschrieben (Bereich 7–11), ganzes PDF, noch vom Stand vor der letzten Seitenänderung`), "log says so", logText().split("\n").filter((l) => l.includes("Unterlagen")).slice(-1));
     ok(logText().includes(`${w.id} Unterlagen: Nachbarseiten keine beschrieben (Bereich 7–11), ganzes PDF, noch vom Stand vor der letzten Seitenänderung, weitere Seiten aus: PDF zu alt`), "old PDF: no further pages to read (their numbers would not match)", logText().split("\n").filter((l) => l.includes("Unterlagen")).slice(-1));
+    // Claude schreiben lassen mit dem alten PDF: Zeigt der Bereich nur die Seite der Frage, bleibt diese Zahl im Auftrag
+    setMode({ mode: "write" });
+    const w1 = await createAsk(sk2, "quick", 0, { span: [0, 0], pages: [], pv: 300, mode: "write" });
+    ok(await waitFor(async () => (await askOf(sk2, w1.id)).status === "answered", 15000), "answered at once");
+    const cw1 = calls().filter((x) => x.args).at(-1);
+    ok(promptOf(cw1).includes("(eine leere Seite danach ist recht; das Dokument hat 1 Seite, darüber hinaus gibt es keine).") && /ist noch der Stand vor der letzten Seitenänderung/.test(promptOf(cw1)), "write, old PDF, a range of one page: the task still says the document has 1 page", promptOf(cw1).match(/eine leere Seite[^\n]*/)?.[0]);
+    setMode({ mode: "ok" });
   }
 
   console.log("== denied tools are logged with the answer");
@@ -531,6 +590,12 @@ async function main() {
   const r2 = await askOnce("thorough");
   ok(r.done && r2.done && !/seiten-/.test(promptOf(r.c)) && !/seiten-/.test(promptOf(r2.c)), "answered without a window", [promptOf(r.c), promptOf(r2.c)]);
   ok(logText().split("\n").filter((l) => l.includes("nicht ausgeschnitten") && l.includes("PDFKit kaputt")).length === 1, "failure logged once with the reason");
+  setMode({ mode: "write" });
+  a = await createAsk(doc, "quick", 2, { mode: "write" });
+  const wf = await waitFor(async () => { const x = await askOf(doc, a.id); return x.status === "answered" ? x : null; }, 15000);
+  c = calls().filter((x) => x.args).at(-1);
+  ok(wf && /Diesmal schreibst du ins Dokument/.test(promptOf(c)) && promptOf(c).includes("(eine leere Seite danach ist recht).") && !/darüber hinaus gibt es keine/.test(promptOf(c)), "write, PDF without PDFKit: no page count in the task (it would be a guess)", promptOf(c).match(/eine leere Seite[^\n]*/)?.[0]);
+  setMode({ mode: "ok" });
   ok(r.c.args.includes("--restricted"), "restricted again with the default config");
   setPages({ n: 30 });
 
@@ -545,6 +610,78 @@ async function main() {
     c = calls().filter((x) => x.args).at(-1);
     ok(failed === 2 && !/nachbarseiten/.test(promptOf(c)) && /Zu dieser Frage hast du vom Notizbuch nur diese eine Seite/.test(promptOf(c)) && !fs.existsSync(path.join(HOME, "chats", nb, "fragen", a.id, "nachbarseiten.pdf")), `tried twice (${failed}), prompt says only this page`, promptOf(c));
     ok(logText().includes(`${a.id} Nachbarseiten nicht geladen: HTTP 500`) && logText().includes(`${a.id} Unterlagen: Nachbarseiten nicht geladen`), "logged", logText().split("\n").filter((l) => l.includes(a.id)));
+    await restartWith(() => writeConfig());
+    proxy.close();
+  }
+
+  console.log("== Claude schreiben lassen im PDF: Seiten ändern sich, während Claude schreibt: der neue Lauf wartet aufs geänderte PDF");
+  {
+    // Maßstab: pdfWaitSeconds 2 steht für 180, ein erster Lauf von 3,5 s für einen von mehr als drei Minuten
+    await restartWith(() => { setHelp("new"); writeConfig({ pdfWaitSeconds: 2 }); });
+    setPages({ n: 30 });
+    const sk3 = uuid(), nowR = Date.now() / 1000;
+    await api("PUT", `/api/library/${sk3}`, { json: { id: sk3, title: "Skript 3", kind: "pdf", created: nowR, modified: nowR, pageCount: 4, pdfVersion: 7 } });
+    await api("PUT", `/api/pdf/${sk3}`, { body: new TextEncoder().encode("%PDF-1.4\n" + "x".repeat(5000)), headers: { "content-type": "application/pdf" } });
+    const before = calls().filter((x) => x.args).length;
+    setMode({ mode: "writePage", delayMs: 3500 });
+    const w = await createAsk(sk3, "quick", 1, { mode: "write" });
+    ok(await waitFor(async () => (await askOf(sk3, w.id)).status === "claimed", 15000, 50), "claimed");
+    // Eine Seite davor eingefügt: Die App verschiebt die Stelle (Seitenstand 1, Seite 3); ihr neues PDF und der
+    // Seitenstand kommen erst danach
+    const moved = await api("PATCH", `/api/doc/${sk3}/asks`, { json: { pv: 1, anchors: { [w.id]: { page: 2, x: 10, y: 20, w: 100, h: 30 } } } });
+    ok(moved.status === 200, "page change while Claude writes", moved.status);
+    const lines = () => logText().split("\n").filter((l) => l.includes(w.id));
+    ok(await waitFor(() => lines().some((l) => /Seiten haben sich geändert, während Claude schrieb/.test(l)), 15000, 20), "the answer is refused: pages changed while Claude wrote", lines());
+    setMode({ mode: "writePage" });
+    // Der neue Lauf zählt ab dem Neustellen: Er wartet wie eine neue Frage aufs geänderte PDF, statt das alte zu nehmen
+    ok(await waitFor(() => lines().some((l) => /PDF am Server noch vor der letzten Seitenänderung, neuer Versuch in \d+ s/.test(l)), 5000, 20), "the new run waits for the changed PDF", lines());
+    // Jetzt kommen das neue PDF und danach der Seitenstand, wie die App sie hinauflädt
+    await api("PUT", `/api/pdf/${sk3}`, { body: new TextEncoder().encode("%PDF-1.4\n" + "n".repeat(5200)), headers: { "content-type": "application/pdf" } });
+    await api("PUT", `/api/library/${sk3}`, { json: { id: sk3, title: "Skript 3", kind: "pdf", created: nowR, modified: nowR + 1, pageCount: 5, pdfVersion: 8, pagesVersion: 1 } });
+    const done = await waitFor(async () => { const x = await askOf(sk3, w.id); return x.status === "answered" ? x : null; }, 20000);
+    const runs = calls().filter((x) => x.args).slice(before);
+    const second = runs[1];
+    ok(runs.length === 2 && second.args.includes("--session-id") && Object.keys(second.sizes).some((k) => /seiten-\d+-\d+\.pdf$/.test(k)) && !/ist noch der Stand vor der letzten Seitenänderung/.test(promptOf(second)), "second run: in a new chat, with the page window from the new PDF, not told the PDF is older", runs.map((r) => ({ args: r.args.filter((x) => /^--(resume|session-id)$/.test(x)), files: Object.keys(r.sizes) })));
+    ok(done && done.pv === 1 && done.anchor.page === 2 && done.notes?.map((n) => n.page).join() === "2,3", "answered in the new numbering: under the question (page 3) and on the page after it", done && { pv: done.pv, anchor: done.anchor.page, notes: done.notes?.map((n) => n.page) });
+    await restartWith(() => writeConfig());
+    setMode({ mode: "ok" });
+  }
+
+  console.log("== Claude schreiben lassen: Antwort verfällt (gelöscht: der Chat bleibt; neu vergeben: neuer Chat)");
+  {
+    // Zwischen Helfer und Server: reicht alles durch, nur die nächste Antwort des Helfers bekommt `refuse`
+    let refuse = null;
+    const proxy = await startProxy((req) => {
+      if (!refuse || req.method !== "PUT" || !/^\/api\/asks\/[^/]+\/answer$/.test(req.url)) return null;
+      const r = refuse;
+      refuse = null;
+      return r;
+    });
+    await restartWith(() => writeConfig({ url: proxy.url }));
+    setMode({ mode: "ok" });
+    const vf = uuid();
+    await api("PUT", `/api/library/${vf}`, { json: { id: vf, title: "Verfällt", kind: "notebook", created: now, modified: now, pageCount: 3 } });
+    const answeredIn = async (x) => waitFor(async () => (await askOf(vf, x.id)).status === "answered", 15000);
+    const first = await createAsk(vf, "quick", 0);
+    ok(await answeredIn(first), "a first question opens the document's chat");
+    const sid1 = calls().filter((x) => x.args).at(-1).args.find((x, i, all) => all[i - 1] === "--session-id");
+    // Die Markierung wurde gelöscht, während Claude schrieb: Die Antwort verfällt, der Chat bleibt
+    refuse = [404, { error: "Diese Frage gibt es nicht (mehr)", code: "gone" }];
+    const g = await createAsk(vf, "quick", 1, { mode: "write" });
+    ok(await waitFor(() => logText().includes(`${g.id} inzwischen gelöscht`), 15000, 50), "write answer refused (deleted meanwhile): logged", logText().split("\n").filter((l) => l.includes(g.id)));
+    const q2 = await createAsk(vf, "quick", 1);
+    ok(await answeredIn(q2), "answered");
+    c = calls().filter((x) => x.args).at(-1);
+    ok(sid1 && c.args[c.args.indexOf("--resume") + 1] === sid1 && !logText().split("\n").some((l) => l.includes(g.id) && /beantwortet nach/.test(l)), "deleted: the next question goes on in the document's chat, nothing logged as answered", c.args.filter((x) => /^--(resume|session-id)$/.test(x)));
+    // Inzwischen neu vergeben: Die Antwort verfällt, steht aber im Chat; der nächste Lauf beginnt einen neuen
+    refuse = [409, { error: "Nicht dein Auftrag", code: "not-yours" }];
+    const t = await createAsk(vf, "quick", 1, { mode: "write" });
+    ok(await waitFor(() => logText().includes(`${t.id} inzwischen neu vergeben`), 15000, 50), "write answer refused (taken meanwhile): logged", logText().split("\n").filter((l) => l.includes(t.id)));
+    const q3 = await createAsk(vf, "quick", 1);
+    ok(await answeredIn(q3), "answered");
+    c = calls().filter((x) => x.args).at(-1);
+    ok(c.args.includes("--session-id") && !c.args.includes("--resume") && c.args[c.args.indexOf("--session-id") + 1] !== sid1, "taken: the next question starts a new chat", c.args.filter((x) => /^--(resume|session-id)$/.test(x)));
+    for (const x of [g, t]) await api("DELETE", `/api/doc/${vf}/asks/${x.id}`);
     await restartWith(() => writeConfig());
     proxy.close();
   }
