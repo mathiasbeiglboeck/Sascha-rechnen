@@ -38,6 +38,7 @@ final class CameraEngine: NSObject, ObservableObject,
     let liveLayer = AVSampleBufferDisplayLayer()
     let displayLayer: AVSampleBufferDisplayLayer
     private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+    private var coordinatorObservation: NSKeyValueObservation?
     /// Last clear portrait/landscape orientation (flat on a table does not count).
     private var lastOrientation = UIDeviceOrientation.portrait
     private var toastToken = 0
@@ -101,6 +102,36 @@ final class CameraEngine: NSObject, ObservableObject,
                                                object: nil, queue: .main) { [weak self] _ in
             let o = UIDevice.current.orientation
             if o.isPortrait || o.isLandscape { self?.lastOrientation = o }
+            self?.learnPortraitAngle()
+        }
+    }
+
+    // MARK: - Which way is up
+
+    /// The rotation that makes the frames upright while the phone stands in
+    /// portrait. Usually 90°, but not on every camera (on the iPhone Air's front
+    /// camera it is 0°). Apple's rotation coordinator knows it; we read it while
+    /// the phone actually stands upright and remember it per camera.
+    private static func portraitAngleKey(back: Bool) -> String { back ? "portraitAngleBack" : "portraitAngleFront" }
+
+    static func storedPortraitAngle(back: Bool) -> CGFloat {
+        let v = UserDefaults.standard.object(forKey: portraitAngleKey(back: back)) as? Double
+        return CGFloat(v ?? 90)
+    }
+
+    /// Main thread: when the phone stands upright, take the coordinator's angle.
+    private func learnPortraitAngle() {
+        guard UIDevice.current.orientation == .portrait, let coord = rotationCoordinator else { return }
+        let angle = coord.videoRotationAngleForHorizonLevelCapture
+        let back = wantBack
+        guard angle != Self.storedPortraitAngle(back: back) else { return }
+        Self.diag("learned portrait angle \(angle) for back=\(back)")
+        UserDefaults.standard.set(Double(angle), forKey: Self.portraitAngleKey(back: back))
+        dataQueue.async { self.resetBuffer() }
+        sessionQueue.async {
+            guard self.configuredBack == back, let c = self.videoOut.connection(with: .video),
+                  c.isVideoRotationAngleSupported(angle) else { return }
+            c.videoRotationAngle = angle
         }
     }
 
@@ -347,7 +378,8 @@ final class CameraEngine: NSObject, ObservableObject,
         Self.diag("active=\(ad.width)x\(ad.height) fov=\(device.activeFormat.videoFieldOfView)")
         if let c = videoOut.connection(with: .video) {
             Self.diag("conn before: angle=\(c.videoRotationAngle) sup90=\(c.isVideoRotationAngleSupported(90)) sup0=\(c.isVideoRotationAngleSupported(0)) mirrored=\(c.isVideoMirrored)")
-            if c.isVideoRotationAngleSupported(90) { c.videoRotationAngle = 90 }
+            let angle = Self.storedPortraitAngle(back: back)
+            if c.isVideoRotationAngleSupported(angle) { c.videoRotationAngle = angle }
             if c.isVideoMirroringSupported {
                 c.automaticallyAdjustsVideoMirroring = false
                 c.isVideoMirrored = false        // mirroring happens on screen only
@@ -362,6 +394,10 @@ final class CameraEngine: NSObject, ObservableObject,
         DispatchQueue.main.async {
             let coord = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil)
             self.rotationCoordinator = coord
+            self.coordinatorObservation = coord.observe(\.videoRotationAngleForHorizonLevelCapture,
+                                                        options: [.initial, .new]) { [weak self] _, _ in
+                DispatchQueue.main.async { self?.learnPortraitAngle() }
+            }
             Self.diag("orientation=\(UIDevice.current.orientation.rawValue) coordinatorCapture=\(coord.videoRotationAngleForHorizonLevelCapture) coordinatorPreview=\(coord.videoRotationAngleForHorizonLevelPreview)")
         }
     }
