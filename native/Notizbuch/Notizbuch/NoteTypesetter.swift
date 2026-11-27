@@ -8,7 +8,8 @@ import WebKit
 /// scharf in jeder Zoomstufe, der Export legt es auf die Seite.
 ///
 /// Gesetzte Notizen liegen im Speicher und als Datei in Caches/notizen/ (Name: Prüfsumme über Text, Breite, Farbe und
-/// Größe). Ändert sich nichts davon, wird nie neu gesetzt.
+/// Größe). Ändert sich nichts davon, wird nie neu gesetzt. Endet WebKit oder hängt es (etwa im Hintergrund), wird die
+/// Notiz später noch einmal gesetzt (höchstens dreimal, solange die App vorn ist).
 @MainActor
 enum NoteTypesetter {
     /// Gesetzte Notiz: die Seite des PDFs und ihre Größe in Seitenpunkten (Breite = Breite der Notiz)
@@ -17,7 +18,7 @@ enum NoteTypesetter {
         let size: CGSize
         private let document: CGPDFDocument
 
-        init?(_ data: Data) {
+        nonisolated init?(_ data: Data) {
             guard let provider = CGDataProvider(data: data as CFData), let doc = CGPDFDocument(provider),
                   let page = doc.page(at: 1) else { return nil }
             let box = page.getBoxRect(.mediaBox)
@@ -81,6 +82,10 @@ enum NoteTypesetter {
     /// Notizen, die gerade gesetzt werden oder nicht zu setzen waren (nicht immer wieder versuchen)
     private static var busy = Set<String>()
     private static var failed = Set<String>()
+    /// Wie oft eine Notiz in dieser Sitzung an einem beendeten oder hängenden WebKit scheiterte, während die App vorn
+    /// war (im Hintergrund beendet iOS WebKit ohnehin; das zählt nicht)
+    private static var attempts: [String: Int] = [:]
+    private static let maxAttempts = 3
     private static var queue: Task<Void, Never>?
 
     private static var folder: URL {
@@ -88,46 +93,102 @@ enum NoteTypesetter {
         return base.appendingPathComponent("notizen", isDirectory: true)
     }
 
-    /// Schon gesetzt (im Speicher oder als Datei)?
-    static func cached(_ note: AskNote) -> Typeset? {
-        let k = key(note)
-        if let t = memory[k] { return t }
-        let file = folder.appendingPathComponent(k + ".pdf")
-        guard let data = try? Data(contentsOf: file), let t = Typeset(data) else { return nil }
-        memory[k] = t
-        // Zuletzt gebraucht (fürs Aufräumen)
-        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
-        return t
+    /// Schon gesetzt? Nur der Speicher: Dateien liest `prepare` abseits des Hauptthreads
+    static func cached(_ note: AskNote) -> Typeset? { memory[key(note)] }
+
+    /// Setzt, was noch fehlt; `done` danach (auf dem Hauptthread), wenn etwas dazukam. Schon als Datei Gesetztes kommt
+    /// gleich (abseits des Hauptthreads gelesen, ohne auf andere Reihen zu warten), der Rest eine Notiz nach der anderen
+    static func prepare(_ notes: [AskNote], done: @escaping () -> Void) {
+        var seen = Set<String>()
+        let todo = notes.filter { n in
+            let k = key(n)
+            return memory[k] == nil && !busy.contains(k) && !failed.contains(k) && seen.insert(k).inserted
+        }
+        guard !todo.isEmpty else { return }
+        let keys = todo.map { key($0) }, dir = folder
+        for k in keys { busy.insert(k) }
+        Task {
+            let loaded = await Task.detached(priority: .userInitiated) { () -> [String: Typeset] in
+                var out: [String: Typeset] = [:]
+                for k in keys {
+                    if let data = try? Data(contentsOf: dir.appendingPathComponent(k + ".pdf")), let t = Typeset(data) {
+                        out[k] = t
+                    }
+                }
+                return out
+            }.value
+            for (k, t) in loaded {
+                memory[k] = t
+                busy.remove(k)
+            }
+            if !loaded.isEmpty { done() }
+            let rest = todo.filter { loaded[key($0)] == nil }
+            if !rest.isEmpty { enqueue(rest, done: done) }
+        }
     }
 
-    /// Setzt, was noch fehlt, eine Notiz nach der anderen; `done` danach (auf dem Hauptthread), wenn etwas dazukam
-    static func prepare(_ notes: [AskNote], done: @escaping () -> Void) {
-        let todo = notes.filter { cached($0) == nil && !busy.contains(key($0)) && !failed.contains(key($0)) }
-        guard !todo.isEmpty else { return }
-        for n in todo { busy.insert(key(n)) }
-        let before = queue
+    /// Setzt `notes` mit WebKit, eine nach der anderen, nach den Reihen davor. Endet WebKit oder hängt es, kommen die
+    /// übrigen 2 s später wieder dran, aber erst, wenn die App vorn ist (so lange bleiben sie `busy`)
+    private static func enqueue(_ notes: [AskNote], done: @escaping () -> Void) {
+        let before = queue, dir = folder
         queue = Task {
             await before?.value
-            let job = Job()
             var added = false
-            for note in todo {
+            var again: [AskNote] = []
+            let job = Job()
+            for (i, note) in notes.enumerated() {
                 let k = key(note)
-                defer { busy.remove(k) }
                 do {
                     let data = try await job.typeset(note)
                     guard let t = Typeset(data) else { throw MarkdownTypesetter.Failure.noPDF }
                     memory[k] = t
-                    try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-                    try? data.write(to: folder.appendingPathComponent(k + ".pdf"), options: .atomic)
+                    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                    try? data.write(to: dir.appendingPathComponent(k + ".pdf"), options: .atomic)
+                    busy.remove(k)
                     added = true
+                } catch let error where isTransient(error, job: job) {
+                    // WebKit beendet oder hängt (etwa die App eben im Hintergrund): Nur vorn zählt das als Versuch
+                    if UIApplication.shared.applicationState == .active { attempts[k, default: 0] += 1 }
+                    Log.sync.error("Notiz nicht gesetzt (noch einmal): \(error.localizedDescription, privacy: .public)")
+                    if attempts[k, default: 0] >= maxAttempts {
+                        failed.insert(k)
+                        busy.remove(k)
+                        again = Array(notes[(i + 1)...])
+                    } else {
+                        again = Array(notes[i...])
+                    }
+                    break
                 } catch {
                     failed.insert(k)
+                    busy.remove(k)
                     Log.sync.error("Notiz nicht gesetzt: \(error.localizedDescription, privacy: .public)")
                 }
             }
             job.close()
             if added { done() }
+            guard !again.isEmpty else { return }
+            // Nicht in der Reihe warten: Andere Notizen kommen inzwischen dran
+            Task { [again] in
+                try? await Task.sleep(for: .seconds(2))
+                while UIApplication.shared.applicationState != .active { try? await Task.sleep(for: .seconds(1)) }
+                enqueue(again, done: done)
+            }
         }
+    }
+
+    /// WebKit beendet oder hängt: später noch einmal. Fehler im Skript, kein PDF, Seite fehlt: nicht
+    private static func isTransient(_ error: Error, job: Job) -> Bool {
+        if job.isCrashed { return true }
+        if let f = error as? MarkdownTypesetter.Failure {
+            switch f {
+            case .timeout, .crashed: return true
+            default: return false
+            }
+        }
+        if let e = error as? WKError {
+            return e.code != .javaScriptExceptionOccurred && e.code != .javaScriptResultTypeIsUnsupported
+        }
+        return false
     }
 
     /// Setzt alle fehlenden Notizen und wartet darauf (für den Export), höchstens `seconds`
@@ -159,6 +220,8 @@ enum NoteTypesetter {
         private var loading: CheckedContinuation<Void, Error>?
         private var loaded = false
         private var crashed = false
+        /// Der WebContent-Prozess dieser Ansicht endete
+        var isCrashed: Bool { crashed }
 
         override init() {
             let config = WKWebViewConfiguration()

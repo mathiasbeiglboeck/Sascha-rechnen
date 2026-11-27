@@ -1085,15 +1085,20 @@ final class SyncEngine: ObservableObject {
 
     /// Neue Stellen nach Seitenänderungen, für den Seitenstand `pv`. Der Server nimmt sie nur, wenn seine Stelle
     /// nicht schon zu einem neueren Seitenstand gehört
-    /// Dazu die Notizen der Fragen von „Claude schreiben lassen“ (ersetzen die bisherigen; ein älterer Server übergeht sie)
+    /// Dazu die Notizen der Fragen von „Claude schreiben lassen“, die sich hier geändert haben (der Server behält nur
+    /// Notizen, die er und das Gerät beide haben; ein älterer Server übergeht sie oder ersetzt mit ihnen), und
+    /// `notesUnknown`: Fragen von „Claude schreiben lassen“, deren Notizen dieses Gerät beim Verschieben nicht kennt
+    /// (der Server ordnet seine der neuen Stelle zu; ein älterer übergeht die Liste)
     func moveAsks(_ doc: UUID, pv: Int, anchors: [String: AskAnchor],
-                  notes: [String: [AskNote]] = [:]) async throws -> AskList {
+                  notes: [String: [AskNote]] = [:], notesUnknown: [String] = []) async throws -> AskList {
         struct Body: Encodable {
             var pv: Int
             var anchors: [String: AskAnchor]
             var notes: [String: [AskNote]]?
+            var notesUnknown: [String]?
         }
-        let body = try JSONEncoder().encode(Body(pv: pv, anchors: anchors, notes: notes.isEmpty ? nil : notes))
+        let body = try JSONEncoder().encode(Body(pv: pv, anchors: anchors, notes: notes.isEmpty ? nil : notes,
+                                                 notesUnknown: notesUnknown.isEmpty ? nil : notesUnknown))
         return try JSONDecoder().decode(AskList.self, from: try await request("PATCH", Self.askPath(doc), body: body))
     }
 

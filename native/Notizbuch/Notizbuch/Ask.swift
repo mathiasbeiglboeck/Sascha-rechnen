@@ -73,8 +73,18 @@ struct Ask: Codable, Identifiable, Equatable {
     var deleting: Bool?
     /// Stelle hier verschoben (Seiten gelöscht oder eingefügt), der Server weiß es noch nicht
     var moved: Bool?
+    /// Notizen hier gerückt, geparkt, zurückgeholt oder eine entfernt, der Server weiß es noch nicht: Nur dann gehen
+    /// sie mit dem Verschieben hinauf (sonst nur die Stelle)
+    var notesMoved: Bool?
     /// Ihre Seite wurde gelöscht: unsichtbar, bis die Seitenübersicht zu ist (Rückgängig bringt sie zurück)
     var hidden: Bool?
+    /// Die Seite der Frage wurde gelöscht, die Markierung rückte zur ersten verbliebenen Notiz: ihre alte Stelle, für
+    /// Rückgängig (bis die Übersicht zu ist)
+    var parkedAnchor: AskAnchor?
+    /// Ihre Seite wurde gelöscht, als der Mac schon schrieb: Notizen, die danach kommen, können noch die alten Seiten
+    /// zählen (ein Server vor dem Update speichert sie so). Sie rücken dann beim Rückgängig nicht mit, und an ihnen
+    /// bleibt die Frage nicht, wenn die Übersicht zugeht
+    var claimedAtHide: Bool?
     /// Warum sie noch nicht hochging (etwa „Server-Update nötig“)
     var localNote: String?
 
@@ -159,6 +169,9 @@ final class AskStore: ObservableObject {
     private struct File: Codable {
         var v: Int
         var asks: [Ask]
+        /// 2: Notizen gehen nur mit `notesMoved` hinauf. Fehlt (ältere App): Dort gingen mit jeder verschobenen Frage
+        /// alle ihre Notizen mit
+        var format: Int?
     }
 
     private func fileURL(_ doc: UUID) -> URL { store.folder(doc).appendingPathComponent("asks.json") }
@@ -177,11 +190,31 @@ final class AskStore: ObservableObject {
         if let data = try? Data(contentsOf: fileURL(doc)), let file = try? JSONDecoder().decode(File.self, from: data) {
             list = file.asks
             v = file.v
+            // Von einer älteren App gesichert: Dort gingen mit jeder verschobenen Frage alle ihre Notizen mit
+            if file.format == nil {
+                for i in list.indices where list[i].moved == true && list[i].isWrite && list[i].notes != nil {
+                    list[i].notesMoved = true
+                }
+            }
         }
-        // Seite gelöscht in einer früheren Sitzung: Rückgängig gibt es nicht mehr, die Frage geht mit ihrer Seite
-        for i in list.indices where list[i].hidden == true {
-            list[i].hidden = nil
-            list[i].deleting = true
+        for i in list.indices {
+            // Seite gelöscht in einer früheren Sitzung: Rückgängig gibt es nicht mehr, die Frage geht mit ihrer Seite
+            if list[i].hidden == true {
+                list[i].hidden = nil
+                list[i].deleting = true
+            }
+            // Ebenso Notizen, die dieses Gerät mit ihrer Seite gelöscht hatte (Seite −1 eines anderen Geräts bleibt:
+            // Dort ist Rückgängig vielleicht noch möglich)
+            if let notes = list[i].notes, notes.contains(where: { $0.parked != nil }) {
+                list[i].notes = notes.filter { $0.parked == nil }
+                if list[i].v != nil, list[i].deleting != true {
+                    list[i].moved = true
+                    list[i].notesMoved = true
+                }
+            }
+            // Die Markierung bleibt an der Notiz, zu der sie rückte
+            list[i].parkedAnchor = nil
+            list[i].claimedAtHide = nil
         }
         lists[doc] = list
         versions[doc] = v
@@ -203,16 +236,19 @@ final class AskStore: ObservableObject {
     private func save(_ doc: UUID, _ list: [Ask]) {
         // Erst der Speicher, dann die Revision: Wer auf sie hört, liest gleich die neue Liste
         lists[doc] = list
-        let data = try? JSONEncoder().encode(File(v: versions[doc] ?? 0, asks: list))
+        let data = try? JSONEncoder().encode(File(v: versions[doc] ?? 0, asks: list, format: 2))
         store.enqueueWrite(to: fileURL(doc)) { data }
         updatePending(doc)
         revisions[doc, default: 0] += 1
     }
 
     private func updatePending(_ doc: UUID) {
-        // Auch mit Fragen, deren Seite eben gelöscht wurde: Endet die App, bevor die Übersicht zu ist, löscht sie der
-        // nächste Start (das Laden der Liste macht aus ihnen zu löschende)
-        let pending = hasLocalWork(doc) || asks(doc).contains { $0.hidden == true }
+        // Auch mit Fragen, deren Seite eben gelöscht wurde (oder deren Markierung deshalb zu einer Notiz rückte, oder mit
+        // Notizen auf gelöschten Seiten): Endet die App, bevor die Übersicht zu ist, räumt der nächste Start auf (das
+        // Laden der Liste macht aus ihnen zu löschende und lässt diese Notizen fallen)
+        let pending = hasLocalWork(doc) || asks(doc).contains {
+            $0.hidden == true || $0.parkedAnchor != nil || ($0.notes ?? []).contains { $0.parked != nil }
+        }
         guard pending != pendingDocs.contains(doc) else { return }
         if pending { pendingDocs.insert(doc) } else { pendingDocs.remove(doc) }
         UserDefaults.standard.set(pendingDocs.map(\.uuidString), forKey: Self.pendingKey)
@@ -257,7 +293,10 @@ final class AskStore: ObservableObject {
             else { return }
             notes.remove(at: index)
             list[i].notes = notes
-            if list[i].v != nil { list[i].moved = true }
+            if list[i].v != nil {
+                list[i].moved = true
+                list[i].notesMoved = true
+            }
         }
         refresh(doc)
     }
@@ -270,34 +309,59 @@ final class AskStore: ObservableObject {
     }
 
     /// Seiten gelöscht oder eingefügt: Jede Frage rückt mit ihrer Seite, wie die Striche (`mapping`: alte Seite →
-    /// neue, nil = gelöscht), und gilt für den neuen Seitenstand `pv`. Fällt ihre Seite weg, wird sie unsichtbar
-    /// (die anderen Geräte bekommen Seite −1), bis Rückgängig sie zurückbringt oder `dropHidden` sie löscht. Gibt
-    /// die IDs der unsichtbar gewordenen zurück. Fragen, die ein anderes Gerät eben so versteckt hat, bleiben, wie sie sind
-    func remap(_ doc: UUID, pv: Int, mapping: (Int) -> Int?) -> [String] {
-        var hidden: [String] = []
+    /// neue, nil = gelöscht), und gilt für den neuen Seitenstand `pv`; ihre Notizen rücken mit ihren Seiten, auch die
+    /// einer hier unsichtbaren Frage (nur das Rückgängig sieht solche). Fällt die Seite der Frage weg, rückt die
+    /// Markierung einer beantworteten Frage von „Claude schreiben lassen“ zur ersten Notiz auf einer verbliebenen Seite
+    /// (`place`: wo eine Notiz auf ihrer Seite steht, im neuen Layout; die alte Stelle bleibt für Rückgängig); sonst
+    /// wird sie unsichtbar (die anderen Geräte bekommen Seite −1), bis Rückgängig sie zurückbringt oder `dropHidden`
+    /// sie löscht. Gibt die IDs der Fragen zurück, die Rückgängig oder `dropHidden` brauchen. Fragen, die ein anderes
+    /// Gerät eben so versteckt hat, bleiben, wie sie sind
+    func remap(_ doc: UUID, pv: Int, mapping: (Int) -> Int?, place: @MainActor (AskNote) -> AskAnchor?) -> [String] {
+        var touched: [String] = []
         edit(doc) { list in
-            for i in list.indices where list[i].deleting != true && list[i].hidden != true && list[i].anchor.page >= 0 {
+            for i in list.indices where list[i].deleting != true {
+                let hiddenHere = list[i].hidden == true
+                // Fragen, die ein anderes Gerät eben versteckt hat (Seite −1), bleiben, wie sie sind
+                guard hiddenHere || list[i].anchor.page >= 0 else { continue }
                 // Notizen rücken mit ihrer Seite; die auf gelöschten Seiten warten mit Seite −1 auf Rückgängig
-                if var notes = list[i].notes, !notes.isEmpty {
-                    var parked = false
+                var parked = false
+                // Nicht die einer Frage, deren Seite gelöscht wurde, als der Mac schon schrieb: Ihre Notizen zählen
+                // vielleicht noch die Seiten von damals, also schon die nach dem Rückgängig
+                if var notes = list[i].notes, !notes.isEmpty, !(hiddenHere && list[i].claimedAtHide == true) {
+                    var changed = false
                     for n in notes.indices where notes[n].page >= 0 {
                         if let j = mapping(notes[n].page) {
-                            notes[n].page = max(j, 0)
+                            if max(j, 0) != notes[n].page {
+                                notes[n].page = max(j, 0)
+                                changed = true
+                            }
                         } else {
                             notes[n].parked = notes[n].page
                             notes[n].page = -1
                             parked = true
+                            changed = true
                         }
                     }
                     list[i].notes = notes
-                    if parked { hidden.append(list[i].id) }
+                    if changed, list[i].v != nil { list[i].notesMoved = true }
                 }
+                if parked { touched.append(list[i].id) }
+                // Stelle, Seitenstand und hidden einer unsichtbaren Frage setzt unhide
+                if hiddenHere { continue }
                 list[i].pv = pv
                 guard let j = mapping(list[i].anchor.page) else {
-                    list[i].hidden = true
-                    // Noch nicht am Server: Sie geht erst hinauf, wenn Rückgängig sie zurückbringt
-                    list[i].moved = list[i].v == nil ? nil : true
-                    if hidden.last != list[i].id { hidden.append(list[i].id) }
+                    // Seite der Frage gelöscht. Stehen Notizen auf anderen Seiten, rückt die Markierung zur ersten davon
+                    if let to = Self.reanchor(list[i], place: place) {
+                        list[i].parkedAnchor = list[i].anchor
+                        list[i].anchor = to
+                        list[i].moved = list[i].failedHere ? nil : true
+                    } else {
+                        list[i].hidden = true
+                        list[i].claimedAtHide = list[i].isWrite && list[i].status == "claimed" ? true : nil
+                        // Noch nicht am Server: Sie geht erst hinauf, wenn Rückgängig sie zurückbringt
+                        list[i].moved = list[i].v == nil ? nil : true
+                    }
+                    if touched.last != list[i].id { touched.append(list[i].id) }
                     continue
                 }
                 list[i].anchor.page = max(j, 0)
@@ -305,11 +369,23 @@ final class AskStore: ObservableObject {
             }
         }
         refresh(doc)
-        return hidden
+        return touched
+    }
+
+    /// Wohin die Markierung einer beantworteten Frage von „Claude schreiben lassen“ rückt, deren Seite gelöscht wurde:
+    /// zur ersten Notiz auf einer verbliebenen Seite (nach Seite, dann von oben), die einen Platz hat. nil: keine
+    static func reanchor(_ ask: Ask, place: @MainActor (AskNote) -> AskAnchor?) -> AskAnchor? {
+        guard ask.isWrite, ask.isAnswered else { return nil }
+        let notes = (ask.notes ?? []).filter { $0.page >= 0 && $0.parked == nil }
+            .sorted { ($0.page, $0.y) < ($1.page, $1.y) }
+        for n in notes {
+            if let a = place(n) { return a }
+        }
+        return nil
     }
 
     /// Rückgängig einer Seitenänderung: Die unsichtbaren Fragen kommen an ihre alte Stelle zurück (ihre Seite ist
-    /// wieder da, mit der alten Nummer)
+    /// wieder da, mit der alten Nummer), ebenso eine Markierung, die zu einer Notiz gerückt war
     func unhide(_ doc: UUID, _ ids: [String], pv: Int) {
         guard !ids.isEmpty else { return }
         edit(doc) { list in
@@ -324,10 +400,21 @@ final class AskStore: ObservableObject {
                         return m
                     }
                     list[i].pv = pv
-                    if list[i].v != nil { list[i].moved = true }
+                    if list[i].v != nil {
+                        list[i].moved = true
+                        list[i].notesMoved = true
+                    }
+                }
+                // Markierung rückte zu einer Notiz, weil die Seite der Frage gelöscht war: zurück an die Frage
+                if let old = list[i].parkedAnchor {
+                    list[i].anchor = old
+                    list[i].parkedAnchor = nil
+                    list[i].pv = pv
+                    list[i].moved = list[i].failedHere ? nil : true
                 }
                 guard list[i].hidden == true else { continue }
                 list[i].hidden = nil
+                list[i].claimedAtHide = nil
                 list[i].pv = pv
                 list[i].moved = list[i].failedHere ? nil : true
             }
@@ -335,18 +422,35 @@ final class AskStore: ObservableObject {
         refresh(doc)
     }
 
-    /// Kein Rückgängig mehr (Übersicht zu, nächste Seitenänderung): Fragen auf gelöschten Seiten endgültig löschen
-    func dropHidden(_ doc: UUID, _ ids: [String]) {
+    /// Kein Rückgängig mehr (Übersicht zu, nächste Seitenänderung): Fragen auf gelöschten Seiten endgültig löschen,
+    /// außer es kamen inzwischen Notizen auf verbliebenen Seiten (dann rückt die Markierung zur ersten, `place` wie bei
+    /// `remap`)
+    func dropHidden(_ doc: UUID, _ ids: [String], place: @MainActor (AskNote) -> AskAnchor?) {
         guard !ids.isEmpty else { return }
         edit(doc) { list in
             for i in list.indices where ids.contains(list[i].id) {
-                // Notizen auf gelöschten Seiten gehen mit ihnen
-                if let notes = list[i].notes, notes.contains(where: { $0.parked != nil || $0.page < 0 }) {
-                    list[i].notes = notes.filter { $0.page >= 0 }
-                    if list[i].v != nil, list[i].deleting != true { list[i].moved = true }
+                // Notizen, die dieses Gerät mit ihrer Seite gelöscht hat, gehen endgültig (Seite −1 eines anderen
+                // Geräts bleibt: Dort ist Rückgängig vielleicht noch möglich)
+                if let notes = list[i].notes, notes.contains(where: { $0.parked != nil }) {
+                    list[i].notes = notes.filter { $0.parked == nil }
+                    if list[i].v != nil, list[i].deleting != true {
+                        list[i].moved = true
+                        list[i].notesMoved = true
+                    }
                 }
+                list[i].parkedAnchor = nil
                 guard list[i].hidden == true else { continue }
                 list[i].hidden = nil
+                let claimed = list[i].claimedAtHide == true
+                list[i].claimedAtHide = nil
+                // Inzwischen kamen Notizen (die Antwort kam, als die Seite schon weg war): Die Frage bleibt, an ihrer
+                // ersten Notiz. Nicht, wenn der Mac schon schrieb, als die Seite gelöscht wurde: Dann zählen die Notizen
+                // vielleicht die alten Seiten
+                if list[i].deleting != true, !claimed, let to = Self.reanchor(list[i], place: place) {
+                    list[i].anchor = to
+                    list[i].moved = list[i].failedHere ? nil : true
+                    continue
+                }
                 list[i].deleting = true
             }
         }
@@ -595,18 +699,23 @@ final class AskStore: ObservableObject {
                 if a.hidden == true { anchor.page = -1 }
                 return (a.id, anchor)
             }, uniquingKeysWith: { a, _ in a })
-            // Notizen der Fragen von „Claude schreiben lassen“ an ihren Stellen (gelöschte Seite: −1)
+            // Notizen der Fragen von „Claude schreiben lassen“ nur, wo sie sich hier geändert haben (gerückt, geparkt,
+            // zurück, eine entfernt; gelöschte Seite: −1)
             let notes = Dictionary(group.compactMap { a -> (String, [AskNote])? in
-                guard a.isWrite, let n = a.notes else { return nil }
+                guard a.isWrite, a.notesMoved == true, let n = a.notes else { return nil }
                 return (a.id, n.map(\.wire))
             }, uniquingKeysWith: { a, _ in a })
-            let list = try await sync.moveAsks(doc, pv: pv, anchors: anchors, notes: notes)
+            // Fragen, deren Notizen dieses Gerät beim Verschieben nicht kennt (noch offen, oder die Antwort kam erst
+            // danach): Hat der Server welche, ordnet er sie der neuen Stelle zu
+            let unknown = group.filter { $0.isWrite && $0.notes == nil }.map(\.id)
+            let list = try await sync.moveAsks(doc, pv: pv, anchors: anchors, notes: notes, notesUnknown: unknown)
             edit(doc) { l in
                 for a in group {
                     guard let i = l.firstIndex(where: { $0.id == a.id }), l[i].anchor == a.anchor, l[i].pv == a.pv,
                           l[i].hidden == a.hidden, l[i].notes == a.notes
                     else { continue }
                     l[i].moved = nil
+                    l[i].notesMoved = nil
                 }
             }
             apply(doc, list)
@@ -680,15 +789,28 @@ final class AskStore: ObservableObject {
                 // Bilder braucht es nicht mehr
                 if l.status == "local" { forgetImages(doc, l.id) }
                 if l.moved == true || l.hidden == true {
+                    // Seitenstand der Liste, bevor die Stelle von hier ihn ersetzt: In ihm zählen ihre Notizen
+                    let serverPv = r.pv
                     r.anchor = l.anchor
                     r.pv = l.pv
                     r.hidden = l.hidden
-                    // Notizen hier verschoben oder entfernt: bleiben, bis der Server sie hat
-                    if l.isWrite, l.notes != nil { r.notes = l.notes }
+                    if l.isWrite, l.notes != nil {
+                        // Notizen hier verschoben oder entfernt: bleiben, bis der Server sie hat
+                        r.notes = l.notes
+                    } else if l.moved == true, serverPv != l.pv {
+                        // Notizen, die dieses Gerät beim Verschieben nicht kannte, zählen die Seiten anders: erst nach
+                        // dem Verschieben übernehmen (der Server ordnet sie zu, notesUnknown)
+                        r.notes = nil
+                    }
+                    r.notesMoved = l.notesMoved
                     // Wurde sie hier verschoben oder ihre Seite gelöscht, bevor sie oben war, geht die Stelle gleich
                     // hinauf (gelöschte Seite: −1)
                     r.moved = l.status == "local" ? true : l.moved
                 }
+                // Die alte Stelle für Rückgängig kennt nur dieses Gerät (bis die Übersicht zu ist)
+                r.parkedAnchor = l.parkedAnchor
+                // Gab der Mac die Frage inzwischen zurück, zählt ein neuer Anlauf schon die neuen Seiten
+                r.claimedAtHide = r.status == "open" ? nil : l.claimedAtHide
             }
             merged.append(r)
         }
@@ -708,7 +830,7 @@ final class AskStore: ObservableObject {
         versions[doc] = remote.v
         if merged == local {
             // Nur die Version ist neu: trotzdem sichern, damit ein späterer Hinweis mit ihr nichts mehr holt
-            let data = try? JSONEncoder().encode(File(v: remote.v, asks: merged))
+            let data = try? JSONEncoder().encode(File(v: remote.v, asks: merged, format: 2))
             store.enqueueWrite(to: fileURL(doc)) { data }
             return
         }

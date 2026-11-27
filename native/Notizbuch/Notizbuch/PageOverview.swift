@@ -346,7 +346,7 @@ struct PageThumbnail: View {
         let i = index, version = self.version
         let ink = (try? await PageExport.run { export.inkFingerprint(page: i) }) ?? 0
         guard !Task.isCancelled else { return }
-        let key = "\(version)-\(i)-\(ink)-\(Int(px))" as NSString
+        let key = "\(version)-\(i)-\(ink)-\(export.notesFingerprint(page: i))-\(Int(px))" as NSString
         if let hit = cache.images.object(forKey: key) {
             image = hit
             return

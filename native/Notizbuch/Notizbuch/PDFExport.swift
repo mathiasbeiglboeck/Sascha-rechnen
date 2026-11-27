@@ -164,6 +164,26 @@ struct PageExport: @unchecked Sendable {
         return h.finalize()
     }
 
+    /// Kennzahl der Notizen auf einer Seite (Lage, Text gesetzt oder nicht und welcher, Rahmen): ändert sich, wenn eine
+    /// dazukommt, wegfällt, rückt oder ihr Text gesetzt ist
+    func notesFingerprint(page i: Int) -> Int {
+        var h = Hasher()
+        for n in notes[i] ?? [] {
+            if let (r, t) = n.text {
+                for v in [r.minX, r.minY, r.width, r.height] { h.combine(Int((v * 4).rounded())) }
+                h.combine(ObjectIdentifier(t.page))
+            } else {
+                h.combine(-1)
+            }
+            if let b = n.box {
+                for v in [b.minX, b.minY, b.width, b.height] { h.combine(Int((v * 4).rounded())) }
+            } else {
+                h.combine(-2)
+            }
+        }
+        return h.finalize()
+    }
+
     /// Kleines Vorschaubild einer Seite, `pixelWidth` Pixel breit
     func thumbnail(page i: Int, pixelWidth: CGFloat) -> UIImage {
         let frame = frames[i]

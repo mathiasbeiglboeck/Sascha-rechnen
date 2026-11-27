@@ -1504,14 +1504,34 @@ extension CanvasController {
         return layout.frames.indices.min { abs(layout.frames[$0].midY - y) < abs(layout.frames[$1].midY - y) } ?? 0
     }
 
+    /// Tinte und Seiten zum Stand von jetzt; die Notizen kommen mit `settledNotes`
     private var exporter: PageExport {
         PageExport(frames: layout.frames, pdf: pdf,
-                   ink: canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k)), notes: exportNotes)
+                   ink: canvas.drawing.transformed(using: CGAffineTransform(scaleX: 1 / k, y: 1 / k)))
     }
 
-    /// Notizen von Claude für Export, Briefkasten, Übersicht und die Seiten, die Claude zu einer Frage bekommt
+    /// Notizen von Claude für die Übersicht (was noch nicht gesetzt ist, fehlt; sie zeichnet nach, sobald es da ist)
     var exportNotes: [Int: [PageExport.Note]] {
         NotesOverlay.forExport(sync.asks.asks(doc.id), frames: layout.frames, pagesVersion: currentPagesVersion)
+    }
+
+    /// Die Notizen für einen Export zum Stand von jetzt (Fragen, Seiten und Seitenstand wie die Tinte). Fehlt einer
+    /// Notiz auf `pages` noch der gesetzte Text (Dokument eben geöffnet, WebKit beendet), wird er gesetzt und darauf
+    /// gewartet, höchstens 5 s; Notizen auf anderen Seiten halten nicht auf
+    private func settledNotes(pages: ClosedRange<Int>) -> @MainActor () async -> [Int: [PageExport.Note]] {
+        let asks = sync.asks.asks(doc.id), frames = layout.frames, pv = currentPagesVersion
+        // Wie NotesOverlay.set: gezeigte Notizen dieses Seitenstands, deren Text noch nicht gesetzt ist
+        var missing: [AskNote] = []
+        for ask in asks where ask.isWrite && ask.pv <= pv {
+            for (_, note) in ask.shownNotes where pages.contains(note.page) && frames.indices.contains(note.page) {
+                let blank = note.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                if !blank, NoteTypesetter.cached(note) == nil { missing.append(note) }
+            }
+        }
+        return { [missing] in
+            if !missing.isEmpty { _ = await NoteTypesetter.ready(missing, seconds: 5) }
+            return NotesOverlay.forExport(asks, frames: frames, pagesVersion: pv)
+        }
     }
 
     /// Aktueller Name (inzwischen vielleicht umbenannt, auch auf einem anderen Gerät)
@@ -1568,9 +1588,13 @@ extension CanvasController {
             sendDocument(to: recipient)
             return
         }
-        let export = exporter
+        let snap = exporter
         let title = Self.fileName(currentTitle)
         let pages = layout.frames.count
+        // Notizen der Seiten, die hinausgehen
+        let notePages: ClosedRange<Int>
+        if case .documentPDF = kind { notePages = 0...max(pages - 1, 0) } else { notePages = i...i }
+        let notes = settledNotes(pages: notePages)
         // Großes PDF: Hinweis, bis es fertig ist (nur diesen räumt das Ende wieder weg, keinen fremden)
         let showsProgress: Bool
         if case .documentPDF = kind, pages > 10 { showsProgress = true } else { showsProgress = false }
@@ -1578,6 +1602,9 @@ extension CanvasController {
         // Hinweise auch, wenn diese Leinwand inzwischen zu ist (Tab gewechselt): Sie erscheinen dann im sichtbaren Tab
         let flash = onFlashTimed
         Task { [weak self] in
+            var e = snap
+            e.notes = await notes()
+            let export = e
             do {
                 let url = try await PageExport.run { () -> URL in
                     let tmp = FileManager.default.temporaryDirectory
@@ -1622,12 +1649,15 @@ extension CanvasController {
         let title = Self.fileName(currentTitle)
         let name = cut ? "\(title) – Seiten 1-\(count).pdf" : "\(title).pdf"
         let who = recipient == "claude" ? "Claude" : "ChatGPT"
-        let export = exporter
+        let snap = exporter, notes = settledNotes(pages: 0...max(count - 1, 0))
         onFlashTimed("Wird gesendet …", 60)
         let sync = self.sync
         // Das Ergebnis auch melden, wenn diese Leinwand inzwischen zu ist (Tab gewechselt)
         let flash = onFlashTimed
         Task {
+            var e = snap
+            e.notes = await notes()
+            let export = e
             do {
                 let pdf = try await PageExport.run { () -> Data in
                     let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".pdf")
@@ -1650,12 +1680,15 @@ extension CanvasController {
             return
         }
         let base = "\(Self.fileName(currentTitle)) – Seite \(i + 1)"
-        let export = exporter
+        let snap = exporter, notes = settledNotes(pages: i...i)
         onFlashTimed("Wird gesendet …", 30)
         let sync = self.sync
         // Das Ergebnis auch melden, wenn diese Leinwand inzwischen zu ist (Tab gewechselt)
         let flash = onFlashTimed
         Task {
+            var e = snap
+            e.notes = await notes()
+            let export = e
             do {
                 let (pdf, png) = try await PageExport.run { () -> (Data, Data) in
                     let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".pdf")
@@ -1885,7 +1918,7 @@ extension CanvasController {
                 }
                 guard let restored = CGPDFDocument(url as CFURL) else {
                     // Die Seiten bleiben gelöscht, die Fragen darauf mit
-                    self.sync.asks.dropHidden(self.doc.id, undo.hiddenAsks)
+                    self.sync.asks.dropHidden(self.doc.id, undo.hiddenAsks, place: self.notePlacer())
                     self.restructuring = false
                     self.syncCycle()
                     done("Rückgängig fehlgeschlagen: PDF lässt sich nicht öffnen")
@@ -1901,10 +1934,10 @@ extension CanvasController {
             self.commitPages(PKDrawing(strokes: moved.kept + undo.removed), pageCount: undo.pageCount,
                              pdfChanged: undo.pdfBackup != nil)
             // Fragen an Claude rücken mit zurück; die auf den gelöschten Seiten kommen wieder
-            let pv = self.currentPagesVersion
-            let gone = self.sync.asks.remap(self.doc.id, pv: pv, mapping: undo.inverse)
+            let pv = self.currentPagesVersion, place = self.notePlacer()
+            let gone = self.sync.asks.remap(self.doc.id, pv: pv, mapping: undo.inverse, place: place)
             self.sync.asks.unhide(self.doc.id, undo.hiddenAsks, pv: pv)
-            self.sync.asks.dropHidden(self.doc.id, gone)
+            self.sync.asks.dropHidden(self.doc.id, gone, place: place)
             done(nil)
         }
     }
@@ -1937,8 +1970,28 @@ extension CanvasController {
     /// Beim Schließen der Übersicht: Kopie für Rückgängig aufräumen
     func discardPageUndo() {
         if let backup = pageUndo?.pdfBackup { try? FileManager.default.removeItem(at: backup) }
-        if let hidden = pageUndo?.hiddenAsks, !hidden.isEmpty { sync.asks.dropHidden(doc.id, hidden) }
+        if let hidden = pageUndo?.hiddenAsks, !hidden.isEmpty {
+            sync.asks.dropHidden(doc.id, hidden, place: notePlacer())
+        }
         pageUndo = nil
+    }
+
+    /// Wo eine Notiz auf ihrer Seite steht, als Stelle einer Markierung (Seitenpunkte, relativ zur Seite, im Layout von
+    /// jetzt); nil, wenn es ihre Seite nicht gibt. Für Fragen, deren Seite gelöscht wurde (AskStore.remap, dropHidden)
+    private func notePlacer() -> @MainActor (AskNote) -> AskAnchor? {
+        let frames = layout.frames
+        return { note in
+            guard frames.indices.contains(note.page) else { return nil }
+            let page = CGRect(origin: .zero, size: frames[note.page].size)
+            var r = NotePlacement.of(note, frame: page, size: NoteTypesetter.cached(note)?.size).bounds
+            // Text noch nicht gesetzt und kein Rahmen: die linke obere Ecke, so breit wie die Notiz
+            if r.isNull {
+                r = CGRect(x: CGFloat(note.x) * page.width, y: CGFloat(note.y) * page.height,
+                           width: CGFloat(NoteTypesetter.width(note)), height: 0)
+            }
+            return AskAnchor(page: note.page, x: Double(r.minX), y: Double(r.minY), w: Double(r.width),
+                             h: Double(r.height))
+        }
     }
 
     /// Ordnet Seiten neu: `mapping` sagt für jede alte Seite, welche neue Seite sie wird (nil = fällt weg).
@@ -2010,7 +2063,8 @@ extension CanvasController {
             self.pageUndo = PageUndo(removed: moved.removed, inverse: inverse, pageCount: old.frames.count, pdfBackup: backup)
             self.commitPages(PKDrawing(strokes: moved.kept), pageCount: new.frames.count, pdfChanged: newPDF != nil)
             // Fragen an Claude rücken mit ihrer Seite; die auf gelöschten Seiten bleiben bis zum Ende des Rückgängig
-            self.pageUndo?.hiddenAsks = self.sync.asks.remap(self.doc.id, pv: self.currentPagesVersion, mapping: mapping)
+            self.pageUndo?.hiddenAsks = self.sync.asks.remap(self.doc.id, pv: self.currentPagesVersion, mapping: mapping,
+                                                             place: self.notePlacer())
             done(nil)
         }
     }
@@ -2503,9 +2557,12 @@ extension CanvasController: UIGestureRecognizerDelegate {
         // Für die Bilder nur die Striche der Seite und der Seiten um sie (nicht die ganze Zeichnung umrechnen)
         let span = PageExport.contextSpan(around: page, count: layout.frames.count, effort: effort)
         let spanArea = layout.frames[span.lowerBound].union(layout.frames[span.upperBound]).applying(toCanvas)
-        let export = PageExport(frames: layout.frames, pdf: pdf,
-                                ink: PKDrawing(strokes: strokes.filter { $0.renderBounds.intersects(spanArea) })
-                                    .transformed(using: toPage), notes: exportNotes)
+        let snap = PageExport(frames: layout.frames, pdf: pdf,
+                              ink: PKDrawing(strokes: strokes.filter { $0.renderBounds.intersects(spanArea) })
+                                  .transformed(using: toPage))
+        // Notizen von Claude: die der Seite der Frage für ihr Bild, die der Seiten um sie für die Seiten dazu (fehlt
+        // einer der gesetzte Text, wird darauf gewartet; die Markierung wartet nur auf die Seite der Frage)
+        let pageNotes = settledNotes(pages: page...page), spanNotes = settledNotes(pages: span)
         let ask = Ask(id: UUID().uuidString, status: "local",
                       anchor: AskAnchor(page: page, x: Double(local.minX), y: Double(local.minY),
                                         w: Double(local.width), h: Double(local.height)),
@@ -2525,6 +2582,9 @@ extension CanvasController: UIGestureRecognizerDelegate {
             // Auch wenn die App gleich in den Hintergrund geht: erst fertig vorbereiten
             let background = BackgroundWork("Frage an Claude vorbereiten")
             defer { background.end() }
+            var e = snap
+            e.notes = await pageNotes()
+            let export = e
             do {
                 try await PageExport.run {
                     let question = PageExport.questionPNG(box.value, region: rect)
@@ -2541,7 +2601,8 @@ extension CanvasController: UIGestureRecognizerDelegate {
                 flash("Frage konnte nicht vorbereitet werden: \(error.localizedDescription)", 3)
                 return
             }
-            await PageExport.writeContext(export, span: span, question: page, pv: ask.pv, effort: effort, to: folder)
+            e.notes = await spanNotes()
+            await PageExport.writeContext(e, span: span, question: page, pv: ask.pv, effort: effort, to: folder)
             asks.prepared(id, ask.id)
         }
     }
@@ -2668,9 +2729,10 @@ extension CanvasController: UIGestureRecognizerDelegate {
         // Für die Bilder nur die Striche dieser Seite und der Seiten um sie (nicht die ganze Zeichnung umrechnen)
         let span = PageExport.contextSpan(around: page, count: layout.frames.count, effort: "quick")
         let spanArea = layout.frames[span.lowerBound].union(layout.frames[span.upperBound]).applying(toCanvas)
-        let export = PageExport(frames: layout.frames, pdf: pdf,
-                                ink: PKDrawing(strokes: strokes.filter { $0.renderBounds.intersects(spanArea) })
-                                    .transformed(using: toPage), notes: exportNotes)
+        let snap = PageExport(frames: layout.frames, pdf: pdf,
+                              ink: PKDrawing(strokes: strokes.filter { $0.renderBounds.intersects(spanArea) })
+                                  .transformed(using: toPage))
+        let pageNotes = settledNotes(pages: page...page), spanNotes = settledNotes(pages: span)
         let ask = Ask(id: UUID().uuidString, status: "local",
                       anchor: AskAnchor(page: page, x: Double(spot.minX), y: Double(spot.minY),
                                         w: Double(spot.width), h: Double(spot.height)),
@@ -2683,6 +2745,9 @@ extension CanvasController: UIGestureRecognizerDelegate {
         Task {
             let background = BackgroundWork("Frage an Claude vorbereiten")
             defer { background.end() }
+            var e = snap
+            e.notes = await pageNotes()
+            let export = e
             do {
                 try await PageExport.run {
                     let question = export.meaningJPEG(page: page, spot: spot, context: context,
@@ -2698,7 +2763,8 @@ extension CanvasController: UIGestureRecognizerDelegate {
                 flash("Frage konnte nicht vorbereitet werden: \(error.localizedDescription)", 3)
                 return
             }
-            await PageExport.writeContext(export, span: span, question: page, pv: ask.pv, effort: "quick", to: folder)
+            e.notes = await spanNotes()
+            await PageExport.writeContext(e, span: span, question: page, pv: ask.pv, effort: "quick", to: folder)
             asks.prepared(id, ask.id)
         }
     }
@@ -2724,7 +2790,11 @@ extension CanvasController: UIGestureRecognizerDelegate {
         askOverlay.layout(scale: k * canvas.zoomScale)
         if canvas.subviews.last !== askOverlay { canvas.bringSubviewToFront(askOverlay) }
         // Notizen von Claude; was noch gesetzt werden muss, kommt danach
-        notesOverlay.set(list, frames: layout.frames, pagesVersion: pv) { [weak self] in self?.reloadAskMarks() }
+        // Kommt gesetzter Text dazu, zeichnet auch eine offene Übersicht nach
+        notesOverlay.set(list, frames: layout.frames, pagesVersion: pv) { [weak self] in
+            self?.reloadAskMarks()
+            self?.onPagesChanged?()
+        }
         // Neue Antwort, während das Dokument offen ist. Gesammelt, nicht ersetzt: Eine Markierung, die mit ihrer Seite
         // kurz verschwand (Seite gelöscht, dann Rückgängig), meldet sich danach nicht als neue Antwort
         let answered = Set(list.filter { $0.isAnswered && $0.isVisible }.map(\.id))
