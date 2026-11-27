@@ -162,6 +162,7 @@
 				INFOPLIST_KEY_NSCameraUsageDescription = "BoulderCam filmt dich beim Klettern und zeigt es dir live oder verzögert.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Für den Ton in gespeicherten Videos.";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Gespeicherte Videos landen in Fotos, wie die der normalen Kamera.";
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_UIRequiresFullScreen = YES;
 				INFOPLIST_KEY_UIStatusBarHidden = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -193,6 +194,7 @@
 				INFOPLIST_KEY_NSCameraUsageDescription = "BoulderCam filmt dich beim Klettern und zeigt es dir live oder verzögert.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Für den Ton in gespeicherten Videos.";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Gespeicherte Videos landen in Fotos, wie die der normalen Kamera.";
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_UIRequiresFullScreen = YES;
 				INFOPLIST_KEY_UIStatusBarHidden = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
