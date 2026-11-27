@@ -126,6 +126,27 @@ if (!fs.existsSync(path.join(texbin, "latexmk"))) {
     "Fehler: altes PDF bleibt", JSON.stringify(r3));
   ok(/undefinedmacro|Undefined control sequence/.test(r3.error || ""), "Fehlertext", r3.error);
 
+  // Zuordnung Dokument → Projekt und Stelle → Quellzeilen
+  fs.writeFileSync(path.join(proj, "antrag.tex"), doc([]));
+  const r4 = await H.build(project, "antrag.tex", "Test");
+  ok(r4.ok, "wieder setzbar", JSON.stringify(r4));
+  const found = H.findDoc(r.doc.toLowerCase());
+  ok(found && found.file === "antrag.tex" && found.project.dir === proj, "Dokument gehört zum Projekt");
+  const z4 = JSON.parse(fs.readFileSync(path.join(proj, ".notizbuch", "antrag", "zustand.json"), "utf8"));
+  const yZ = rowY(z4.pages, "ZIELZEILE");
+  const spot = H.sourceSpot(project, "antrag.tex", { page: 0, x: 700, y: yZ - L.PAGE_GAP - 5, w: 40, h: 10 });
+  const zline = fs.readFileSync(path.join(proj, "antrag.tex"), "utf8").split("\n").findIndex((l) => l.startsWith("ZIELZEILE")) + 1;
+  ok(spot && spot.file === "antrag.tex" && spot.from <= zline && spot.to >= zline, "Stelle → Quellzeile", JSON.stringify(spot) + " " + zline);
+  ok(fs.existsSync(path.join(proj, "antrag.pdf")), "A4-PDF neben der .tex");
+  // git
+  const s1 = H.projectStamp(project);
+  const c1 = await H.commit(project, "erster Stand");
+  ok(c1 && fs.existsSync(path.join(proj, ".gitignore")), "git angelegt", String(c1));
+  ok(await H.commit(project, "nichts") === null, "nichts zu sichern");
+  fs.appendFileSync(path.join(proj, "antrag.tex"), "% Kommentar\n");
+  ok(H.projectStamp(project) !== s1, "Änderung erkannt");
+  ok(typeof (await H.commit(project, "Auftrag")) === "string", "Auftrag gesichert");
+
   // tick: erkennt die Änderung erst nach der Ruhezeit
   fs.writeFileSync(path.join(proj, "antrag.tex"), doc([]));
   await H.tick();

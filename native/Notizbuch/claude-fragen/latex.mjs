@@ -471,6 +471,7 @@ export function marksTeX(starts) {
 export function create({ api, upload, log, getConfig, now = Date.now, run = runFile }) {
   const busy = new Set(); // Dokumente, die gerade gesetzt werden (Schlüssel: Projektordner + Datei)
   const watched = new Map(); // Schlüssel → {stamp, since}
+  const held = new Set(); // Projektordner, in denen gerade ein Auftrag läuft: erst danach setzen (buildProject)
   let timer = null;
 
   const cfg = () => {
@@ -695,6 +696,7 @@ export function create({ api, upload, log, getConfig, now = Date.now, run = runF
     const c = cfg();
     if (!c.on) return;
     for (const project of findProjects(c.roots)) {
+      if (held.has(project.dir)) continue;
       for (const file of mainFiles(project)) {
         const key = path.join(project.dir, file);
         if (busy.has(key)) continue;
@@ -728,7 +730,100 @@ export function create({ api, upload, log, getConfig, now = Date.now, run = runF
     timer = setTimeout(loop, 1000);
   }
 
-  return { start, tick, build, compile };
+  /// Zu welchem Projekt ein Dokument im Notizbuch gehört: {project, file} oder null
+  function findDoc(docId) {
+    const id = String(docId).toUpperCase();
+    for (const project of findProjects(cfg().roots)) {
+      for (const file of mainFiles(project)) {
+        const z = readJSON(path.join(docDir(project, file), "zustand.json"), null);
+        if (z && String(z.doc).toUpperCase() === id) return { project, file };
+      }
+    }
+    return null;
+  }
+
+  /// Welche Quellzeilen unter einer Stelle der App liegen (anchor: Seite ab 0, x/y/w/h in Seitenpunkten der App). Aus
+  /// dem Stand, der gerade im Notizbuch liegt. Ergebnis {file, from, to} oder null
+  function sourceSpot(project, file, anchor) {
+    const dir = docDir(project, file);
+    const z = readJSON(path.join(dir, "zustand.json"), null);
+    if (!z || !z.pages || !anchor || anchor.page < 0) return null;
+    let sync;
+    try { sync = readSynctex(path.join(dir, "stand", "synctex.gz")); } catch { return null; }
+    const page = z.pages[anchor.page];
+    if (!page) return null;
+    const scale = PAGE_WIDTH / page.width;
+    const y0 = anchor.y / scale, y1 = (anchor.y + anchor.h) / scale;
+    const files = new Map();
+    for (const [tag, p] of sync.inputs) {
+      const rel = path.relative(project.dir, path.resolve(project.dir, p));
+      if (!rel.startsWith("..") && !path.isAbsolute(rel) && !rel.startsWith(".notizbuch")) files.set(tag, rel);
+    }
+    const rows = sync.rows.filter((r) => r.page === anchor.page + 1 && files.has(r.tag) && r.n > 0);
+    let hit = rows.filter((r) => r.bottom >= y0 - 4 && r.top <= y1 + 4);
+    if (!hit.length) {
+      // Daneben geschrieben (am Rand, zwischen Absätzen): die nächste Zeile darüber, sonst darunter
+      const above = rows.filter((r) => r.top <= y0).pop();
+      hit = above ? [above] : rows.filter((r) => r.top > y0).slice(0, 1);
+    }
+    if (!hit.length) return null;
+    const main = files.get(hit[0].tag);
+    const lines = hit.filter((r) => files.get(r.tag) === main).map((r) => r.line);
+    return { file: main, from: Math.min(...lines), to: Math.max(...lines) };
+  }
+
+  /// Fingerabdruck aller Quellen eines Projekts (ohne .notizbuch und .git): ändert er sich, hat jemand geschrieben
+  function projectStamp(project) {
+    const out = [];
+    const walk = (d, depth) => {
+      let entries = [];
+      try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (e.name.startsWith(".")) continue;
+        const p = path.join(d, e.name);
+        if (e.isDirectory() && depth < 4) walk(p, depth + 1);
+        else if (e.isFile() && [".tex", ".bib", ".sty", ".cls", ".md"].includes(path.extname(e.name).toLowerCase())) {
+          try { const st = fs.statSync(p); out.push(`${path.relative(project.dir, p)}:${st.size}:${st.mtimeMs}`); } catch {}
+        }
+      }
+    };
+    walk(project.dir, 0);
+    return out.sort().join("|");
+  }
+
+  /// Gleich alle Dokumente des Projekts neu setzen (nach einem Auftrag), ohne die Ruhezeit. Ergebnis je Datei
+  async function buildProject(project, why) {
+    const results = [];
+    for (const file of mainFiles(project)) {
+      try { results.push({ file, ...(await build(project, file, why)) }); }
+      catch (e) { results.push({ file, ok: false, error: e.message }); }
+    }
+    return results;
+  }
+
+  /// Stand im Projekt festhalten (git; legt das Archiv beim ersten Mal an). Ergebnis: Kurzname des Commits oder null
+  async function commit(project, message) {
+    const git = (args) => run("/usr/bin/git", ["-c", "user.name=BetterNotes-Helfer", "-c", "user.email=helfer@localhost",
+      ...args], { cwd: project.dir, env: { HOME: os.homedir(), PATH: "/usr/bin:/bin" }, timeout: 30000 });
+    if (!fs.existsSync(path.join(project.dir, ".git"))) {
+      const init = await git(["init", "-q"]);
+      if (!init.ok) return null;
+      const ignore = path.join(project.dir, ".gitignore");
+      if (!fs.existsSync(ignore)) {
+        fs.writeFileSync(ignore, ".notizbuch/\n*.aux\n*.log\n*.synctex.gz\n*.fls\n*.fdb_latexmk\n" +
+          mainFiles(project).map((f) => "/" + f.replace(/\.tex$/, ".pdf")).join("\n") + "\n");
+      }
+    }
+    await git(["add", "-A", "."]);
+    const c = await git(["commit", "-q", "-m", message]);
+    if (!c.ok) return null; // nichts zu sichern
+    const h = await git(["rev-parse", "--short", "HEAD"]);
+    return h.ok ? h.output.trim() : null;
+  }
+
+  const hold = (dir, on) => { if (on) held.add(dir); else held.delete(dir); };
+
+  return { start, tick, build, compile, hold, findDoc, sourceSpot, projectStamp, buildProject, commit };
 }
 
 function runFile(bin, args, { cwd, env, timeout }) {

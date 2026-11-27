@@ -124,3 +124,29 @@ Karten in beide Richtungen. Einstellbar in config.json: `"vokabeln": {"effort": 
 Einrichtungslink für Mios iPhone: `zsh native/Notizbuch/claude-fragen/karten-link.sh` (legt ihn in die
 Zwischenablage). In der Lernkarten-App: ⋯ → Vokabelfotos → Link einsetzen.
 Test: `node server/test/karten.mjs` (Server) und `claude-fragen/test/helper-test.mjs` (Abschnitt Vokabelfotos).
+
+## LaTeX-Modus (latex.mjs)
+
+Ein Ordner unter `~/Documents/ClaudeCode` mit einer Datei `notizbuch.json` ist ein LaTeX-Projekt. Inhalt (alles
+wahlweise): `{"ordner": "Exciting Games", "dateien": ["antrag.tex", "ideen.tex"]}`. Ohne `ordner` heißt der Ordner im
+Notizbuch wie der am Mac, ohne `dateien` zählt jede .tex direkt im Ordner mit `\documentclass`.
+
+- Der Helfer sieht alle 3 s nach, ob sich Quellen geändert haben (gleich von wem), und setzt das Dokument nach 2 s Ruhe
+  neu: erst wie gewohnt auf A4 (`<Name>.pdf` neben der .tex, zum Einreichen), dann auf eine lange Seite für das
+  Notizbuch, mit gestrichelten Linien „S. n“ am Rand, wo im A4-PDF eine Seite beginnt. Die Präambel bleibt unverändert
+  (`.notizbuch/nb-lang.tex` wird mit `latexmk -usepretex` davorgesetzt). `% !TEX program = xelatex` bzw. `lualatex` in den
+  ersten Zeilen wählt die Engine.
+- Die Striche im Notizbuch wandern mit: Jede Gruppe hängt über SyncTeX an einer Quellzeile; über den Zeilen-Diff alt → neu
+  rückt sie an die neue Lage (wie das Lasso im Browser: dx/dy, neue ID). Wurde ihre Zeile umgeschrieben, an den Anfang der
+  neuen Fassung. Keine Server- oder App-Änderung nötig.
+- „Claude fragen“ (und „Claude schreiben lassen“) in einem solchen Dokument geht an einen Claude je Projekt (ein
+  fortlaufender Chat), der im Projektordner arbeitet und die Quellen ändern darf (Read, Edit, Write, Glob, Grep,
+  WebSearch; keine Shell). Er entscheidet selbst, ob die Nachricht ein Auftrag oder eine Frage ist, liest CLAUDE.md
+  (gemeinsames Gedächtnis mit den Threads) und schreibt Aufträge in AUFTRAEGE.md. Danach setzt der Helfer sofort neu,
+  gibt LaTeX-Fehler bis zu zweimal an Claude zurück und sichert den Stand mit git (legt das Archiv beim ersten Mal an).
+- Zustand je Dokument in `<Projekt>/.notizbuch/<Name>/` (zustand.json, stand/, bau/, a4/, fehler.txt beim letzten Fehler).
+- Einstellungen in config.json des Helfers, alle wahlweise: `"latex": {"an": false}` schaltet ab, `"wurzeln"`, `"texbin"`
+  (Vorgabe /Library/TeX/texbin), `"sekunden"`, `"ruhe"`.
+
+Tests: `node test/latex-test.mjs` (braucht latexmk) und gegen den lokalen Server
+`BASE=http://127.0.0.1:8791 KEY=testkey node native/Notizbuch/claude-fragen/test/latex-server-test.mjs`.
