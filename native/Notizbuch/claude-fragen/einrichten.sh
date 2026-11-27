@@ -40,6 +40,8 @@ mkdir -p "$DEST"
 chmod 700 "$DEST"
 # Die weiteren Seiten zum Nachlesen liegen in einem eigenen Teil neben dem Helfer (fehlt er, läuft der Helfer ohne sie)
 cp "$HERE/weitere-seiten.mjs" "$DEST/weitere-seiten.mjs"
+# LaTeX-Modus (latex.mjs): ebenso ein eigener Teil
+cp "$HERE/latex.mjs" "$DEST/latex.mjs"
 cp "$HERE/helfer.mjs" "$DEST/helfer.mjs"
 
 # macOS schützt Dokumente, Schreibtisch und Downloads: Ein Dienst im Hintergrund (launchd) darf dort ohne eigene
