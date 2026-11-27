@@ -490,7 +490,10 @@ export function create({ api, upload, log, getConfig, now = Date.now, run = runF
     const c = getConfig().latex || {};
     const home = os.homedir();
     // Ein Helfer mit eigenem Arbeitsordner (Tests) setzt nur, wenn seine config.json „latex“ nennt
-    const test = !!process.env.BETTERNOTES_HELFER_HOME && !getConfig().latex;
+    // (launchd setzt BETTERNOTES_HELFER_HOME auch beim echten Helfer, auf den Standardordner)
+    const own = process.env.BETTERNOTES_HELFER_HOME;
+    const test = !!own && path.resolve(own) !== path.join(home, "Library", "Application Support", "BetterNotes-Helfer") &&
+      !getConfig().latex;
     return {
       on: c.an !== false && !test,
       roots: (c.wurzeln || [path.join(home, "Documents", "ClaudeCode")]).map((r) => r.replace(/^~(?=$|\/)/, home)),
@@ -735,6 +738,8 @@ export function create({ api, upload, log, getConfig, now = Date.now, run = runF
 
   function start() {
     if (timer) return;
+    const c = cfg();
+    log(c.on ? `LaTeX-Modus an (${c.roots.join(", ")})` : "LaTeX-Modus aus");
     const loop = async () => {
       try { await tick(); } catch (e) { log("LaTeX:", e.message); }
       timer = setTimeout(loop, cfg().seconds * 1000);
