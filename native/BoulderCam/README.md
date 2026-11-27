@@ -5,10 +5,11 @@ Kamera zum Selbstfilmen beim Bouldern: Handy aufstellen, klettern, abspringen un
 - Großes Bild: die Frontkamera **verzögert** (20 s bis 2 min, Standard 40 s), ungespiegelt wie ein abgespieltes Video. Gewählt wird das Kameraformat mit dem größten Bildausschnitt (4:3 bei den meisten iPhones), Bildstabilisierung, Center Stage und Verzeichnungskorrektur sind aus.
 - **Lauter / Leiser** verlängert bzw. verkürzt die Verzögerung (5-s-Schritte bis 1 min, darüber 10 s); der neue Wert blitzt groß auf.
 - Klein unten links: das **Live-Bild**, gespiegelt wie bei einer normalen Selfie-Kamera, zum Ausrichten.
-- **Aufnahmeknopf**: nimmt das verzögerte Video ab der Stelle auf, die beim Drücken gezeigt wird, bis zur Stelle beim zweiten Drücken; das Video (mit Ton, ohne neu zu kodieren) kommt in Fotos.
+- **Zoom**: zwei Finger auf dem großen Bild zoomen (bis 5×), ein Finger verschiebt den Ausschnitt, Doppeltipp oder die Zoom-Anzeige oben rechts setzt zurück. Der Ausschnitt gilt gleichzeitig für Live-Bild und Wiedergabe; im Puffer liegt immer das ganze Bild.
+- **Aufnahmeknopf**: nimmt das verzögerte Video ab der Stelle auf, die beim Drücken gezeigt wird, bis zur Stelle beim zweiten Drücken; das Video (mit Ton) kommt in Fotos, und zwar nur der Ausschnitt, der beim ersten Drücken zu sehen war (dafür wird nach dem Stoppen neu kodiert).
 - Die letzten 2 min 10 s liegen als H.264 im Speicher (etwa 1 MB pro Sekunde), nichts landet ungefragt auf dem Gerät.
-- Kamerawechsel auf die hintere Ultraweitwinkel-Kamera oben rechts.
-- Die Bilder werden immer hochkant gespeichert; steht das Handy quer, bekommt die Datei eine Drehung mit, damit Fotos sie richtig zeigt.
+- Nur die Frontkamera. Welche Drehung sie für hochkant braucht, liest die App bei iOS ab (RotationCoordinator), sobald das Handy aufrecht steht, und merkt es sich (die Frontkamera des iPhone Air braucht 0° statt der üblichen 90°).
+- Die Bilder werden immer hochkant gepuffert; steht das Handy beim Aufnehmen quer, wird das gespeicherte Video gedreht, damit Fotos es richtig zeigt.
 
 Braucht iOS 17.2 (Lautstärketasten über `AVCaptureEventInteraction`).
 

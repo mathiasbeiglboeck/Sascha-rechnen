@@ -71,6 +71,8 @@ final class CameraEngine: NSObject, ObservableObject,
     private var recorder: ClipWriter?
     private var recSeq: Int?                 // next frame for the recording
     private var recAudioT = -Double.infinity // audio up to this time is in the recording
+    private var recCrop = CGRect(x: 0, y: 0, width: 1, height: 1)
+    private var recDegrees = 0
     private var feedTimer: DispatchSourceTimer?
     private var lastPublish = 0.0
 
@@ -205,17 +207,21 @@ final class CameraEngine: NSObject, ObservableObject,
 
     /// The record button: records the delayed video, from the moment shown
     /// when pressed until the moment shown at the second press.
-    func toggleRecording() {
-        if isRecording { stopRecording() } else { startRecording() }
+    /// `crop` is the zoomed part of the picture (0…1 coordinates) shown when the
+    /// button is pressed; only that part ends up in Photos.
+    func toggleRecording(crop: CGRect) {
+        if isRecording { stopRecording() } else { startRecording(crop: crop) }
     }
 
-    private func startRecording() {
-        let transform = Self.transform(for: lastOrientation, back: wantBack)
-        Self.diag("record start: orientation=\(lastOrientation.rawValue) back=\(wantBack) coordinatorCapture=\(rotationCoordinator?.videoRotationAngleForHorizonLevelCapture ?? -1)")
+    private func startRecording(crop: CGRect) {
+        let degrees = Self.rotationDegrees(for: lastOrientation, back: wantBack)
+        Self.diag("record start: orientation=\(lastOrientation.rawValue) degrees=\(degrees) crop=\(crop)")
         isRecording = true
         recordingStart = Date()
         dataQueue.async {
-            guard let writer = ClipWriter(transform: transform, audioSettings: self.audioSettings(),
+            self.recCrop = crop
+            self.recDegrees = degrees
+            guard let writer = ClipWriter(transform: .identity, audioSettings: self.audioSettings(),
                                           waitWhenBusy: false) else {
                 self.show("Aufnahme fehlgeschlagen.")
                 DispatchQueue.main.async { self.isRecording = false }
@@ -242,10 +248,15 @@ final class CameraEngine: NSObject, ObservableObject,
             guard let r = self.recorder else { return }
             self.recorder = nil
             self.recSeq = nil
+            let crop = self.recCrop, degrees = self.recDegrees
             r.finish { url in
                 guard let url else { self.show("Nichts aufgenommen."); return }
-                ClipWriter.saveToPhotos(url) { ok, msg in
-                    self.show(ok ? "Aufnahme in Fotos gespeichert" : (msg ?? ""))
+                self.show("Speichere …", seconds: 60)
+                ClipWriter.cropAndRotate(url, crop: crop, degrees: degrees) { final in
+                    guard let final else { self.show("Speichern fehlgeschlagen."); return }
+                    ClipWriter.saveToPhotos(final) { ok, msg in
+                        self.show(ok ? "Aufnahme in Fotos gespeichert" : (msg ?? ""))
+                    }
                 }
             }
         }
@@ -263,18 +274,16 @@ final class CameraEngine: NSObject, ObservableObject,
     }
 
     /// Frames are stored upright for a phone standing in portrait. When it
-    /// stands sideways, the file gets a rotation so Photos shows it the right
-    /// way up. The front camera's frames are not mirrored, which turns the
-    /// direction of the needed rotation around.
-    private static func transform(for orientation: UIDeviceOrientation, back: Bool) -> CGAffineTransform {
-        let degrees: CGFloat
+    /// stands sideways, the saved video is turned so Photos shows it the right
+    /// way up (clockwise degrees). The front camera's frames are not mirrored,
+    /// which turns the direction of the needed rotation around.
+    private static func rotationDegrees(for orientation: UIDeviceOrientation, back: Bool) -> Int {
         switch orientation {
-        case .landscapeLeft: degrees = back ? -90 : 90     // top of the phone points left
-        case .landscapeRight: degrees = back ? 90 : -90
-        case .portraitUpsideDown: degrees = 180
-        default: degrees = 0
+        case .landscapeLeft: return back ? -90 : 90     // top of the phone points left
+        case .landscapeRight: return back ? 90 : -90
+        case .portraitUpsideDown: return 180
+        default: return 0
         }
-        return CGAffineTransform(rotationAngle: degrees * .pi / 180)
     }
 
     // MARK: - Session setup (session queue)

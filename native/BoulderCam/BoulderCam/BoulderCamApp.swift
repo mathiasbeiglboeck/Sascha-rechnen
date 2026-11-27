@@ -16,9 +16,25 @@ struct ContentView: View {
     @StateObject private var cam = CameraEngine()
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("verzoegerungSekunden") private var savedDelay = CameraEngine.defaultDelay
-    @AppStorage("useBack") private var useBack = false
+    // Digital zoom: the part of the picture shown (live and replay alike) and
+    // later saved. The buffer always keeps the whole picture.
+    @AppStorage("zoom") private var zoom = 1.0
+    @AppStorage("zoomX") private var zoomX = 0.5
+    @AppStorage("zoomY") private var zoomY = 0.5
+    @State private var pinchStart: Double?
+    @State private var dragStart: CGPoint?
+    @State private var replaySize = CGSize(width: 300, height: 400)
     @State private var flashDelay = false
     @State private var flashToken = 0
+
+    static let maxZoom = 5.0
+
+    private var crop: CGRect {
+        let w = 1 / max(zoom, 1)
+        let x = min(max(zoomX - w / 2, 0), 1 - w)
+        let y = min(max(zoomY - w / 2, 0), 1 - w)
+        return CGRect(x: x, y: y, width: w, height: w)
+    }
 
     var body: some View {
         ZStack {
@@ -38,13 +54,13 @@ struct ContentView: View {
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
             cam.setDelay(savedDelay)
-            cam.start(back: useBack)
+            cam.start(back: false)
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
                 UIApplication.shared.isIdleTimerDisabled = true
-                cam.start(back: useBack)
+                cam.start(back: false)
             case .background:
                 cam.stop()
             default:
@@ -65,12 +81,57 @@ struct ContentView: View {
     // MARK: Delayed picture (never mirrored: it looks like a played-back video)
 
     private var replay: some View {
-        ReplayView(engine: cam)
+        ReplayView(engine: cam, crop: crop)
             .aspectRatio(cam.aspect, contentMode: .fit)
+            .background(GeometryReader { g in
+                Color.clear
+                    .onAppear { replaySize = g.size }
+                    .onChange(of: g.size) { _, size in replaySize = size }
+            })
             .overlay(alignment: .topLeading) { recordingBadge.padding(10) }
             .overlay { waitingHint }
             .overlay { delayFlash }
             .overlay(alignment: .bottom) { toastView.padding(.bottom, 16) }
+            .contentShape(Rectangle())
+            .gesture(zoomGesture)
+            .onTapGesture(count: 2) { resetZoom() }
+    }
+
+    /// Two fingers zoom, one finger moves the zoomed part.
+    private var zoomGesture: some Gesture {
+        let pinch = MagnifyGesture()
+            .onChanged { value in
+                let start = pinchStart ?? zoom
+                pinchStart = start
+                zoom = min(max(start * Double(value.magnification), 1), Self.maxZoom)
+                clampCenter()
+            }
+            .onEnded { _ in pinchStart = nil }
+        let drag = DragGesture(minimumDistance: 5)
+            .onChanged { value in
+                guard zoom > 1.01 else { return }
+                let start = dragStart ?? CGPoint(x: zoomX, y: zoomY)
+                dragStart = start
+                zoomX = Double(start.x) - Double(value.translation.width / max(replaySize.width, 1)) / zoom
+                zoomY = Double(start.y) - Double(value.translation.height / max(replaySize.height, 1)) / zoom
+                clampCenter()
+            }
+            .onEnded { _ in dragStart = nil }
+        return SimultaneousGesture(pinch, drag)
+    }
+
+    private func clampCenter() {
+        let half = 0.5 / max(zoom, 1)
+        zoomX = min(max(zoomX, half), 1 - half)
+        zoomY = min(max(zoomY, half), 1 - half)
+    }
+
+    private func resetZoom() {
+        withAnimation(.easeOut(duration: 0.2)) {
+            zoom = 1
+            zoomX = 0.5
+            zoomY = 0.5
+        }
     }
 
     @ViewBuilder private var recordingBadge: some View {
@@ -144,16 +205,19 @@ struct ContentView: View {
                 .background(Color.white.opacity(0.12), in: Capsule())
             }
             Spacer()
-            Button {
-                useBack.toggle()
-                cam.switchCamera(back: useBack)
-            } label: {
-                Image(systemName: "arrow.triangle.2.circlepath.camera")
-                    .font(.system(size: 18, weight: .medium))
-                    .frame(width: 44, height: 44)
-                    .background(Color.white.opacity(0.12), in: Circle())
+            if zoom > 1.01 {
+                // Shows the zoom; tapping it goes back to the whole picture.
+                Button { resetZoom() } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "plus.magnifyingglass")
+                        Text(zoom.formatted(.number.precision(.fractionLength(1))) + "×")
+                            .monospacedDigit()
+                    }
+                    .font(.system(.body, design: .rounded).weight(.medium))
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(Color.white.opacity(0.12), in: Capsule())
+                }
             }
-            .disabled(cam.isRecording)
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 16)
@@ -164,9 +228,9 @@ struct ContentView: View {
         VStack(spacing: 8) {
             HStack(alignment: .center) {
                 // Live picture for aiming: mirrored like a normal selfie camera.
-                LiveView(engine: cam)
+                LiveView(engine: cam, crop: crop)
                     .aspectRatio(cam.aspect, contentMode: .fit)
-                    .scaleEffect(x: useBack ? 1 : -1, y: 1)
+                    .scaleEffect(x: -1, y: 1)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .overlay(alignment: .bottomLeading) {
                         Text("LIVE")
@@ -177,7 +241,7 @@ struct ContentView: View {
                     }
                     .frame(width: 110, height: 140, alignment: .leading)
                 Spacer()
-                Button { cam.toggleRecording() } label: {
+                Button { cam.toggleRecording(crop: crop) } label: {
                     ZStack {
                         Circle().stroke(.white, lineWidth: 4).frame(width: 76, height: 76)
                         if cam.isRecording {

@@ -84,6 +84,76 @@ final class ClipWriter {
         }
     }
 
+    /// Cuts the zoomed part out of the full picture and turns it upright
+    /// (clockwise `degrees`). Without zoom and rotation the file stays as it is.
+    /// This needs re-encoding, so it takes a few seconds per minute of video.
+    static func cropAndRotate(_ url: URL, crop: CGRect, degrees: Int,
+                              done: @escaping (URL?) -> Void) {
+        let full = CGRect(x: 0, y: 0, width: 1, height: 1)
+        let rot = ((degrees % 360) + 360) % 360
+        if rot == 0 && crop.insetBy(dx: -0.001, dy: -0.001).contains(full) {
+            done(url)
+            return
+        }
+        Task {
+            let asset = AVURLAsset(url: url)
+            guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+                  let size = try? await track.load(.naturalSize),
+                  let duration = try? await asset.load(.duration),
+                  let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality)
+            else { done(nil); return }
+
+            func even(_ v: CGFloat) -> CGFloat { max(2, (v / 2).rounded(.down) * 2) }
+            let x = (crop.minX * size.width).rounded(), y = (crop.minY * size.height).rounded()
+            let w = even(crop.width * size.width), h = even(crop.height * size.height)
+
+            var t = CGAffineTransform(translationX: -x, y: -y)
+            var render = CGSize(width: w, height: h)
+            switch rot {
+            case 90:
+                t = t.concatenating(CGAffineTransform(rotationAngle: .pi / 2))
+                     .concatenating(CGAffineTransform(translationX: h, y: 0))
+                render = CGSize(width: h, height: w)
+            case 180:
+                t = t.concatenating(CGAffineTransform(rotationAngle: .pi))
+                     .concatenating(CGAffineTransform(translationX: w, y: h))
+            case 270:
+                t = t.concatenating(CGAffineTransform(rotationAngle: -.pi / 2))
+                     .concatenating(CGAffineTransform(translationX: 0, y: w))
+                render = CGSize(width: h, height: w)
+            default:
+                break
+            }
+
+            let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+            layer.setTransform(t, at: .zero)
+            let instruction = AVMutableVideoCompositionInstruction()
+            instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
+            instruction.layerInstructions = [layer]
+            let composition = AVMutableVideoComposition()
+            composition.renderSize = render
+            composition.frameDuration = CMTime(value: 1, timescale: 30)
+            composition.instructions = [instruction]
+
+            let out = FileManager.default.temporaryDirectory
+                .appendingPathComponent("BoulderCam-\(UUID().uuidString).mov")
+            export.videoComposition = composition
+            var ok = false
+            if #available(iOS 18.0, *) {
+                do { try await export.export(to: out, as: .mov); ok = true } catch { ok = false }
+            } else {
+                export.outputURL = out
+                export.outputFileType = .mov
+                await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                    export.exportAsynchronously { c.resume() }
+                }
+                ok = export.status == .completed
+            }
+            try? FileManager.default.removeItem(at: url)
+            done(ok ? out : nil)
+        }
+    }
+
     /// Moves the file into the Photos library, next to the videos of the normal camera.
     static func saveToPhotos(_ url: URL, done: @escaping (Bool, String?) -> Void) {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
