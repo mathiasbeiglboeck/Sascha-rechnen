@@ -339,11 +339,21 @@ export function shifted(wire, dx, dy) {
 const SOURCE_EXT = new Set([".tex", ".bib", ".sty", ".cls", ".bst", ".png", ".jpg", ".jpeg", ".pdf", ".eps", ".tikz"]);
 
 /// Projektordner: direkte Unterordner der Wurzeln mit einer notizbuch.json
-export function findProjects(roots) {
+const rootErrors = new Map(); // Wurzel → zuletzt gemeldeter Fehler (nur einmal ins Protokoll)
+export function findProjects(roots, log = null) {
   const out = [];
   for (const root of roots) {
     let entries = [];
-    try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { continue; }
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+      rootErrors.delete(root);
+    } catch (e) {
+      // EPERM: macOS lässt den Helfer nicht in „Dokumente“ (Festplattenvollzugriff für sein node fehlt)
+      if (log && rootErrors.get(root) !== e.code) log(`LaTeX: ${root} nicht lesbar (${e.code || e.message})` +
+        (e.code === "EPERM" ? ": dem node des Helfers Festplattenvollzugriff geben" : ""));
+      rootErrors.set(root, e.code);
+      continue;
+    }
     for (const e of entries) {
       if (!e.isDirectory() || e.name.startsWith(".")) continue;
       // Aufgelöst: TeX schreibt echte Pfade in .fls und SyncTeX (macOS: /var → /private/var)
@@ -697,7 +707,7 @@ export function create({ api, upload, log, getConfig, now = Date.now, run = runF
   async function tick() {
     const c = cfg();
     if (!c.on) return;
-    for (const project of findProjects(c.roots)) {
+    for (const project of findProjects(c.roots, log)) {
       if (held.has(project.dir)) continue;
       for (const file of mainFiles(project)) {
         const key = path.join(project.dir, file);
