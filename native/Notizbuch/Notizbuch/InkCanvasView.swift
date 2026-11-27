@@ -20,9 +20,9 @@ struct SelectionMenuContext {
 ///   wenn kopierte Striche zum Einsetzen bereitliegen.
 /// - Mit dem Lasso bleiben Ausschneiden, Kopieren, Löschen, Duplizieren und Einsetzen; im Menü einer Auswahl
 ///   kommen vorn die Einträge für Claude dazu (`selectionMenuItems`).
-/// - Das Menü einer Auswahl zeigt alle Einträge auf einmal, untereinander, in einer eigenen Liste neben der Auswahl
-///   (siehe `presentSelectionPanel`): Das Bearbeiten-Menü zeigt seit iPadOS 26 nur etwa drei davon und den Rest hinter
-///   einem Pfeil.
+/// - Das Menü einer Auswahl zeigt alle Einträge auf einmal, nebeneinander als kurze Reihe (Claudes Einträge als Kürzel
+///   wie „C?“, PencilKits als Symbole), in einer eigenen Liste neben der Auswahl (siehe `presentSelectionPanel`): Das
+///   Bearbeiten-Menü zeigt seit iPadOS 26 nur etwa drei davon und den Rest hinter einem Pfeil.
 /// - „Alles auswählen“ fällt immer weg. Bleibt nichts übrig, kommt kein Menü.
 /// - „Leerzeile (oben) einfügen“ fällt anhand von PencilKits eigenen Übersetzungen weg (die Einträge tragen zufällige
 ///   Kennungen), falls PencilKits Schalter dafür (siehe unten) fehlt.
@@ -165,9 +165,10 @@ final class InkCanvasView: PKCanvasView {
         // Schon offen für dieselbe Auswahl
         if panel != nil, let shown = panelSource, hypot(source.x - shown.x, source.y - shown.y) < 1 { return handled() }
         let region = visibleRegion(in: host)
-        // Breiter, wo Platz ist: Mit großer Schrift würden die Einträge sonst abgeschnitten, bis zwei gleich aussehen
-        let list = SelectionMenuPanel(sections: sections,
-                                      maxWidth: min(region.width >= 700 ? 520 : 360, max(region.width, 0)))
+        // Höchstens 520 breit: Mit üblicher Schrift ist das eine Reihe, mit großer Schrift oder am schmalen iPhone brechen
+        // die Abschnitte um (siehe SelectionMenuPanel)
+        let list = SelectionMenuPanel(sections: sections, maxWidth: min(520, max(region.width, 0)),
+                                      scale: host.traitCollection.displayScale)
         guard list.bounds.width <= region.width, list.bounds.height <= region.height else {
             Self.debugLog("Menü mit allen Einträgen passt nicht (\(list.bounds.size) in \(region.size)), "
                           + "Bearbeiten-Menü wie früher")
@@ -201,15 +202,15 @@ final class InkCanvasView: PKCanvasView {
         let estimate = selectionEstimate(at: point, target: target.map { space.convert($0, to: self) }, lasso: lasso)
         let area = estimate.area.union(CGRect(origin: point, size: .zero))
         var touchArea = area
-        // Nur ein Lasso, unter dem noch dieselbe Tinte liegt: Nach einem Verschieben liegt es, wo die Auswahl vorher war
-        if let lasso, lasso.unchanged, !lasso.rect.isNull, !lasso.rect.isInfinite,
-           lasso.rect.insetBy(dx: -60, dy: -60).contains(point) {
+        // Nur das Lasso dieser Auswahl (siehe menuBelongs): Nach einem Verschieben liegt es, wo die Auswahl vorher war
+        if let lasso, Self.menuBelongs(at: point, to: lasso) {
             touchArea = touchArea.union(lasso.rect)
         }
         let region = visibleRegion(in: host)
         guard panel.bounds.width <= region.width, panel.bounds.height <= region.height else { return }
-        panel.frame = Self.place(panel.bounds.size, near: convert(point, to: host), avoiding: convert(area, to: host),
-                                 within: region)
+        panel.frame = Self.onPixels(Self.place(panel.bounds.size, near: convert(point, to: host),
+                                               avoiding: convert(area, to: host), within: region),
+                                    scale: host.traitCollection.displayScale)
         panel.onChoose = { [weak self, weak panel] action in
             guard let self, let panel, self.panel === panel else { return }
             self.closePanel(animated: true, reason: "gewählt: \(action.title)")
@@ -227,9 +228,10 @@ final class InkCanvasView: PKCanvasView {
         watchTouches(in: window)
         panel.alpha = 0
         UIView.animate(withDuration: 0.12) { panel.alpha = 1 }
-        UIAccessibility.post(notification: .layoutChanged, argument: panel.firstRow)
+        UIAccessibility.post(notification: .layoutChanged, argument: panel.firstButton)
         Self.debugLog("Menü mit allen Einträgen bei \(panel.frame), Auswahl etwa \(convert(area, to: host)) "
                       + "(\(estimate.kind))")
+        Self.debugLog("Menü mit allen Einträgen in \(panel.lineCount) Reihe(n)")
         Self.debugLog("Menü mit allen Einträgen geht auf")
     }
 
@@ -247,11 +249,11 @@ final class InkCanvasView: PKCanvasView {
     }
 
     /// Wo die Auswahl ungefähr liegt, deren Menü bei `point` (Mitte oben der Auswahl, Koordinaten dieser Fläche)
-    /// aufgehen soll, der Reihe nach: PencilKits eigene Angabe `target`, wenn sie zum Punkt passt; das zuletzt gezogene
-    /// Lasso, wenn die Tinte darunter dieselbe ist und das Menü an ihm aufgeht; die Auswahl der vorigen Liste,
-    /// mitgewandert (verschoben); ein Rechteck so groß wie das Lasso, oben mittig am Punkt (die Auswahl wurde verschoben
-    /// oder dupliziert, bevor eine Liste aufging); sonst nur dieser Punkt. `lasso`: was selectionArea lieferte.
-    /// `kind` fürs Protokoll
+    /// aufgehen soll, der Reihe nach: das zuletzt gezogene Lasso, wenn das Menü zu ihm gehört (menuBelongs; PencilKit
+    /// zeigt die Auswahl dann mit diesem Lasso); PencilKits eigene Angabe `target`, wenn sie eine Fläche ist und zum
+    /// Punkt passt; die Auswahl der vorigen Liste, mitgewandert (verschoben, oder eine eingesetzte Kopie); ein Rechteck
+    /// so groß wie das Lasso, oben mittig am Punkt (die Auswahl wurde verschoben oder dupliziert, bevor eine Liste
+    /// aufging); sonst nur dieser Punkt. `lasso`: was selectionArea lieferte. `kind` fürs Protokoll
     private func selectionEstimate(at point: CGPoint, target: CGRect?,
                                    lasso: (rect: CGRect, unchanged: Bool)?) -> (area: CGRect, kind: String) {
         let z = max(zoomScale, 0.01)
@@ -260,14 +262,16 @@ final class InkCanvasView: PKCanvasView {
             knownSelection = (unzoomed, rect.applying(CGAffineTransform(scaleX: 1 / z, y: 1 / z)))
             return (rect, kind)
         }
-        // Der Punkt ist die Mitte oben der Auswahl: Eine Angabe, deren Oberkante nicht dort liegt, gehört nicht dazu
+        if let lasso, Self.menuBelongs(at: point, to: lasso) {
+            return remembered(lasso.rect, "Lasso")
+        }
+        // Der Punkt ist die Mitte oben der Auswahl: Eine Angabe, deren Oberkante nicht dort liegt, gehört nicht dazu.
+        // Unter 24 pt in beiden Richtungen ist sie keine Fläche: Im Simulator mit iOS 27 nennt PencilKit nur ein Quadrat
+        // von 5 pt an diesem Punkt (27.11.); die Liste lag dann auf der Auswahl
         if let target, !target.isNull, !target.isInfinite, target.width >= 1, target.height >= 1,
+           max(target.width, target.height) >= 24,
            abs(target.minY - point.y) <= 40, point.x >= target.minX - 40, point.x <= target.maxX + 40 {
             return remembered(target, "von PencilKit")
-        }
-        if let lasso, lasso.unchanged, !lasso.rect.isNull, !lasso.rect.isInfinite,
-           lasso.rect.insetBy(dx: -60, dy: -60).contains(point) {
-            return remembered(lasso.rect, "Lasso")
         }
         if let known = knownSelection {
             let moved = known.area.offsetBy(dx: unzoomed.x - known.source.x, dy: unzoomed.y - known.source.y)
@@ -309,8 +313,9 @@ final class InkCanvasView: PKCanvasView {
         guard panel.bounds.width <= region.width, panel.bounds.height <= region.height else {
             return closePanel(animated: true, reason: "Tastatur, kein Platz mehr")
         }
-        let frame = Self.place(panel.bounds.size, near: convert(anchor.point, to: host),
-                               avoiding: convert(anchor.area, to: host), within: region)
+        let frame = Self.onPixels(Self.place(panel.bounds.size, near: convert(anchor.point, to: host),
+                                             avoiding: convert(anchor.area, to: host), within: region),
+                                  scale: host.traitCollection.displayScale)
         guard frame != panel.frame else { return }
         Self.debugLog("Menü mit allen Einträgen neu bei \(frame) (Tastatur)")
         UIView.animate(withDuration: 0.25) { panel.frame = frame }
@@ -353,6 +358,23 @@ final class InkCanvasView: PKCanvasView {
         }
         let basic = least(candidates.map(clamped)), edge = least(corners.map(clamped))
         return covered(edge) < min(covered(basic) * 0.8, covered(basic) - 500) ? edge : basic
+    }
+
+    /// `rect` mit dem Ursprung auf ganzen Bildpunkten (`scale` Bildpunkte je Punkt): Innen liegt die Liste schon so,
+    /// sonst wären Kürzel und Symbole leicht unscharf
+    private static func onPixels(_ rect: CGRect, scale: CGFloat) -> CGRect {
+        let s = max(scale, 1)
+        return CGRect(x: (rect.minX * s).rounded() / s, y: (rect.minY * s).rounded() / s,
+                      width: rect.width, height: rect.height)
+    }
+
+    /// Gehört das Menü bei `point` (Mitte oben der Auswahl, Koordinaten dieser Fläche) zum zuletzt gezogenen Lasso
+    /// (selectionArea)? Die Tinte darunter ist dieselbe, und der Punkt liegt höchstens 60 pt daneben, aber nie tiefer als
+    /// seine Unterkante: Jeder ausgewählte Strich liegt zum Teil im Lasso, die Oberkante der Auswahl also höher. Eine
+    /// knapp darunter eingesetzte Kopie (ohne neues Lasso, die Tinte im Lasso bleibt dieselbe) gehört nicht dazu
+    private static func menuBelongs(at point: CGPoint, to lasso: (rect: CGRect, unchanged: Bool)) -> Bool {
+        lasso.unchanged && !lasso.rect.isNull && !lasso.rect.isInfinite
+            && lasso.rect.insetBy(dx: -60, dy: -60).contains(point) && point.y <= lasso.rect.maxY
     }
 
     /// Die Einträge als Abschnitte der Liste: Jedes Untermenü (auch inline) wird ein Abschnitt, ausgeblendete Einträge
@@ -405,21 +427,21 @@ final class InkCanvasView: PKCanvasView {
     /// Eine Berührung beginnt, während die Liste offen ist. Neben der Liste schließt sie sie gleich. Nicht am iPad mit
     /// dem Finger auf der Fläche: Dort liegt beim Schreiben oft der Handballen auf, und das soll die Liste nicht
     /// schließen. Ein Finger schließt sie dort erst mit einem kurzen Tippen (tapWhilePanelOpen) oder wenn die Seite zu
-    /// scrollen beginnt (CanvasController). Am iPhone nie, solange eine Zeile der Liste gedrückt ist: Deren Wahl ginge
-    /// sonst verloren. Am iPad drückt dann ein Finger oder der Handballen die Zeile (der Pencil kann nicht zugleich
-    /// woanders aufsetzen): Der Pencil schließt trotzdem, ebenso ein kurzes Tippen mit einem anderen Finger, und die
-    /// Zeile wählt beim Abheben nichts mehr
+    /// scrollen beginnt (CanvasController). Am iPhone nie, solange ein Eintrag der Liste gedrückt ist: Dessen Wahl ginge
+    /// sonst verloren. Am iPad drückt dann ein Finger oder der Handballen den Eintrag (der Pencil kann nicht zugleich
+    /// woanders aufsetzen): Der Pencil schließt trotzdem, ebenso ein kurzes Tippen mit einem anderen Finger, und der
+    /// Eintrag wählt beim Abheben nichts mehr
     private func touchDownWhilePanelOpen(_ touch: UITouch) {
-        guard let panel, !isFingerOnPencilCanvas(touch), drawingPolicy == .pencilOnly || !panel.isPressingRow,
+        guard let panel, !isFingerOnPencilCanvas(touch), drawingPolicy == .pencilOnly || !panel.isPressingButton,
               !panel.bounds.contains(touch.location(in: panel)) else { return }
         closeByTouch(at: touch.location(in: self))
     }
 
     /// Ein kurzes Tippen (unter 0,35 s, kaum bewegt) endete, während die Liste offen ist; `start`: wo es begann, in
     /// Fensterkoordinaten. So schließt am iPad ein Finger die Liste. Einen aufliegenden Handballen bricht iPadOS meist ab
-    /// oder er bleibt länger liegen; beides zählt nicht als Tippen. Auch während ein Handballen oder Daumen eine Zeile
-    /// drückt (der tippende Finger auf der Fläche ist nicht die Berührung auf der Zeile): Sonst führte deren Abheben die
-    /// Zeile aus
+    /// oder er bleibt länger liegen; beides zählt nicht als Tippen. Auch während ein Handballen oder Daumen einen Eintrag
+    /// drückt (der tippende Finger auf der Fläche ist nicht die Berührung auf dem Eintrag): Sonst führte dessen Abheben
+    /// den Eintrag aus
     private func tapWhilePanelOpen(_ touch: UITouch, startedAt start: CGPoint) {
         guard let panel, isFingerOnPencilCanvas(touch),
               !panel.bounds.contains(panel.convert(start, from: nil)) else { return }
@@ -659,6 +681,43 @@ final class InkCanvasView: PKCanvasView {
         Bundle(for: PKCanvasView.self).localizedString(forKey: $0, value: $0, table: "Localizable")
     })
 
+    /// Kennung für einen Eintrag (`selectionMenuItems`), den die Liste einer Auswahl als Kürzel `short` zeigt, etwa
+    /// „C?“ für „Claude fragen“. Der volle Titel bleibt für Bedienungshilfen und UIKits Bearbeiten-Menü
+    static func shortTitleIdentifier(_ short: String) -> UIAction.Identifier {
+        UIAction.Identifier(shortTitlePrefix + short)
+    }
+
+    /// Das Kürzel eines Eintrags (siehe shortTitleIdentifier), nil ohne
+    fileprivate static func shortTitle(of action: UIAction) -> String? {
+        let id = action.identifier.rawValue
+        guard id.hasPrefix(shortTitlePrefix), id.count > shortTitlePrefix.count else { return nil }
+        return String(id.dropFirst(shortTitlePrefix.count))
+    }
+
+    private static let shortTitlePrefix = "de.beiglboeck.notizbuch.kurz."
+
+    /// Das Symbol für einen von PencilKits Einträgen, an seinem Titel erkannt (sie tragen zufällige Kennungen):
+    /// Ausschneiden, Kopieren, Löschen, Duplizieren, Einsetzen. nil für andere, die Liste zeigt dann den Titel
+    fileprivate static func symbolName(for title: String) -> String? {
+        symbolNames[title.lowercased()]
+    }
+
+    /// Die Titel auf Englisch, auf Deutsch und so, wie PencilKit und UIKit sie selbst übersetzen (wie hiddenTitles)
+    private static let symbolNames: [String: String] = {
+        let known: [(english: String, german: String, symbol: String)] = [
+            ("Cut", "Ausschneiden", "scissors"), ("Copy", "Kopieren", "doc.on.doc"), ("Delete", "Löschen", "trash"),
+            ("Duplicate", "Duplizieren", "plus.square.on.square"), ("Paste", "Einsetzen", "doc.on.clipboard"),
+        ]
+        let bundles = [Bundle(for: PKCanvasView.self), Bundle(for: UIView.self)]
+        var names: [String: String] = [:]
+        for entry in known {
+            let titles = [entry.english, entry.german]
+                + bundles.map { $0.localizedString(forKey: entry.english, value: entry.english, table: "Localizable") }
+            for title in titles { names[title.lowercased()] = entry.symbol }
+        }
+        return names
+    }()
+
     private static func debugLog(_ text: String) {
         #if DEBUG
         NSLog("InkCanvasView: %@", text)
@@ -666,9 +725,13 @@ final class InkCanvasView: PKCanvasView {
     }
 }
 
-/// Das Menü einer Auswahl mit allen Einträgen (InkCanvasView.presentSelectionPanel): Abschnitte untereinander, je
-/// Eintrag eine Zeile mit Titel und Symbol wie in UIKits Menüs. Es liegt in der Ansicht über der Fläche, nicht in ihr:
-/// PencilKits Gesten (Lasso, Schreiben, Scrollen) sehen keine Berührung darin
+/// Das Menü einer Auswahl mit allen Einträgen (InkCanvasView.presentSelectionPanel): alle nebeneinander in einer
+/// kurzen Reihe wie UIKits Bearbeiten-Menü, aber ohne Pfeil zum Weiterblättern. Claudes Einträge stehen als Kürzel da
+/// („C?“, „C?+“, „CS“, „CS+“), PencilKits als Symbole (Schere, Kopieren, Papierkorb, Duplizieren), unbekannte mit
+/// ihrem Titel; Bedienungshilfen lesen immer den vollen Titel. Zwischen zwei Abschnitten liegt ein breiterer Strich.
+/// Passt nicht alles in eine Reihe (`maxWidth`: große Schrift, schmales iPhone), beginnt ein Abschnitt, der nicht mehr
+/// daneben passt, eine neue Reihe, und ein Abschnitt, der allein zu breit ist, bricht um. Die Liste liegt in der Ansicht
+/// über der Fläche, nicht in ihr: PencilKits Gesten (Lasso, Schreiben, Scrollen) sehen keine Berührung darin
 private final class SelectionMenuPanel: UIView {
     /// Ein Eintrag wurde angetippt
     var onChoose: ((UIAction) -> Void)?
@@ -676,69 +739,158 @@ private final class SelectionMenuPanel: UIView {
     var onHover: ((Bool) -> Void)?
     /// VoiceOver: Wischen mit zwei Fingern (Z-Form) schließt die Liste
     var onEscape: (() -> Void)?
-    /// Am iPad (nur der Pencil zeichnet): Schwebt der Pencil über der Liste oder tat er es eben noch, nimmt keine Zeile
+    /// Am iPad (nur der Pencil zeichnet): Schwebt der Pencil über der Liste oder tat er es eben noch, nimmt kein Eintrag
     /// eine Berührung mit dem Finger an. Das ist dann fast immer der Handballen
     var palmGuard = false
     /// Für Bedienungshilfen: Dorthin springt der Fokus, wenn die Liste aufgeht
-    private(set) var firstRow: UIView?
+    private(set) var firstButton: UIView?
+    /// In wie vielen Reihen die Einträge stehen (fürs Protokoll)
+    private(set) var lineCount = 0
     /// Schwebt der Pencil gerade über der Liste?
     private(set) var isHovered = false
     private var hoverEnded = Date.distantPast
-    private var rows: [SelectionMenuRow] = []
-    /// Wird gerade eine Zeile gedrückt?
-    var isPressingRow: Bool { rows.contains { $0.isTracking } }
+    private var buttons: [SelectionMenuButton] = []
+    /// Wird gerade ein Eintrag gedrückt?
+    var isPressingButton: Bool { buttons.contains { $0.isTracking } }
 
-    init(sections: [[UIAction]], maxWidth: CGFloat) {
+    /// Ein Eintrag in einer Reihe: Nummer seines Abschnitts und seine Nummer darin
+    private struct Slot {
+        let section: Int
+        let index: Int
+    }
+
+    /// Eine Reihe der Liste: ihre Einträge, ihre Breite, und ob sie mit einem neuen Abschnitt beginnt
+    private struct Line {
+        var slots: [Slot] = []
+        var width: CGFloat = 0
+        var startsSection = true
+    }
+
+    /// `scale`: Bildpunkte je Punkt. Feine Striche sind einen Bildpunkt breit, und alles liegt auf ganzen Bildpunkten
+    /// (scharf)
+    init(sections: [[UIAction]], maxWidth: CGFloat, scale: CGFloat) {
         super.init(frame: .zero)
         layer.shadowColor = UIColor.black.cgColor
         layer.shadowOpacity = 0.2
         layer.shadowRadius = 16
         layer.shadowOffset = CGSize(width: 0, height: 4)
-        let stack = UIStackView()
-        stack.axis = .vertical
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        for (index, section) in sections.enumerated() {
-            if index > 0 { stack.addArrangedSubview(Self.line(height: 8, alpha: 0.08)) }
-            for (row, action) in section.enumerated() {
-                if row > 0 { stack.addArrangedSubview(Self.line(height: 0.5, alpha: 0.18)) }
-                let button = SelectionMenuRow(action)
-                button.addAction(UIAction { [weak self] _ in self?.onChoose?(action) }, for: .touchUpInside)
-                button.ignoresTouch = { [weak self] touch in self?.isPalm(touch) ?? false }
-                stack.addArrangedSubview(button)
-                rows.append(button)
-                if firstRow == nil { firstRow = button }
-            }
-        }
-        // Gemessen, solange die Liste noch für sich steht (ohne Bindung an die noch leere Ansicht): so breit wie der
-        // längste Eintrag (mindestens 220, höchstens maxWidth), so hoch wie alle zusammen
-        let natural = stack.systemLayoutSizeFitting(UIView.layoutFittingCompressedSize).width
-        let width = ceil(min(max(natural, 220), maxWidth))
-        let height = stack.systemLayoutSizeFitting(CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
-                                                   withHorizontalFittingPriority: .required,
-                                                   verticalFittingPriority: .fittingSizeLevel).height
-        frame = CGRect(x: 0, y: 0, width: width, height: ceil(height))
-
         let background = UIVisualEffectView(effect: UIBlurEffect(style: .systemThickMaterial))
         background.layer.cornerRadius = Self.cornerRadius
         background.layer.cornerCurve = .continuous
         background.clipsToBounds = true
-        background.translatesAutoresizingMaskIntoConstraints = false
         addSubview(background)
-        background.contentView.addSubview(stack)
-        NSLayoutConstraint.activate([
-            background.topAnchor.constraint(equalTo: topAnchor),
-            background.bottomAnchor.constraint(equalTo: bottomAnchor),
-            background.leadingAnchor.constraint(equalTo: leadingAnchor),
-            background.trailingAnchor.constraint(equalTo: trailingAnchor),
-            stack.topAnchor.constraint(equalTo: background.contentView.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: background.contentView.bottomAnchor),
-            stack.leadingAnchor.constraint(equalTo: background.contentView.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: background.contentView.trailingAnchor),
-        ])
+
+        // Jeder Eintrag so schmal, wie sein Inhalt es erlaubt (gemessen, solange er noch für sich steht), mindestens 44,
+        // alle so hoch wie der höchste. Einer, der allein breiter als die ganze Liste wäre (ein sehr langer Titel), wird
+        // gekürzt
+        let limit = max(floor(maxWidth), 44)
+        var widths: [[CGFloat]] = []
+        var sectionButtons: [[SelectionMenuButton]] = []
+        var height: CGFloat = 44
+        for section in sections where !section.isEmpty {
+            var row: [SelectionMenuButton] = []
+            var rowWidths: [CGFloat] = []
+            for action in section {
+                let button = SelectionMenuButton(action)
+                let size = button.systemLayoutSizeFitting(UIView.layoutFittingCompressedSize)
+                rowWidths.append(min(max(ceil(size.width), 44), limit))
+                height = max(height, ceil(size.height))
+                button.addAction(UIAction { [weak self] _ in self?.onChoose?(action) }, for: .touchUpInside)
+                button.ignoresTouch = { [weak self] touch in self?.isPalm(touch) ?? false }
+                row.append(button)
+            }
+            widths.append(rowWidths)
+            sectionButtons.append(row)
+        }
+        buttons = sectionButtons.flatMap { $0 }
+        firstButton = buttons.first
+
+        let pixel = 1 / max(scale, 1)
+        let thin = pixel, wide: CGFloat = 6
+        let lines = Self.arrange(widths, maxWidth: limit, thin: thin, wide: wide)
+        lineCount = lines.count
+        let width = lines.map(\.width).max() ?? 0
+        let content = background.contentView
+        func separator(_ frame: CGRect, wide isWide: Bool) {
+            let line = UIView(frame: frame)
+            line.backgroundColor = UIColor.label.withAlphaComponent(isWide ? 0.08 : 0.18)
+            line.isUserInteractionEnabled = false
+            content.addSubview(line)
+        }
+        var y: CGFloat = 0
+        for (n, line) in lines.enumerated() {
+            if n > 0 {
+                separator(CGRect(x: 0, y: y, width: width, height: line.startsSection ? wide : thin),
+                          wide: line.startsSection)
+                y += line.startsSection ? wide : thin
+            }
+            // Eine kürzere Reihe verteilt den Rest ihrer Breite auf ihre Einträge, auf ganze Bildpunkte, den Rest bekommt
+            // der letzte: Alle Reihen enden rechts gleich
+            let spare = max(0, width - line.width) / CGFloat(line.slots.count)
+            let extra = floor(spare / pixel + 0.001) * pixel
+            var x: CGFloat = 0
+            for (j, slot) in line.slots.enumerated() {
+                if j > 0 {
+                    let newSection = slot.section != line.slots[j - 1].section
+                    separator(CGRect(x: x, y: y, width: newSection ? wide : thin, height: height), wide: newSection)
+                    x += newSection ? wide : thin
+                }
+                let w = j == line.slots.count - 1 ? width - x : widths[slot.section][slot.index] + extra
+                let button = sectionButtons[slot.section][slot.index]
+                button.frame = CGRect(x: x, y: y, width: w, height: height)
+                content.addSubview(button)
+                x += w
+            }
+            y += height
+        }
+        frame = CGRect(x: 0, y: 0, width: width, height: y)
+        background.frame = bounds
+        background.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         addGestureRecognizer(UIHoverGestureRecognizer(target: self, action: #selector(hovered(_:))))
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) wird nicht verwendet") }
+
+    /// Verteilt die Einträge (ihre Breiten, je Abschnitt) auf Reihen von höchstens `maxWidth`: Ein Abschnitt kommt ganz
+    /// neben den vorigen, wenn er dort noch passt, sonst in eine neue Reihe. Ist er allein zu breit, bricht er auf so
+    /// wenige Reihen wie möglich um, gleich voll (sonst stünde am Ende vielleicht einer allein). Zwischen zwei Einträgen
+    /// eines Abschnitts liegt `thin`, zwischen zwei Abschnitten `wide`. Jeder Eintrag ist höchstens `maxWidth` breit
+    private static func arrange(_ widths: [[CGFloat]], maxWidth: CGFloat, thin: CGFloat, wide: CGFloat) -> [Line] {
+        var lines: [Line] = []
+        var current = Line()
+        for (section, row) in widths.enumerated() where !row.isEmpty {
+            func span(_ range: Range<Int>) -> CGFloat {
+                row[range].reduce(0, +) + thin * CGFloat(range.count - 1)
+            }
+            let whole = span(row.indices)
+            if !current.slots.isEmpty {
+                if current.width + wide + whole <= maxWidth {
+                    current.slots += row.indices.map { Slot(section: section, index: $0) }
+                    current.width += wide + whole
+                    continue
+                }
+                lines.append(current)
+            }
+            // Je Reihe `size` Einträge, so viele wie möglich (ein einzelner passt immer)
+            var size = 1
+            for rows in 1...row.count {
+                let candidate = (row.count + rows - 1) / rows
+                let ranges = stride(from: 0, to: row.count, by: candidate).map { $0..<min($0 + candidate, row.count) }
+                if ranges.allSatisfy({ span($0) <= maxWidth }) {
+                    size = candidate
+                    break
+                }
+            }
+            let ranges = stride(from: 0, to: row.count, by: size).map { $0..<min($0 + size, row.count) }
+            for (n, range) in ranges.enumerated() {
+                current = Line(slots: range.map { Slot(section: section, index: $0) }, width: span(range),
+                               startsSection: n == 0)
+                if n < ranges.count - 1 { lines.append(current) }
+            }
+        }
+        if !current.slots.isEmpty { lines.append(current) }
+        return lines
+    }
 
     private func isPalm(_ touch: UITouch) -> Bool {
         palmGuard && touch.type == .direct && (isHovered || Date().timeIntervalSince(hoverEnded) < 0.5)
@@ -771,19 +923,12 @@ private final class SelectionMenuPanel: UIView {
         super.layoutSubviews()
         layer.shadowPath = UIBezierPath(roundedRect: bounds, cornerRadius: Self.cornerRadius).cgPath
     }
-
-    private static func line(height: CGFloat, alpha: CGFloat) -> UIView {
-        let line = UIView()
-        line.backgroundColor = UIColor.label.withAlphaComponent(alpha)
-        line.heightAnchor.constraint(equalToConstant: height).isActive = true
-        return line
-    }
 }
 
-/// Eine Zeile der Liste: Titel vorn, Symbol hinten, wie in UIKits Menüs. Ein Knopf, damit UIKit sie als einen
-/// behandelt (Bedienungshilfen, Antippen)
-private final class SelectionMenuRow: UIButton {
-    /// Berührungen, die die Zeile nicht annimmt (Handballen am iPad, siehe SelectionMenuPanel.palmGuard): Sie drückt
+/// Ein Eintrag der Liste: sein Kürzel, sein Symbol oder (unbekannt) sein Titel, in der Mitte. Ein Knopf, damit UIKit ihn
+/// als einen behandelt (Bedienungshilfen, Antippen); Bedienungshilfen lesen den vollen Titel
+private final class SelectionMenuButton: UIButton {
+    /// Berührungen, die der Eintrag nicht annimmt (Handballen am iPad, siehe SelectionMenuPanel.palmGuard): Er drückt
     /// sich dann nicht und wählt nichts
     var ignoresTouch: ((UITouch) -> Bool)?
     private var ignored = Set<ObjectIdentifier>()
@@ -792,34 +937,44 @@ private final class SelectionMenuRow: UIButton {
         super.init(frame: .zero)
         let enabled = !action.attributes.contains(.disabled)
         let color: UIColor = !enabled ? .tertiaryLabel : action.attributes.contains(.destructive) ? .systemRed : .label
-        let title = UILabel()
-        title.text = action.title
-        title.font = UIFont.preferredFont(forTextStyle: .body)
-        title.adjustsFontForContentSizeCategory = true
-        title.lineBreakMode = .byTruncatingTail
-        title.textColor = color
-        let icon = UIImageView(image: action.image)
-        icon.tintColor = color
-        icon.contentMode = .scaleAspectFit
-        icon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(textStyle: .body)
-        for view in [title, icon] as [UIView] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            view.isUserInteractionEnabled = false
-            addSubview(view)
+        let body = UIFontMetrics(forTextStyle: .body)
+        let short = InkCanvasView.shortTitle(of: action)
+        let symbol = short == nil ? InkCanvasView.symbolName(for: action.title).flatMap { UIImage(systemName: $0) } : nil
+        let content: UIView
+        var size: [NSLayoutConstraint] = []
+        if let symbol {
+            let icon = UIImageView(image: symbol)
+            icon.tintColor = color
+            icon.contentMode = .center
+            icon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(textStyle: .body, scale: .large)
+            // Alle Symbole gleich breit: Die Reihe wirkt ruhiger
+            let side = icon.widthAnchor.constraint(equalToConstant: ceil(body.scaledValue(for: 26)))
+            side.priority = UILayoutPriority(999)
+            size.append(side)
+            content = icon
+        } else {
+            let label = UILabel()
+            label.text = short ?? action.title
+            label.font = short != nil ? body.scaledFont(for: UIFont.systemFont(ofSize: 17, weight: .semibold))
+                : UIFont.preferredFont(forTextStyle: .body)
+            label.adjustsFontForContentSizeCategory = true
+            label.lineBreakMode = .byTruncatingTail
+            label.textColor = color
+            content = label
         }
-        NSLayoutConstraint.activate([
+        content.translatesAutoresizingMaskIntoConstraints = false
+        content.isUserInteractionEnabled = false
+        addSubview(content)
+        NSLayoutConstraint.activate(size + [
+            widthAnchor.constraint(greaterThanOrEqualToConstant: 44),
             heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
-            title.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
-            title.topAnchor.constraint(greaterThanOrEqualTo: topAnchor, constant: 11),
-            title.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -11),
-            title.centerYAnchor.constraint(equalTo: centerYAnchor),
-            icon.leadingAnchor.constraint(greaterThanOrEqualTo: title.trailingAnchor, constant: 16),
-            icon.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 24),
+            content.centerXAnchor.constraint(equalTo: centerXAnchor),
+            content.centerYAnchor.constraint(equalTo: centerYAnchor),
+            content.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 10),
+            content.topAnchor.constraint(greaterThanOrEqualTo: topAnchor, constant: 8),
         ])
         isEnabled = enabled
-        // Liegt der Handballen (nicht angenommen) schon auf der Zeile, käme der Pencil sonst gar nicht an
+        // Liegt der Handballen (nicht angenommen) schon auf dem Eintrag, käme der Pencil sonst gar nicht an
         isMultipleTouchEnabled = true
         isAccessibilityElement = true
         accessibilityLabel = action.title

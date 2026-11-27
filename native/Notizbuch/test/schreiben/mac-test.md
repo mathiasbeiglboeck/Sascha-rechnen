@@ -620,11 +620,16 @@ S8b, race B (`notesUnknown`):
 
 ## 4. Real devices (Mathias), after the cable install and the deploy
 
+„169“ in this part means the new app on the devices: 170 (the same batch plus the short lasso bar) or a later build,
+if the instructions name one. From 170 on, the lasso list is one short row: C? „Claude fragen“, C?+ „Claude
+gründlich fragen“, CS „Claude schreiben lassen“, CS+ „Claude gründlich schreiben lassen“, then symbols for
+Ausschneiden, Kopieren, Löschen and Duplizieren.
+
 R0. Deploy, then install (residual 9, APP-LOGIC-1):
 1. Server and helper first (Mathias): the server script with `claude/link-vorschau` and, right after it,
    `zsh native/Notizbuch/claude-fragen/einrichten.sh` from the updated checkout, in the same minute. Do not use
    „Claude schreiben lassen“ with page changes between the two (an old helper would re-run in the same chat).
-2. Then the app by cable: the Release build of 169, installed with devicectl over the installed app (bundle id
+2. Then the app by cable: the Release build of 169 (or of the later commit the instructions name), installed with devicectl over the installed app (bundle id
    `de.beiglboeck.notizbuch.R5W5PMUZKF`), after a backup of its data container; never uninstall. Deploying first
    avoids a rare race of the new app with the old server (S3a shows that window). If the app has to go on first,
    avoid deleting the question page of a write ask while Claude writes until the deploy.
@@ -633,7 +638,7 @@ R0. Deploy, then install (residual 9, APP-LOGIC-1):
    - `shasum -a 256 ~/Library/Application\ Support/BetterNotes-Helfer/helfer.mjs` equals
      `git show 29dfdae:native/Notizbuch/claude-fragen/helfer.mjs | shasum -a 256`. Do the same for weitere-seiten.mjs.
    - helfer.log shows the helper starting after the update.
-   - The gear window of the app shows version 169.
+   - The gear window of the app shows the version that was built.
 
 R2, R3, R4, R5 and R6 need only the cable install. R1 and R7 need the deploy.
 
@@ -641,7 +646,7 @@ R1, case A with real Claude (after the deploy):
 - R1a:
   1. On the iPad (169), in a throwaway notebook, write a task near the bottom of page 2 whose solution needs more
      room, for example a calculation with several steps.
-  2. Lasso it and choose „Claude gründlich schreiben lassen“.
+  2. Lasso it and choose „Claude gründlich schreiben lassen“ (CS+ from 170 on).
   3. While the bubble shows dots, open the overview, insert a page above page 2 and close the overview.
   4. Expected:
      - The bubble keeps waiting, with no error.
@@ -676,7 +681,7 @@ R4, sharing right after opening:
 R5, asking right after opening:
 1. Force-quit the app, reopen it and open a document with many notes (for example the writeMany kind, or a long
    answer).
-2. Immediately lasso a question on a page with notes and choose „Claude fragen“.
+2. Immediately lasso a question on a page with notes and choose „Claude fragen“ (C? from 170 on).
 3. Expected: the bubble appears within about a second, with no noticeable stall when opening or scrolling.
 
 R6, overview: right after opening that document after a fresh start, open the page overview. The thumbnails fill in

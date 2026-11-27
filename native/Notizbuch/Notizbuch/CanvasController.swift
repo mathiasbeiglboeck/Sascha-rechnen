@@ -354,7 +354,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             guard let self else { return }
             // Nicht mitten in einem Strich, sonst ginge er verloren. Auch nicht, solange die Liste einer Lasso-Auswahl
             // offen ist: Die neu gesetzte Zeichnung höbe Auswahl und Liste auf, etwa wenn der Pencil über der Liste
-            // weggehoben wird oder eine Zeile länger drückt
+            // weggehoben wird oder einen Eintrag länger drückt
             if self.toolBusy || (self.redrawWaitsForPencil && (self.pencilNear || self.canvas.isShowingSelectionPanel)) {
                 self.redrawInkSoon(waitForPencil: self.redrawWaitsForPencil)
                 return
@@ -2415,14 +2415,19 @@ extension CanvasController: UIGestureRecognizerDelegate {
     private var currentPagesVersion: Int { store.documents.first { $0.id == doc.id }?.pagesVersion ?? 0 }
 
     /// „Claude fragen“ und „Claude gründlich fragen“ vorn im Menü einer Lasso-Auswahl, dazu „Claude schreiben lassen“
-    /// (schnell und gründlich): Die markierte Schrift ist dann ein Auftrag, Claude schreibt ins Dokument
+    /// (schnell und gründlich): Die markierte Schrift ist dann ein Auftrag, Claude schreibt ins Dokument. Die Liste einer
+    /// Auswahl zeigt sie als Kürzel (C?, C?+, CS, CS+; Wunsch 27.11.), Bedienungshilfen und UIKits Menü den Titel
     private func askMenuItems(_ context: SelectionMenuContext) -> [UIMenuElement] {
-        [("quick", nil, "Claude fragen", "questionmark.bubble"),
-         ("thorough", nil, "Claude gründlich fragen", "text.bubble"),
-         ("quick", "write", "Claude schreiben lassen", "pencil.line"),
-         ("thorough", "write", "Claude gründlich schreiben lassen", "square.and.pencil")].map { effort, mode, title, symbol in
-            UIAction(title: title, image: UIImage(systemName: symbol)) { [weak self] _ in
-                self?.askClaude(effort: effort, mode: mode, from: context)
+        let entries: [(effort: String, mode: String?, title: String, short: String, symbol: String)] = [
+            ("quick", nil, "Claude fragen", "C?", "questionmark.bubble"),
+            ("thorough", nil, "Claude gründlich fragen", "C?+", "text.bubble"),
+            ("quick", "write", "Claude schreiben lassen", "CS", "pencil.line"),
+            ("thorough", "write", "Claude gründlich schreiben lassen", "CS+", "square.and.pencil"),
+        ]
+        return entries.map { entry in
+            UIAction(title: entry.title, image: UIImage(systemName: entry.symbol),
+                     identifier: InkCanvasView.shortTitleIdentifier(entry.short)) { [weak self] _ in
+                self?.askClaude(effort: entry.effort, mode: entry.mode, from: context)
             }
         }
     }
