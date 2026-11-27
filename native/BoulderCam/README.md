@@ -2,8 +2,8 @@
 
 Kamera zum Selbstfilmen beim Bouldern: Handy aufstellen, klettern, abspringen und den Versuch verzögert anschauen.
 
-- Großes Bild: die Frontkamera **verzögert** (20 s bis 2 min, Standard 40 s), ungespiegelt wie ein abgespieltes Video. Gewählt wird das Kameraformat mit dem größten Bildausschnitt (4:3 bei den meisten iPhones), Bildstabilisierung, Center Stage und Verzeichnungskorrektur sind aus.
-- **Lauter / Leiser** verlängert bzw. verkürzt die Verzögerung (5-s-Schritte bis 1 min, darüber 10 s); der neue Wert blitzt groß auf.
+- Großes Bild: die Frontkamera **verzögert** (10 s bis 2 min, Standard 30 s), ungespiegelt wie ein abgespieltes Video. Gewählt wird das Kameraformat mit dem größten Bildausschnitt (4:3 bei den meisten iPhones), Bildstabilisierung, Center Stage und Verzeichnungskorrektur sind aus.
+- **Lauter / Leiser** verlängert bzw. verkürzt die Verzögerung in 2-s-Schritten (das Menü oben bietet runde Werte); der neue Wert blitzt groß auf.
 - Klein unten links: das **Live-Bild**, gespiegelt wie bei einer normalen Selfie-Kamera, zum Ausrichten.
 - **Zoom**: zwei Finger auf dem großen Bild zoomen (bis 5×), ein Finger verschiebt den Ausschnitt, Doppeltipp oder die Zoom-Anzeige oben rechts setzt zurück. Der Ausschnitt gilt gleichzeitig für Live-Bild und Wiedergabe; im Puffer liegt immer das ganze Bild.
 - **Aufnahmeknopf**: nimmt das verzögerte Video ab der Stelle auf, die beim Drücken gezeigt wird, bis zur Stelle beim zweiten Drücken; das Video (mit Ton) kommt in Fotos, und zwar nur der Ausschnitt, der beim ersten Drücken zu sehen war (dafür wird nach dem Stoppen neu kodiert).

@@ -190,7 +190,9 @@ struct ContentView: View {
         HStack(spacing: 14) {
             Menu {
                 Picker("Verzögerung", selection: Binding(get: { cam.delay }, set: { cam.setDelay($0) })) {
-                    ForEach(CameraEngine.delayChoices, id: \.self) { d in
+                    // The menu offers round values; the volume buttons go in 2-s steps.
+                    ForEach(Array(Set(Array(stride(from: 10, through: 120, by: 10)) + [cam.delay])).sorted(),
+                            id: \.self) { d in
                         Text("\(Self.label(d)) verzögert").tag(d)
                     }
                 }

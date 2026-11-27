@@ -14,7 +14,7 @@ final class CameraEngine: NSObject, ObservableObject,
                           @unchecked Sendable {
 
     /// Volume up/down walk through these steps.
-    static let delayChoices = [20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80, 90, 100, 110, 120]
+    static let delayChoices = Array(stride(from: 10, through: 120, by: 2))
     static let defaultDelay = 30
     /// The buffer always holds the longest delay (plus a little), so a longer
     /// delay can be shown at once.
