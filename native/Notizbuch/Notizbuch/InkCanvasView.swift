@@ -45,6 +45,12 @@ final class InkCanvasView: PKCanvasView {
     /// Rechteck des zuletzt gezogenen Lassos in den Koordinaten dieser Fläche, und ob die Tinte darunter noch dieselbe ist
     /// (nil: keins). Das Menü einer Auswahl geht daneben auf statt darüber; setzt CanvasController
     var selectionArea: (() -> (rect: CGRect, unchanged: Bool)?)?
+    /// Rechteck der Striche, die seit dem letzten Lasso dazukamen oder sich bewegten, in den Koordinaten dieser Fläche
+    /// (nil: keine): nach Einsetzen, Duplizieren oder Verschieben die Auswahl. Setzt CanvasController
+    var selectionInk: (() -> CGRect?)?
+    /// Gleich beginnt eine Auswahl ohne eigenes Lasso: PencilKit zeigt ein Menü ohne Auswahl (etwa nur „Einsetzen“ an
+    /// einer leeren Stelle), oder in der Liste wurde Duplizieren gewählt. Setzt CanvasController
+    var onSelectionAhead: (() -> Void)?
     /// Der Pencil schwebt über der Liste einer Auswahl (true) oder nicht mehr (false). Die Liste liegt neben der Fläche,
     /// deren Schwebe-Geste dort endet; CanvasController hält die Seite dann trotzdem fest (Handballen)
     var onPanelHover: ((Bool) -> Void)?
@@ -189,9 +195,11 @@ final class InkCanvasView: PKCanvasView {
     }
 
     /// PencilKit zeigt ein anderes Menü als die Liste (etwa nur „Einsetzen“ an einer leeren Stelle, oder das
-    /// Bearbeiten-Menü, weil die Liste nicht passt): Die Auswahl der offenen Liste ist dann weg oder eine andere
-    fileprivate func editMenuWillShow() {
+    /// Bearbeiten-Menü, weil die Liste nicht passt): Die Auswahl der offenen Liste ist dann weg oder eine andere.
+    /// `selection`: Es ist das Menü einer Auswahl (die Liste passte nicht)
+    fileprivate func editMenuWillShow(selection: Bool) {
         if panel != nil { dismissSelectionMenu("anderes Menü") }
+        if !selection { onSelectionAhead?() }
     }
 
     private func show(_ panel: SelectionMenuPanel, from space: UIView, source: CGPoint, target: CGRect?) {
@@ -214,6 +222,8 @@ final class InkCanvasView: PKCanvasView {
         panel.onChoose = { [weak self, weak panel] action in
             guard let self, let panel, self.panel === panel else { return }
             self.closePanel(animated: true, reason: "gewählt: \(action.title)")
+            // Duplizieren: Dann ist die Kopie die Auswahl, und nur sie kommt neu dazu (selectionInk)
+            if Self.symbolName(for: action.title) == "plus.square.on.square" { self.onSelectionAhead?() }
             // Erst danach, wie bei UIKits Menüs
             DispatchQueue.main.async { action.performWithSender(nil, target: nil) }
         }
@@ -248,30 +258,51 @@ final class InkCanvasView: PKCanvasView {
         knownSelection = nil
     }
 
-    /// Wo die Auswahl ungefähr liegt, deren Menü bei `point` (Mitte oben der Auswahl, Koordinaten dieser Fläche)
-    /// aufgehen soll, der Reihe nach: das zuletzt gezogene Lasso, wenn das Menü zu ihm gehört (menuBelongs; PencilKit
-    /// zeigt die Auswahl dann mit diesem Lasso); PencilKits eigene Angabe `target`, wenn sie eine Fläche ist und zum
-    /// Punkt passt; die Auswahl der vorigen Liste, mitgewandert (verschoben, oder eine eingesetzte Kopie); ein Rechteck
-    /// so groß wie das Lasso, oben mittig am Punkt (die Auswahl wurde verschoben oder dupliziert, bevor eine Liste
-    /// aufging); sonst nur dieser Punkt. `lasso`: was selectionArea lieferte. `kind` fürs Protokoll
+    /// Wo die Auswahl ungefähr liegt, deren Menü bei `point` (Mitte oben der Auswahl, ohne Platz darüber Mitte unten;
+    /// Koordinaten dieser Fläche) aufgehen soll, der Reihe nach: das zuletzt gezogene Lasso, wenn das Menü zu ihm gehört
+    /// (menuBelongs; PencilKit zeigt die Auswahl dann mit diesem Lasso); PencilKits eigene Angabe `target`, wenn sie eine
+    /// Fläche ist und zum Punkt passt; die Striche, die seit dem Lasso dazukamen oder sich bewegten (selectionInk), wenn
+    /// der Punkt an ihrer Ober- oder Unterkante liegt; die Auswahl der vorigen Liste, mitgewandert (verschoben, oder eine
+    /// eingesetzte Kopie); ein Rechteck so groß wie das Lasso, oben mittig am Punkt (die Auswahl wurde verschoben oder
+    /// dupliziert, bevor eine Liste aufging); sonst nur dieser Punkt. `lasso`: was selectionArea lieferte. `kind` fürs
+    /// Protokoll
     private func selectionEstimate(at point: CGPoint, target: CGRect?,
                                    lasso: (rect: CGRect, unchanged: Bool)?) -> (area: CGRect, kind: String) {
         let z = max(zoomScale, 0.01)
         let unzoomed = CGPoint(x: point.x / z, y: point.y / z)
+        // Mitwandern rechnet von der Mitte oben aus: Nannte PencilKit die Mitte unten (über der Auswahl kein Platz),
+        // läge die Schätzung um die Höhe der Auswahl daneben, sobald ihr nächstes Menü wieder oben aufgeht
         func remembered(_ rect: CGRect, _ kind: String) -> (area: CGRect, kind: String) {
-            knownSelection = (unzoomed, rect.applying(CGAffineTransform(scaleX: 1 / z, y: 1 / z)))
+            if point.y > rect.midY {
+                knownSelection = nil
+            } else {
+                knownSelection = (unzoomed, rect.applying(CGAffineTransform(scaleX: 1 / z, y: 1 / z)))
+            }
             return (rect, kind)
         }
         if let lasso, Self.menuBelongs(at: point, to: lasso) {
             return remembered(lasso.rect, "Lasso")
         }
-        // Der Punkt ist die Mitte oben der Auswahl: Eine Angabe, deren Oberkante nicht dort liegt, gehört nicht dazu.
-        // Unter 24 pt in beiden Richtungen ist sie keine Fläche: Im Simulator mit iOS 27 nennt PencilKit nur ein Quadrat
-        // von 5 pt an diesem Punkt (27.11.); die Liste lag dann auf der Auswahl
+        // Der Punkt ist die Mitte oben der Auswahl (ohne Platz darüber die Mitte unten): Eine Angabe, deren Ober- oder
+        // Unterkante nicht dort liegt, gehört nicht dazu. Unter 24 pt in beiden Richtungen ist sie keine Fläche: Im
+        // Simulator mit iOS 27 nennt PencilKit nur ein Quadrat von 5 pt an diesem Punkt (27.11.); die Liste lag dann auf
+        // der Auswahl
         if let target, !target.isNull, !target.isInfinite, target.width >= 1, target.height >= 1,
-           max(target.width, target.height) >= 24,
-           abs(target.minY - point.y) <= 40, point.x >= target.minX - 40, point.x <= target.maxX + 40 {
+           max(target.width, target.height) >= 24, Self.atEdge(point, of: target) {
             return remembered(target, "von PencilKit")
+        }
+        // Eingesetzt, dupliziert oder verschoben: Die Auswahl sind die Striche, die seit dem Lasso dazukamen oder sich
+        // bewegten. PencilKit zeigt sie im Umriss des Lassos, so groß wie das Lasso, der Punkt mittig an seiner Ober-
+        // oder Unterkante: Liegen die Striche darin, gilt dieser Umriss samt den Strichen (auch bei locker gezogenem
+        // Lasso, und Tippen auf seinen Rand zählt als Tippen auf die Auswahl). Sonst die Striche allein, wenn der Punkt
+        // mittig an ihrem Rand liegt. Andernfalls gehören auch andere Striche dazu (etwa eben geschriebene)
+        if let ink = selectionInk?() {
+            if let lasso, let outline = Self.outline(of: lasso.rect.size, at: point, holding: ink) {
+                return remembered(outline.union(ink), "Striche seit dem Lasso")
+            }
+            if Self.atEdge(point, of: ink), abs(point.x - ink.midX) <= 40 {
+                return remembered(ink, "Striche seit dem Lasso")
+            }
         }
         if let known = knownSelection {
             let moved = known.area.offsetBy(dx: unzoomed.x - known.source.x, dy: unzoomed.y - known.source.y)
@@ -368,13 +399,34 @@ final class InkCanvasView: PKCanvasView {
                       width: rect.width, height: rect.height)
     }
 
-    /// Gehört das Menü bei `point` (Mitte oben der Auswahl, Koordinaten dieser Fläche) zum zuletzt gezogenen Lasso
-    /// (selectionArea)? Die Tinte darunter ist dieselbe, und der Punkt liegt höchstens 60 pt daneben, aber nie tiefer als
-    /// seine Unterkante: Jeder ausgewählte Strich liegt zum Teil im Lasso, die Oberkante der Auswahl also höher. Eine
-    /// knapp darunter eingesetzte Kopie (ohne neues Lasso, die Tinte im Lasso bleibt dieselbe) gehört nicht dazu
+    /// Gehört das Menü bei `point` (Mitte oben der Auswahl, ohne Platz darüber Mitte unten; Koordinaten dieser Fläche)
+    /// zum zuletzt gezogenen Lasso (selectionArea)? Die Tinte darunter ist dieselbe, und der Punkt liegt höchstens 60 pt
+    /// daneben, aber höchstens 24 pt unter seiner Unterkante: Jeder ausgewählte Strich liegt zum Teil im Lasso, die
+    /// Oberkante der Auswahl also höher. Ist über der Auswahl kein Platz für PencilKits Menü, nennt PencilKit die Mitte
+    /// unten, knapp unter dem Lasso (27.11., iPhone mit sehr großer Schrift: 1 pt darunter). Eine eingesetzte oder
+    /// duplizierte Kopie gehört nie dazu, auch knapp darunter nicht: Mit ihr ändert sich die Zahl der Striche, also der
+    /// Abdruck der Tinte (`unchanged` falsch, siehe inkPrint im CanvasController)
     private static func menuBelongs(at point: CGPoint, to lasso: (rect: CGRect, unchanged: Bool)) -> Bool {
         lasso.unchanged && !lasso.rect.isNull && !lasso.rect.isInfinite
-            && lasso.rect.insetBy(dx: -60, dy: -60).contains(point) && point.y <= lasso.rect.maxY
+            && lasso.rect.insetBy(dx: -60, dy: -60).contains(point) && point.y <= lasso.rect.maxY + 24
+    }
+
+    /// Liegt `point` (wo PencilKit sein Menü zeigen will) an der Ober- oder Unterkante von `rect`, waagrecht darüber oder
+    /// darunter, mit 40 pt Spiel? Dann kann `rect` die Auswahl dieses Menüs sein
+    private static func atEdge(_ point: CGPoint, of rect: CGRect) -> Bool {
+        !rect.isNull && !rect.isInfinite && (abs(rect.minY - point.y) <= 40 || abs(rect.maxY - point.y) <= 40)
+            && point.x >= rect.minX - 40 && point.x <= rect.maxX + 40
+    }
+
+    /// Der Umriss einer Auswahl so groß wie `size` (das Lasso), deren Menü PencilKit bei `point` zeigen will (Mitte
+    /// oben, ohne Platz darüber Mitte unten), wenn die Striche `ink` darin liegen; sonst nil. Erst genau, dann mit 16 pt
+    /// Spiel (ein Strich ragt etwas über das Lasso): Sonst nähme eine flache Auswahl knapp über dem Punkt den Umriss
+    /// darunter
+    private static func outline(of size: CGSize, at point: CGPoint, holding ink: CGRect) -> CGRect? {
+        guard size.width > 0, size.height > 0, !ink.isNull, !ink.isInfinite else { return nil }
+        let below = CGRect(x: point.x - size.width / 2, y: point.y, width: size.width, height: size.height)
+        let boxes = [below, below.offsetBy(dx: 0, dy: -size.height)]
+        return boxes.first { $0.contains(ink) } ?? boxes.first { $0.insetBy(dx: -16, dy: -16).contains(ink) }
     }
 
     /// Die Einträge als Abschnitte der Liste: Jedes Untermenü (auch inline) wird ein Abschnitt, ausgeblendete Einträge
@@ -560,7 +612,7 @@ final class InkCanvasView: PKCanvasView {
                     return UIMenu(children: [])
                 }
                 // Sonst kommt ein Menü von UIKit oder keins: keine Liste einer anderen Auswahl daneben
-                ink.editMenuWillShow()
+                ink.editMenuWillShow(selection: !extra.isEmpty)
             }
             // Nichts geändert: PencilKits Menü wie es ist (oder nil: UIKit zeigt seine Vorschläge)
             if removed == nil, extra.isEmpty { return result }
@@ -939,14 +991,22 @@ private final class SelectionMenuButton: UIButton {
         let color: UIColor = !enabled ? .tertiaryLabel : action.attributes.contains(.destructive) ? .systemRed : .label
         let body = UIFontMetrics(forTextStyle: .body)
         let short = InkCanvasView.shortTitle(of: action)
-        let symbol = short == nil ? InkCanvasView.symbolName(for: action.title).flatMap { UIImage(systemName: $0) } : nil
+        // Das Symbol in der Schriftgröße der Kürzel, fest beim Bauen (die Liste wird für jedes Menü neu gebaut und
+        // gemessen, bevor sie im Fenster liegt). Ohne seine Einzüge (alignmentRectInsets) rechnet Auto Layout mit dem
+        // ganzen Bild: Mit ihnen ragte es bei sehr großer Schrift unten über den Rand der Leiste (27.11.)
+        var symbol: UIImage?
+        if short == nil, let name = InkCanvasView.symbolName(for: action.title) {
+            let config = UIImage.SymbolConfiguration(font: body.scaledFont(for: UIFont.systemFont(ofSize: 17)),
+                                                     scale: .large)
+            symbol = UIImage(systemName: name, withConfiguration: config)?
+                .withRenderingMode(.alwaysTemplate).withAlignmentRectInsets(.zero)
+        }
         let content: UIView
         var size: [NSLayoutConstraint] = []
         if let symbol {
             let icon = UIImageView(image: symbol)
             icon.tintColor = color
             icon.contentMode = .center
-            icon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(textStyle: .body, scale: .large)
             // Alle Symbole gleich breit: Die Reihe wirkt ruhiger
             let side = icon.widthAnchor.constraint(equalToConstant: ceil(body.scaledValue(for: 26)))
             side.priority = UILayoutPriority(999)

@@ -68,6 +68,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     /// Rechteck des vorigen Lassos (Seitenpunkte), wenn ein gerader Zug danach seine Auswahl verschob (lassoEnded):
     /// Seine Größe taugt noch, um die Liste neben die verschobene Auswahl zu legen; sonst nichts
     private var movedLasso: CGRect?
+    /// Die Zeichnung, als das letzte Lasso gezogen wurde, mit ihrem k: Was seither dazukam oder sich bewegte, ist danach
+    /// die Auswahl (eingesetzt, dupliziert, verschoben), bis ein neues Lasso gezogen wird (selectionInkOnCanvas). Neu
+    /// gesetzt auch, wenn es gerade keine Auswahl gibt (rebaseLassoDrawing)
+    private var lassoDrawing: (drawing: PKDrawing, k: CGFloat)?
     /// ∞ mit dem Lasso: die Zeichnung beim Aufsetzen des laufenden Wegs (ein Wert, kostet nichts) und `k` dazu. Liegen
     /// Striche danach verschoben, hat der Weg eine Auswahl verschoben (strokesMoved)
     private var lassoStart: (drawing: PKDrawing, k: CGFloat)?
@@ -138,6 +142,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         /// Gezogene Wege des Lassos bis einschließlich diesem
         let path: Int
         let ended: Date
+        /// toolUses an seinem Ende (sein eigenes Werkzeug ist mitgezählt)
+        let toolUses: Int
     }
 
     private var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
@@ -225,6 +231,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         canvas.addGestureRecognizer(lassoTracker)
         canvas.selectionMenuItems = { [weak self] context in self?.askMenuItems(context) ?? [] }
         canvas.selectionArea = { [weak self] in self?.lassoAreaOnCanvas() }
+        canvas.selectionInk = { [weak self] in self?.selectionInkOnCanvas() }
+        canvas.onSelectionAhead = { [weak self] in self?.rebaseLassoDrawing() }
         canvas.onPanelHover = { [weak self] hovering in self?.panelHover(hovering) }
         // Markierungen der Fragen über der Tinte; Antippen öffnet die Antwort
         canvas.addSubview(askOverlay)
@@ -483,7 +491,12 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     /// Beginn des letzten erfolgreichen Abgleichs: So aktuell ist hier der Stand des Servers
     private var lastFetch = Date.distantPast
     private var localChanged = true
-    private var usingTool = false
+    private var usingTool = false {
+        didSet { if usingTool, !oldValue { toolUses += 1 } }
+    }
+    /// Wie oft ein Werkzeug zu arbeiten begann (PencilKits Stift und Lasso, der Radierer der App, auch ein kurzes
+    /// Antippen mit dem Radierer): Ein ∞ nimmt sein Mitziehen nur zurück, wenn seither keins begann (undoInfinityMove)
+    private var toolUses = 0
     /// Wann der Stift zuletzt abgesetzt wurde. PencilKit übernimmt den fertigen Strich erst kurz
     /// nach `canvasViewDidEndUsingTool` in die Zeichnung; wer in diesem Moment die Zeichnung
     /// ersetzt (fremde Striche einfügen), verliert den gerade geschriebenen Strich.
@@ -951,6 +964,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         settingDrawing = true
         canvas.drawing = drawing
         settingDrawing = false
+        rebaseLassoDrawing()
         // Ist noch etwas ungespeichert (etwa beim Neuzeichnen kurz nach dem Radieren), bleibt der Vergleichsstand
         // der zuletzt gespeicherte: Das nächste Speichern sieht dann den Unterschied und schreibt
         guard !dirty else { return }
@@ -1003,7 +1017,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         // PencilKits Lasso-Gesten aktiv, und eine Auswahl ließe sich verschieben. Der Stift löscht die Auswahl; mit
         // „Bearbeiten“ ist das Lasso wieder da
         if lasso && !viewOnly {
-            if !(canvas.tool is PKLassoTool) { canvas.tool = PKLassoTool() }
+            if !(canvas.tool is PKLassoTool) {
+                canvas.tool = PKLassoTool()
+                rebaseLassoDrawing()
+            }
         } else {
             canvas.tool = inkingTool()
             // Mit dem Lasso geht auch die Auswahl: ihr Menü mit allen Einträgen nicht offen lassen (siehe InkCanvasView)
@@ -1017,8 +1034,10 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         pointerGesture.isEnabled = pointing && !viewOnly
         lassoTracker.isEnabled = lasso && !viewOnly
         if !lassoTracker.isEnabled {
+            // Seine Größe bleibt: Eine danach eingesetzte Kopie zeigt PencilKit im Umriss dieses Lassos
+            // (selectionEstimate); zur Auswahl gehört es nicht mehr (unchanged ist dann falsch)
+            movedLasso = lassoPath?.bounds ?? movedLasso
             lassoPath = nil
-            movedLasso = nil
             lassoStart = nil
         }
         if !isPad { canvas.panGestureRecognizer.minimumNumberOfTouches = viewOnly ? 1 : 2 }
@@ -1179,6 +1198,7 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
             linkPreviewTouch = false
             if eraseStart == nil, g.state == .ended {
                 // Kurzes Antippen mit dem Finger (die Geste begann gar nicht erst): einmal radieren
+                toolUses += 1
                 toolUsedSinceSave = true
                 eraseStart = canvas.drawing
                 lastErasePoint = nil
@@ -2443,6 +2463,51 @@ extension CanvasController: UIGestureRecognizerDelegate {
         return (pagesView.convert(path.bounds, to: canvas), inkPrint(near: path.bounds) == path.inkPrint)
     }
 
+    /// Ab hier zählt neu, was dazukommt oder wandert (selectionInkOnCanvas): Gerade gibt es keine Auswahl (zum Lasso
+    /// gewechselt, ein Menü ohne Auswahl wie nur „Einsetzen“), gleich wird eine Kopie die Auswahl (Duplizieren in der
+    /// Liste), oder die Zeichnung wurde ersetzt (setDrawing hebt die Auswahl auf). Sonst zählten eben geschriebene,
+    /// fremde oder schon vorher kopierte Striche zur nächsten Auswahl. Ein Wert, kostet nichts
+    private func rebaseLassoDrawing() {
+        guard k > 0 else { return }
+        lassoDrawing = (canvas.drawing, k)
+    }
+
+    /// Wo die Striche liegen, die seit dem letzten Lasso dazukamen oder sich bewegten, als Rechteck auf der Leinwand (nil:
+    /// keine, oder noch kein Lasso). Nach Einsetzen, Duplizieren oder Verschieben ist das die Auswahl, egal ob PencilKit
+    /// ihr Menü oben oder unten zeigt. Abdrücke wie bei strokesMoved, nur von Strichen nahe dem Sichtbaren (die Auswahl
+    /// wurde eben angetippt): Unveränderte liegen in beiden Zeichnungen gleich, neue und verschobene fallen auf. Nur
+    /// wenn ein Menü aufgeht und das Lasso nicht mehr passt
+    private func selectionInkOnCanvas() -> CGRect? {
+        guard let base = lassoDrawing, let area = changedInk(since: base, now: (canvas.drawing, k)) else { return nil }
+        return pagesView.convert(area, to: canvas)
+    }
+
+    /// Rechteck (Seitenpunkte) der Striche nahe dem Sichtbaren, die in `now` dazukamen oder anders liegen als in `base`
+    /// (nil: keine). Zeichnungen in Leinwandpunkten, je mit ihrem Maßstab `k`
+    private func changedInk(since base: (drawing: PKDrawing, k: CGFloat),
+                            now: (drawing: PKDrawing, k: CGFloat)) -> CGRect? {
+        guard base.k > 0, now.k > 0 else { return nil }
+        let visible = pagesView.convert(canvas.bounds, from: canvas)
+        let seen = visible.insetBy(dx: -visible.width, dy: -visible.height)
+        let nearBefore = seen.applying(CGAffineTransform(scaleX: base.k, y: base.k))
+        let nearNow = seen.applying(CGAffineTransform(scaleX: now.k, y: now.k))
+        var old: [StrokePrint: Int] = [:]
+        for stroke in base.drawing.strokes where stroke.renderBounds.intersects(nearBefore) {
+            if let p = Self.strokePrint(stroke, k: base.k) { old[p, default: 0] += 1 }
+        }
+        var area = CGRect.null
+        for stroke in now.drawing.strokes where stroke.renderBounds.intersects(nearNow) {
+            guard let p = Self.strokePrint(stroke, k: now.k) else { continue }
+            if let n = old[p], n > 0 {
+                old[p] = n - 1
+            } else {
+                area = area.union(stroke.renderBounds)
+            }
+        }
+        guard !area.isNull, !area.isInfinite else { return nil }
+        return area.applying(CGAffineTransform(scaleX: 1 / now.k, y: 1 / now.k))
+    }
+
     /// Ein Weg des Lassos beginnt (auch Antippen): die Zeichnung merken, für ein ∞. Für ein ∞, über das noch nicht
     /// entschieden ist, ist das zugleich der Stand nach seinem Weg
     private func lassoBegan() {
@@ -2476,7 +2541,7 @@ extension CanvasController: UIGestureRecognizerDelegate {
             infinitiesWaiting.insert(lassoPaths)
             let before = start ?? (drawing: canvas.drawing, k: k)
             infinityDrawn(PendingInfinity(match: match, before: before.drawing, k: before.k, path: lassoPaths,
-                                          ended: Date()))
+                                          ended: Date(), toolUses: toolUses))
             return
         }
         // Ein anderer Weg nach einem ∞: PencilKits Menü wieder wie sonst
@@ -2487,24 +2552,41 @@ extension CanvasController: UIGestureRecognizerDelegate {
                 movedLasso = old.bounds
             }
             lassoPath = nil
+            // Ab dem Beginn dieses Wegs zählt neu, was wandert oder dazukommt (selectionInkOnCanvas): Ein kurzer Weg
+            // wählt etwas Kleines neu aus (dazu gehört nichts von früher) oder verschiebt die Auswahl (das legt
+            // PencilKit erst nach dem Abheben ab und zählt so mit). Außer er begann auf Strichen, die seit dem Lasso
+            // dazukamen oder wanderten: Dann zog er diese Auswahl weiter, und sie bleibt neu, auch wenn Rückgängig das
+            // Ziehen zurücknimmt
+            if let start {
+                let moved = lassoDrawing.flatMap { changedInk(since: $0, now: start) }
+                if !(moved?.insetBy(dx: -8 / s, dy: -8 / s).contains(points[0]) ?? false) { lassoDrawing = start }
+            }
             return
         }
         let box = LassoGeometry.bounds(points)
         lassoPath = LassoPath(points: points, bounds: box, inkPrint: inkPrint(near: box))
+        lassoDrawing = (canvas.drawing, k)
         movedLasso = nil
         // Die Liste einer früheren Auswahl taugt nicht mehr als Schätzung, wo die Auswahl liegt (außer der Weg begann auf
         // ihr und hat sie nur verschoben)
         canvas.forgetSelection(unlessStartingAt: pagesView.convert(points[0], to: canvas))
     }
 
-    /// Kennzahl der Tinte, die `box` (Seitenpunkte) berührt, in Seitenpunkten gerechnet (übersteht Drehen)
+    /// Kennzahl der Tinte, die `box` (Seitenpunkte) berührt, in Seitenpunkten gerechnet (übersteht Drehen). Mit der
+    /// Verschiebung der transform: Zieht PencilKit eine Auswahl mit, ändert es sie, auch wenn renderBounds das nicht
+    /// zeigen sollte (siehe StrokePrint). Und mit der Zahl aller Striche: Eingesetzt oder dupliziert (auch weit weg)
+    /// ist die Auswahl danach das Neue, nicht mehr, was dieses Lasso umschließt
     private func inkPrint(near box: CGRect) -> Int {
         guard k > 0 else { return 0 }
         let area = box.applying(CGAffineTransform(scaleX: k, y: k))
+        let strokes = canvas.drawing.strokes
         var h = Hasher()
-        for stroke in canvas.drawing.strokes where stroke.renderBounds.intersects(area) {
+        h.combine(strokes.count)
+        for stroke in strokes where stroke.renderBounds.intersects(area) {
             let b = stroke.renderBounds
             for v in [b.minX, b.minY, b.maxX, b.maxY] { h.combine(Int((v / k * 4).rounded())) }
+            h.combine((stroke.transform.tx / k * 4).rounded())
+            h.combine((stroke.transform.ty / k * 4).rounded())
             h.combine(stroke.path.count)
         }
         return h.finalize()
@@ -2630,7 +2712,8 @@ extension CanvasController: UIGestureRecognizerDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.infinitySettled(pending) }
     }
 
-    /// PencilKit ist fertig. Hat der Weg Striche verschoben (er begann in einer Auswahl), nur ein Hinweis. Sonst fällt
+    /// PencilKit ist fertig. Hat der Weg Striche verschoben (er begann in einer Auswahl und zog sie mit), nimmt die App
+    /// das zurück, wenn es geht (undoInfinityMove; nicht nach einem neuen Weg); sonst nur ein Hinweis. Dann fällt
     /// PencilKits Auswahl weg, außer ein neuer Weg des Lassos hat inzwischen begonnen (der bleibt ungestört), und die
     /// Frage geht hinaus. Gespiegelt und an Abläufen geprüft in test/unendlich/entscheidung.js (mit strokesMoved)
     private func infinitySettled(_ pending: PendingInfinity) {
@@ -2651,13 +2734,26 @@ extension CanvasController: UIGestureRecognizerDelegate {
         // Wartet ein neueres ∞ noch, bleibt sein Menü gesperrt
         let newest = pending.path == lastInfinity
         let match = pending.match
+        #if DEBUG
+        NSLog("Asks-Debug: ∞ entschieden, seither %ld Werkzeug(e), gerade %@, Striche vorher %@ / nachher %@",
+              toolUses - pending.toolUses, toolBusy ? "beschäftigt" : "frei", Self.strokesForLog(pending.before),
+              Self.strokesForLog(after.drawing))
+        #endif
         if Self.strokesMoved(before: pending.before, kBefore: pending.k, now: after.drawing, k: after.k) {
-            if newest { canvas.menuBlockedUntil = .distantPast }
-            Log.ink.info("Lasso-∞ verschob Striche: keine Frage")
-            // Kamen inzwischen fremde Striche, gibt es kein Rückgängig mehr (applyPending)
-            let back = canvas.undoManager?.canUndo == true ? "Rückgängig" : "zurückschieben"
-            onFlashTimed("∞ hat die Auswahl verschoben – \(back), dann die Auswahl aufheben", 3)
-            return
+            // nil: nicht versucht
+            let undone = newPath ? nil : undoInfinityMove(pending)
+            if undone == true {
+                Log.ink.info("Lasso-∞ verschob Striche: zurückgenommen")
+            } else {
+                if newest { canvas.menuBlockedUntil = .distantPast }
+                Log.ink.info("Lasso-∞ verschob Striche: keine Frage")
+                // „Rückgängig“ nur, wenn es das Verschieben träfe: nicht schon vergeblich versucht, seither kein
+                // Werkzeug, und es gibt noch Rückgängig (fremde Striche räumen es ab, applyPending)
+                let back = undone == nil && toolUses == pending.toolUses && canvas.undoManager?.canUndo == true
+                    ? "Rückgängig" : "zurückschieben"
+                onFlashTimed("∞ hat die Auswahl verschoben – \(back), dann die Auswahl aufheben", 3)
+                return
+            }
         }
         Log.ink.info("Lasso-∞: \(match.summary, privacy: .public)")
         if newPath {
@@ -2671,7 +2767,7 @@ extension CanvasController: UIGestureRecognizerDelegate {
     }
 
     /// Hat ein Weg des Lassos Striche verschoben (er begann in einer Auswahl)? Dann fehlt ein Strich von vorher, und
-    /// ein gleicher (gleich groß, gleich viele Punkte) kam an anderer Stelle dazu. Nur gelöscht (Radierer, Rückgängig,
+    /// ein gleicher (gleich geformt, gleich viele Punkte) kam an anderer Stelle dazu. Nur gelöscht (Radierer, Rückgängig,
     /// ein anderes Gerät) oder nur dazugekommen zählt nicht. Über alle Striche: Eine verschobene Auswahl kann weit weg
     /// vom ∞ liegen. Zeichnungen in Leinwandpunkten, je mit ihrem Maßstab `k`
     private static func strokesMoved(before: PKDrawing, kBefore: CGFloat, now: PKDrawing, k: CGFloat) -> Bool {
@@ -2682,27 +2778,66 @@ extension CanvasController: UIGestureRecognizerDelegate {
         return new.contains { p, n in (old[p] ?? 0) < n && gone.contains(p.shape) }
     }
 
-    /// Abdruck eines Strichs für strokesMoved: Lage und Größe in ¼ Seitenpunkten, Zahl der Punkte. Gerundet, aber nie
-    /// in Int umgewandelt (ein Strich ohne Punkte hat keine endliche Lage)
+    /// Abdruck eines Strichs für strokesMoved: wo sein erster Punkt liegt und wie weit es von dort bis zum letzten ist,
+    /// in ¼ Seitenpunkten, und die Zahl der Punkte. Aus den Punkten samt transform, nicht aus renderBounds: Im Simulator
+    /// mit iOS 27 erkannte der Vergleich über renderBounds nicht, dass ein ∞ die Auswahl mitgezogen hatte (27.11.).
+    /// Gerundet, aber nie in Int umgewandelt
     private struct StrokePrint: Hashable {
-        let x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat
+        let x: CGFloat, y: CGFloat, dx: CGFloat, dy: CGFloat
         let points: Int
         /// Ohne die Lage: bleibt gleich, wenn der Strich nur verschoben wurde
-        var shape: [CGFloat] { [w, h, CGFloat(points)] }
+        var shape: [CGFloat] { [dx, dy, CGFloat(points)] }
     }
 
-    /// Wie oft jeder Abdruck vorkommt (StrokePrint), in Seitenpunkten wie inkPrint
+    /// Abdruck eines Strichs in Seitenpunkten wie inkPrint (`k` > 0); nil für einen Strich ohne Punkte
+    private static func strokePrint(_ stroke: PKStroke, k: CGFloat) -> StrokePrint? {
+        func q(_ v: CGFloat) -> CGFloat { (v / k * 4).rounded() }
+        guard let first = stroke.path.first?.location.applying(stroke.transform),
+              let last = stroke.path.last?.location.applying(stroke.transform) else { return nil }
+        return StrokePrint(x: q(first.x), y: q(first.y), dx: q(last.x - first.x), dy: q(last.y - first.y),
+                           points: stroke.path.count)
+    }
+
+    /// Wie oft jeder Abdruck vorkommt (StrokePrint), in Seitenpunkten wie inkPrint. Striche ohne Punkte zählen nicht
     private static func strokePrints(_ drawing: PKDrawing, k: CGFloat) -> [StrokePrint: Int] {
         guard k > 0 else { return [:] }
-        func q(_ v: CGFloat) -> CGFloat { (v / k * 4).rounded() }
         var prints: [StrokePrint: Int] = [:]
         for stroke in drawing.strokes {
-            let b = stroke.renderBounds
-            prints[StrokePrint(x: q(b.minX), y: q(b.minY), w: q(b.width), h: q(b.height), points: stroke.path.count),
-                   default: 0] += 1
+            if let p = strokePrint(stroke, k: k) { prints[p, default: 0] += 1 }
         }
         return prints
     }
+
+    /// Nimmt zurück, was ein ∞ mit dem Lasso mitgezogen hat: PencilKits Verschieben ist dann das Letzte, was Rückgängig
+    /// kennt (kein neuer Weg, seit dem ∞ kein Werkzeug begonnen; fremde Änderungen räumen Rückgängig ab). Nie während
+    /// ein Werkzeug arbeitet (nach 2 s entscheidet infinitySettled auch dann): Ein Strich unterwegs ginge verloren.
+    /// Gilt nur, wenn danach alles wieder wie beim Aufsetzen des ∞ liegt; sonst wird es wiederholt, und nichts ist
+    /// verloren (false). nil: nicht versucht. Zählt wie das Rückgängig der Leiste als eigene Änderung und geht so an die
+    /// anderen Geräte
+    private func undoInfinityMove(_ pending: PendingInfinity) -> Bool? {
+        guard !toolBusy, toolUses == pending.toolUses, let undo = canvas.undoManager, undo.canUndo else { return nil }
+        toolUsedSinceSave = true
+        undo.undo()
+        if Self.strokePrints(canvas.drawing, k: k) == Self.strokePrints(pending.before, k: pending.k) { return true }
+        #if DEBUG
+        NSLog("Asks-Debug: ∞ zurücknehmen ging nicht, wiederholt (%@)", Self.strokesForLog(canvas.drawing))
+        #endif
+        if undo.canRedo { undo.redo() }
+        return false
+    }
+
+    #if DEBUG
+    /// Fürs Protokoll: die ersten drei Striche mit Punktzahl, erstem Punkt, renderBounds und Verschiebung der transform
+    private static func strokesForLog(_ drawing: PKDrawing) -> String {
+        let shown = drawing.strokes.prefix(3).map { stroke -> String in
+            let first = stroke.path.first.map { "\($0.location)" } ?? "keiner"
+            return "[\(stroke.path.count) Punkte, erster \(first), rb \(stroke.renderBounds), "
+                + "tf \(stroke.transform.tx), \(stroke.transform.ty)]"
+        }
+        let more = drawing.strokes.count > 3 ? " … (\(drawing.strokes.count) Striche)" : ""
+        return shown.joined(separator: " ") + more
+    }
+    #endif
 
     /// „Was bedeutet das?“ zur Stelle unter dem ∞: eine schnelle Frage wie mit „Claude fragen“. Die Frage steht
     /// gedruckt im Bild der Stelle (Server und Helfer reichen nur die Bilder weiter), und das ist ein JPEG: Mit einem

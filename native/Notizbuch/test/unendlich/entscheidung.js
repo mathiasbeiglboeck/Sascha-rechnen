@@ -1,7 +1,8 @@
 // Entscheidung nach einem ∞ mit dem Lasso: spiegelt lassoBegan, lassoEnded, infinityDrawn, infinitySettled,
-// strokesMoved und strokePrints aus Notizbuch/CanvasController.swift und prüft sie mit simulierter Zeit an Abläufen:
-// Antippen der Auswahl, ein neuer Weg, zwei ∞ hintereinander, Tab-Wechsel, eine verschobene Auswahl, fremde Änderungen
-// (auch fremd verschobene Striche, wie sie ein anderes Gerät, der Browser oder eingefügte Seiten bringen), Drehen.
+// strokesMoved, strokePrints und undoInfinityMove aus Notizbuch/CanvasController.swift und prüft sie mit simulierter
+// Zeit an Abläufen: Antippen der Auswahl, ein neuer Weg, zwei ∞ hintereinander, Tab-Wechsel, eine verschobene Auswahl
+// (seit 171 mit Rückgängig zurückgenommen, nicht während eines anderen Werkzeugs), fremde Änderungen (auch fremd
+// verschobene Striche, wie sie ein anderes Gerät, der Browser oder eingefügte Seiten bringen), Drehen.
 // PencilKit ist dabei nur nachgebildet (Annahmen bei `touch` und `remote`); das ersetzt keinen Test am Gerät.
 // Teil 1 vergleicht die gespiegelten Zeilen mit dem Swift-Code: Ändert sich dort etwas, hier nachziehen. Jeder Ablauf
 // läuft auch mit der Fassung vor den Korrekturen („vorher“, Commit 9f28905); sie muss an den genannten Stellen scheitern.
@@ -44,7 +45,8 @@ const ended = between(swift, "private func lassoEnded(", "private func inkPrint(
 const drawn = between(swift, "private func infinityDrawn(", "private func infinitySettled(");
 const settled = between(swift, "private func infinitySettled(", "private static func strokesMoved(");
 const moved = between(swift, "private static func strokesMoved(", "private struct StrokePrint");
-const prints = between(swift, "private struct StrokePrint", "private func askMeaning(");
+const prints = between(swift, "private struct StrokePrint", "private func undoInfinityMove(");
+const undoRegion = between(swift, "private func undoInfinityMove(", "private static func strokesForLog(");
 const whenIdle = between(swift, "private func applyPendingWhenIdle(", "private func applyPending(");
 const applyP = between(swift, "private func applyPending(", "private func setDrawing(");
 const toolEnd = between(swift, "func canvasViewDidEndUsingTool(", "private func moveCursor(");
@@ -52,7 +54,7 @@ order("lassoBegan", began, ["let start = (drawing: canvas.drawing, k: k)", "lass
   "for path in infinitiesWaiting where infinityNext[path] == nil { infinityNext[path] = start }"]);
 order("lassoEnded", ended, ["lastLassoEnd = Date()", "guard points.count >= 8 else { return }", "lassoPaths += 1",
   "if let match = InfinityGesture.detect(raw, scale: s) {", "lastInfinity = lassoPaths", "infinitiesWaiting.insert(lassoPaths)",
-  "return", "canvas.menuBlockedUntil = .distantPast"]);
+  "ended: Date(), toolUses: toolUses))", "return", "canvas.menuBlockedUntil = .distantPast"]);
 lines("infinityDrawn", drawn, ["canvas.menuBlockedUntil = Date().addingTimeInterval(3)",
   "DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.infinitySettled(pending) }"]);
 order("infinitySettled", settled, [
@@ -64,17 +66,26 @@ order("infinitySettled", settled, [
   "let after = infinityNext.removeValue(forKey: pending.path) ?? (drawing: canvas.drawing, k: k)",
   "let newest = pending.path == lastInfinity",
   "if Self.strokesMoved(before: pending.before, kBefore: pending.k, now: after.drawing, k: after.k) {",
+  "let undone = newPath ? nil : undoInfinityMove(pending)", "if undone == true {", "} else {",
   "if newest { canvas.menuBlockedUntil = .distantPast }",
-  "canvas.undoManager?.canUndo == true ? \"Rückgängig\" : \"zurückschieben\"",
+  "let back = undone == nil && toolUses == pending.toolUses && canvas.undoManager?.canUndo == true ? \"Rückgängig\" : \"zurückschieben\"",
   "onFlashTimed(\"∞ hat die Auswahl verschoben – \\(back), dann die Auswahl aufheben\", 3)", "return",
   "if newPath {", "if newest { canvas.menuBlockedUntil = .distantPast }", "} else {",
   "canvas.menuBlockedUntil = Date().addingTimeInterval(0.3)", "endLassoSelection()", "askMeaning(match)"]);
 lines("strokesMoved", moved, ["let old = strokePrints(before, k: kBefore), new = strokePrints(now, k: k)",
   "for (p, n) in old where (new[p] ?? 0) < n { gone.insert(p.shape) }", "guard !gone.isEmpty else { return false }",
   "return new.contains { p, n in (old[p] ?? 0) < n && gone.contains(p.shape) }"]);
-lines("strokePrints", prints, ["var shape: [CGFloat] { [w, h, CGFloat(points)] }",
+lines("strokePrints", prints, ["var shape: [CGFloat] { [dx, dy, CGFloat(points)] }",
   "func q(_ v: CGFloat) -> CGFloat { (v / k * 4).rounded() }", "for stroke in drawing.strokes {",
-  "StrokePrint(x: q(b.minX), y: q(b.minY), w: q(b.width), h: q(b.height), points: stroke.path.count)"]);
+  "guard let first = stroke.path.first?.location.applying(stroke.transform), let last = stroke.path.last?.location.applying(stroke.transform) else { return nil }",
+  "return StrokePrint(x: q(first.x), y: q(first.y), dx: q(last.x - first.x), dy: q(last.y - first.y), points: stroke.path.count)",
+  "if let p = strokePrint(stroke, k: k) { prints[p, default: 0] += 1 }"]);
+// Nach dem Hinweis endet der Zweig, nach dem Zurücknehmen geht es weiter zur Frage
+lines("infinitySettled", settled, ["onFlashTimed(\"∞ hat die Auswahl verschoben – \\(back), dann die Auswahl aufheben\", 3) return } } Log.ink.info(\"Lasso-∞: "]);
+order("undoInfinityMove", undoRegion, [
+  "guard !toolBusy, toolUses == pending.toolUses, let undo = canvas.undoManager, undo.canUndo else { return nil }",
+  "undo.undo()", "if Self.strokePrints(canvas.drawing, k: k) == Self.strokePrints(pending.before, k: pending.k) { return true }",
+  "if undo.canRedo { undo.redo() }", "return false"]);
 order("applyPendingWhenIdle", whenIdle, ["pendingWork?.cancel()", "guard !pending.isEmpty else { return }",
   "guard toolBusy || waitForPages || idWarmup != nil else {", "applyPending()", "return",
   "let work = DispatchWorkItem { [weak self] in self?.applyPendingWhenIdle() }",
@@ -85,27 +96,37 @@ order("applyPending", applyP, ["guard !pending.isEmpty, k > 0 else { return }", 
 order("canvasViewDidEndUsingTool", toolEnd, ["usingTool = false", "lastToolEnd = Date()", "applyPendingWhenIdle()"]);
 lines("detach", between(swift, "private func detach(", "private func reattach("), ["applyPending()"]);
 lines("toolBusy", swift, ["private var toolBusy: Bool { usingTool || Date().timeIntervalSince(lastToolEnd) < 0.5 }"]);
+lines("toolUses", swift, ["private var usingTool = false { didSet { if usingTool, !oldValue { toolUses += 1 } } }"]);
+lines("toolUses", swift, ["toolUses += 1"], 2);
+order("Antippen mit dem Radierer", between(swift, "if eraseStart == nil, g.state == .ended {", "usingTool = false"),
+  ["toolUses += 1", "eraseStart = canvas.drawing", "erase(at: p)"]);
+order("canvasViewDidBeginUsingTool", between(swift, "func canvasViewDidBeginUsingTool(", "func canvasViewDidEndUsingTool("),
+  ["usingTool = true"]);
+order("Radierer setzt auf", between(swift, "@objc private func handleErase(", "case .changed:"), ["case .began:", "usingTool = true"]);
 lines("LassoTracker", gestures, ["var isTracking: Bool { tracked != nil }"]);
 lines("ohne weak", swift, ["[weak self] in self?.infinitySettled"], 0);
 const mirrorBad = bad;
 console.log(mirrorBad ? `Spiegel: ${mirrorBad} Unterschiede zum Swift-Code` : "Spiegel: gleich wie im Swift-Code");
 
-// ---- Teil 2: Modell. Striche: x, y, w, h (renderBounds, Leinwandpunkte) und n Punkte
+// ---- Teil 2: Modell. Striche: x, y (erster Punkt), w, h (Weg vom ersten zum letzten Punkt), Leinwandpunkte, und n
+// Punkte
 const K = 1.34; // iPad 13 bei Zoom 1: Leinwandpunkte je Seitenpunkt
 
-/// strokePrints: je Strich Lage und Größe in ¼ Seitenpunkten (.rounded(): ab ,5 von 0 weg) und Zahl der Punkte
+/// strokePrints: je Strich erster Punkt und Weg bis zum letzten in ¼ Seitenpunkten (.rounded(): ab ,5 von 0 weg) und
+/// Zahl der Punkte; Striche ohne Punkte zählen nicht
 const q = (v, k) => { const x = v / k * 4; return Math.sign(x) * Math.round(Math.abs(x)) + 0; };
 function strokePrints(drawing, k) {
   const m = new Map();
   if (!(k > 0)) return m;
   for (const s of drawing) {
+    if (!s.n) continue;
     const key = [q(s.x, k), q(s.y, k), q(s.w, k), q(s.h, k), s.n].join(",");
     m.set(key, (m.get(key) || 0) + 1);
   }
   return m;
 }
 const shapeOf = (key) => key.split(",").slice(2).join(",");
-/// strokesMoved: ein Strich fehlt, und ein gleich großer mit gleich vielen Punkten kam anderswo dazu
+/// strokesMoved: ein Strich fehlt, und ein gleich geformter mit gleich vielen Punkten kam anderswo dazu
 function strokesMoved(before, kBefore, now, k) {
   const old = strokePrints(before, kBefore), neu = strokePrints(now, k);
   const gone = new Set();
@@ -138,16 +159,32 @@ const inside = (r, p) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= 
 const strokeIn = (r, s, k) => s.x / k >= r.x && (s.x + s.w) / k <= r.x + r.w && s.y / k >= r.y && (s.y + s.h) / k <= r.y + r.h;
 const touches = (r, s, k) => !(s.x / k > r.x + r.w || (s.x + s.w) / k < r.x || s.y / k > r.y + r.h || (s.y + s.h) / k < r.y);
 
+/// Rückgängig wie PencilKits undoManager: `undo`/`redo` sind Stapel von Schritten { undo(), redo() }. `canUndo` im
+/// Aufbau: etwas Früheres, das hier nichts ändert; `undoStroke`: zuletzt wurde dieser Strich geschrieben
 function makeState(version, setup) {
-  return {
+  const st = {
     version, now: 0, queue: [], seq: 0, k: K, drawing: clone(setup.drawing || []), pdf: !!setup.pdf,
     sel: setup.sel ? { name: setup.sel.name, ids: new Set(setup.sel.ids), region: { ...setup.sel.region } } : null,
-    canUndo: !!setup.canUndo, lassoPaths: 0, lastInfinity: 0, lastLassoEnd: -Infinity, tracking: false,
+    undo: [], redo: [], undoCalls: 0, toolUses: 0, lassoPaths: 0, lastInfinity: 0, lastLassoEnd: -Infinity, tracking: false,
     lassoStart: null, usingTool: false, lastToolEnd: -Infinity, menuBlockedUntil: -Infinity, left: false,
     waiting: new Set(), next: new Map(), pending: [], pendingWork: 0,
-    questions: [], hints: [], menus: [], decisions: [],
+    questions: [], hints: [], menus: [], decisions: [], reverted: [],
   };
+  if (setup.canUndo) st.undo.push({ undo() {}, redo() {} });
+  if (setup.undoStroke) {
+    const s = { ...st.drawing.find((x) => x.id === setup.undoStroke) };
+    st.undo.push({ undo: () => removeId(st.drawing, s.id), redo: () => st.drawing.push({ ...s }) });
+  }
+  return st;
 }
+const removeId = (d, id) => { const i = d.findIndex((s) => s.id === id); if (i >= 0) d.splice(i, 1); };
+const canUndo = (st) => st.undo.length > 0;
+const register = (st, step) => { st.undo.push(step); st.redo = []; };
+const doUndo = (st) => { st.undoCalls++; const step = st.undo.pop(); step.undo(); st.redo.push(step); };
+const doRedo = (st) => { const step = st.redo.pop(); step.redo(); st.undo.push(step); };
+const clearUndo = (st) => { st.undo = []; st.redo = []; };            // removeAllActions
+/// usingTool = true; didSet zählt toolUses, wenn das Werkzeug vorher ruhte
+const useTool = (st) => { if (!st.usingTool) st.toolUses++; st.usingTool = true; };
 const at = (st, t, f) => st.queue.push({ t, seq: st.seq++, f });
 function runAll(st) {
   while (st.queue.length) {
@@ -164,7 +201,8 @@ const later = (st, dt, f) => at(st, st.now + dt, () => { if (!(st.version === "v
 /// Eine Berührung mit dem Lasso von t0 bis t1 (Seitenpunkte): Antippen („tap“, unter 8 Punkten: kein Weg), ein Weg
 /// („path“) oder ein ∞ („inf“, Umriss `match`). `region`: was ein neuer Weg umschließt. Annahmen über PencilKit (wie in
 /// Notizen): Beginnt ein Weg in der Auswahl, zieht er sie um Ende − Anfang mit, sie bleibt ausgewählt, Rückgängig kennt
-/// das; sonst wählt er aus, was er umschließt. Antippen der Auswahl fragt nach dem Menü, daneben hebt es sie auf; ein
+/// das als Letztes (mit `noUndo` nicht: dann nimmt Rückgängig etwas Unbekanntes zurück); sonst wählt er aus, was er
+/// umschließt. Antippen der Auswahl fragt nach dem Menü, daneben hebt es sie auf; ein
 /// „Ruck“ ist für die App ein Antippen (unter 8 Punkten), zieht aber eine Auswahl ein Stück mit. Das Werkzeug meldet
 /// PencilKit vom Aufsetzen bis kurz nach dem Abheben (nicht beim Antippen)
 function touch(st, t0, t1, o) {
@@ -175,7 +213,7 @@ function touch(st, t0, t1, o) {
     st.lassoStart = start;
     if (st.version === "neu") for (const p of st.waiting) if (!st.next.has(p)) st.next.set(p, start);
     drag = o.kind !== "tap" && !!st.sel && inside(st.sel.region, o.from);
-    if (o.kind !== "tap") st.usingTool = true;                    // canvasViewDidBeginUsingTool
+    if (o.kind !== "tap") useTool(st);                            // canvasViewDidBeginUsingTool
   });
   at(st, t1, () => {
     st.tracking = false;                                          // LassoTracker.touchesEnded → lassoEnded
@@ -187,10 +225,11 @@ function touch(st, t0, t1, o) {
         st.menus.push({ t: st.now, sel: st.sel.name, shown: st.now >= st.menuBlockedUntil });
       } else st.sel = null;
     } else if (drag && st.sel) {
-      const dx = o.to.x - o.from.x, dy = o.to.y - o.from.y;
-      for (const s of st.drawing) if (st.sel.ids.has(s.id)) { s.x += dx * st.k; s.y += dy * st.k; }
+      const dx = o.to.x - o.from.x, dy = o.to.y - o.from.y, ids = new Set(st.sel.ids), k = st.k;
+      const shift = (f) => { for (const s of st.drawing) if (ids.has(s.id)) { s.x += f * dx * k; s.y += f * dy * k; } };
+      shift(1);
       st.sel.region = { ...st.sel.region, x: st.sel.region.x + dx, y: st.sel.region.y + dy };
-      st.canUndo = true;
+      if (!o.noUndo) register(st, { undo: () => shift(-1), redo: () => shift(1) });
     } else {
       const ids = st.drawing.filter((s) => strokeIn(o.region, s, st.k)).map((s) => s.id);
       st.sel = ids.length ? { name: o.name, ids: new Set(ids), region: { ...o.region } } : null;
@@ -208,7 +247,8 @@ function lassoEnded(st, o) {
   if (o.kind === "inf") {
     if (st.version === "neu") { st.lastInfinity = st.lassoPaths; st.waiting.add(st.lassoPaths); }
     const before = start || { drawing: clone(st.drawing), k: st.k };
-    const pending = { name: o.name, match: o.match, before: before.drawing, k: before.k, path: st.lassoPaths, ended: st.now };
+    const pending = { name: o.name, match: o.match, before: before.drawing, k: before.k, path: st.lassoPaths, ended: st.now,
+      toolUses: st.toolUses };
     st.menuBlockedUntil = st.now + 3;                             // infinityDrawn
     later(st, 0.5, () => settle(st, pending));
     return;
@@ -237,16 +277,32 @@ function settle(st, p) {
     isMoved = strokesMoved(p.before, p.k, after.drawing, after.k);
   } else isMoved = movedNear(p.match, p.before, p.k, st.drawing, st.k);
   if (isMoved) {
-    if (newest) st.menuBlockedUntil = -Infinity;
-    const text = st.version === "neu" ? `${st.canUndo ? "Rückgängig" : "zurückschieben"}, dann die Auswahl aufheben` : "erst die Auswahl aufheben";
-    st.hints.push({ t: st.now, name: p.name, text: "∞ hat die Auswahl verschoben – " + text });
-    return;
+    const undone = st.version === "neu" && !newPath ? undoMove(st, p) : null;   // null: nicht versucht
+    if (undone === true) st.reverted.push({ t: st.now, name: p.name });
+    else {
+      if (newest) st.menuBlockedUntil = -Infinity;
+      const back = undone === null && st.toolUses === p.toolUses && canUndo(st) ? "Rückgängig" : "zurückschieben";
+      const text = st.version === "neu" ? `${back}, dann die Auswahl aufheben` : "erst die Auswahl aufheben";
+      st.hints.push({ t: st.now, name: p.name, text: "∞ hat die Auswahl verschoben – " + text });
+      return;
+    }
   }
   if (newPath) { if (newest) st.menuBlockedUntil = -Infinity; }
   else { st.menuBlockedUntil = st.now + 0.3; st.sel = null; }   // endLassoSelection
   // askMeaning: im Notizbuch muss unter dem ∞ etwas stehen
   if (!st.pdf && !st.drawing.some((s) => touches(p.match, s, st.k))) return st.hints.push({ t: st.now, name: p.name, text: "Unter dem ∞ steht nichts" });
   st.questions.push({ t: st.now, name: p.name });
+}
+
+const samePrints = (a, b) => a.size === b.size && [...a].every(([key, n]) => b.get(key) === n);
+/// undoInfinityMove: nicht, solange ein Werkzeug arbeitet oder seit dem Ende des ∞ eins begann (null: nicht versucht);
+/// dann Rückgängig. Gilt nur, wenn danach alles wie beim Aufsetzen des ∞ liegt, sonst wiederholt (false)
+function undoMove(st, p) {
+  if (toolBusy(st) || st.toolUses !== p.toolUses || !canUndo(st)) return null;
+  doUndo(st);
+  if (samePrints(strokePrints(st.drawing, st.k), strokePrints(p.before, p.k))) return true;
+  if (st.redo.length) doRedo(st);
+  return false;
 }
 
 /// Fremde Änderung kommt an (enqueue); eingefügt, sobald das Werkzeug ruht (applyPendingWhenIdle: ein Auftrag, alle
@@ -267,17 +323,17 @@ function applyPending(st) {
   if (st.version === "neu") for (const p of st.waiting) if (!st.next.has(p)) st.next.set(p, { drawing: clone(st.drawing), k: st.k });
   for (const change of st.pending) change(st.drawing);
   st.pending = [];
-  st.canUndo = false;
+  clearUndo(st);
   st.sel = null;
 }
 /// Tab gewechselt: leave() (detach fügt Wartendes ein und räumt Rückgängig ab); die Leinwand ist danach weg, außer
 /// etwas hält sie
-const leave = (st, t) => at(st, t, () => { applyPending(st); st.left = true; st.canUndo = false; });
+const leave = (st, t) => at(st, t, () => { applyPending(st); st.left = true; clearUndo(st); });
 /// Drehen: die Zeichnung auf die neue Breite umgerechnet (viewDidLayoutSubviews), k mit
 const rotate = (st, t, f) => at(st, t, () => {
   for (const s of st.drawing) { s.x *= f; s.y *= f; s.w *= f; s.h *= f; }
   st.k *= f;
-  st.canUndo = false;
+  clearUndo(st);
   st.sel = null;
 });
 
@@ -321,37 +377,112 @@ add("zwei ∞: das ältere gibt das Menü des neueren nicht frei", "falsch", { d
 // Befund 4
 add("Tab gewechselt 0,3 s nach dem ∞: die Frage geht trotzdem", "falsch", { drawing: word() },
   (st) => { touch(st, -1, 0, inf()); leave(st, 0.3); }, oneQuestion);
-// Befund 3 und 6: Das ∞ beginnt in einer Auswahl und zieht sie mit
+// Befund 3 und 6: Das ∞ beginnt in einer Auswahl und zieht sie mit. Seit 171 nimmt Rückgängig das zurück, und die
+// Frage geht (im Simulator mit iOS 27 legte PencilKit das Verschieben 13 ms nach dem Ende des Wegs ab, 27.11.)
 const selWord = { name: "Lasso vorher", ids: ["w1", "w2", "w3", "w4"], region: { x: 295, y: 395, w: 90, h: 40 } };
 const movedHint = (want) => (st) => {
   if (st.questions.length) return `${st.questions.length} Fragen, obwohl Striche verschoben`;
   return st.hints.length === 1 && st.hints[0].text.includes(want) ? "" : `Hinweis: ${st.hints.map((h) => h.text).join(" | ") || "keiner"}`;
 };
-add("∞ beginnt in der Auswahl: Hinweis nennt Rückgängig", "falsch", { drawing: word(), sel: selWord, canUndo: true },
-  (st) => touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 })), movedHint("Rückgängig"));
+const withoutHint = (st) => (st.hints.length ? `Hinweis: ${st.hints.map((h) => h.text).join(" | ")}` : "");
+const backInPlace = (initial) => (st) => (samePrints(strokePrints(st.drawing, st.k), strokePrints(initial, K)) ? "" : "Striche nicht zurückgeschoben");
+add("∞ beginnt in der Auswahl und zieht sie mit: zurückgenommen, Frage geht", "falsch", { drawing: word(), sel: selWord, canUndo: true },
+  (st) => touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 })),
+  all(oneQuestion, withoutHint, backInPlace(word()), (st) => (st.reverted.length === 1 ? "" : `${st.reverted.length}-mal zurückgenommen`),
+    (st) => (st.sel ? "Auswahl blieb" : "")));
+add("… und Antippen der Auswahl in der Wartezeit: zurückgenommen, kein Menü", "falsch", { drawing: word(), sel: selWord, canUndo: true },
+  (st) => { touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 })); touch(st, 0.2, 0.3, tap(346, 417)); },
+  all(oneQuestion, withoutHint, backInPlace(word()), noMenuOn("Lasso vorher")));
+// Rückgängig nimmt statt des Verschiebens den zuletzt geschriebenen Strich e1 zurück: wiederholen bringt ihn wieder
+const withE1 = () => [...word(), S("e1", 200, 300, 20, 10, 30)];
+add("… Rückgängig kennt das Verschieben nicht: wiederholt, Hinweis nennt zurückschieben", "falsch", { drawing: withE1(), sel: selWord, undoStroke: "e1" },
+  (st) => touch(st, -1, 0, { ...inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 }), noUndo: true }),
+  all(movedHint("zurückschieben"), (st) => (backInPlace(withE1())(st) ? "" : "Striche zurückgeschoben, obwohl Rückgängig nicht passte"),
+    (st) => (st.drawing.some((s) => s.id === "e1") ? "" : "Strich e1 fehlt (nicht wiederholt)"),
+    (st) => (st.undo.length === 1 && !st.redo.length ? "" : `Rückgängig ${st.undo.length}, Wiederholen ${st.redo.length} statt 1 und 0`)));
+// Ein neuer Weg zählt als Werkzeug: Ob Rückgängig dann noch das Verschieben träfe, ist nicht sicher
+add("∞ zieht die Auswahl mit, dann ein neuer Weg anderswo: nichts zurückgenommen, Auswahl des Wegs bleibt", "falsch",
+  { drawing: [...word(), ...word2()], sel: selWord, canUndo: true },
+  (st) => {
+    touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 }));
+    touch(st, 0.3, 0.9, { kind: "path", name: "Lasso", region: INF2, from: { x: 90, y: 590 }, to: { x: 92, y: 592 } });
+  },
+  all(movedHint("zurückschieben"), (st) => (st.reverted.length ? "zurückgenommen trotz neuem Weg" : ""),
+    (st) => (st.sel && st.sel.name === "Lasso" ? "" : "Auswahl des neuen Wegs fehlt")));
+add("∞ zieht die Auswahl mit, in der Wartezeit ein Ruck an ihr: nichts zurückgenommen, Hinweis nennt zurückschieben", "falsch",
+  { drawing: word(), sel: selWord, canUndo: true },
+  (st) => {
+    touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 }));
+    touch(st, 0.3, 0.42, { kind: "nudge", from: { x: 346, y: 417 }, to: { x: 348, y: 418 } });
+  },
+  all(movedHint("zurückschieben"), (st) => (st.reverted.length ? "zurückgenommen trotz Ruck" : "")));
+add("∞ zieht die Auswahl mit, dann liegt der Pencil 0,4–3,0 s auf ihr: nach 2 s nichts zurückgenommen, Hinweis nennt Rückgängig", "falsch",
+  { drawing: word(), sel: selWord, canUndo: true },
+  (st) => { touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 })); touch(st, 0.4, 3.0, tap(346, 417)); },
+  all(movedHint("Rückgängig"), (st) => (st.undoCalls ? "Rückgängig, während PencilKit die Berührung verfolgte" : "")));
+// Doppeltippen mit dem Pencil: gleich der Radierer der App. Rückgängig träfe sein Radieren; es bleibt unberührt
+add("∞ zieht die Auswahl mit, dann radiert der Radierer der App kurz (0,1–0,2 s): Rückgängig unberührt, Hinweis nennt zurückschieben", "falsch",
+  { drawing: [...word(), S("r2", 288, 380, 12, 10, 18)], sel: selWord, canUndo: true },
+  (st) => {
+    touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 }));
+    at(st, 0.1, () => { useTool(st); });
+    at(st, 0.2, () => {
+      const r2 = { ...st.drawing.find((s) => s.id === "r2") };
+      removeId(st.drawing, "r2");
+      register(st, { undo: () => st.drawing.push({ ...r2 }), redo: () => removeId(st.drawing, "r2") });
+      st.usingTool = false;
+      st.lastToolEnd = st.now;
+    });
+  },
+  all(movedHint("zurückschieben"), (st) => (st.undoCalls ? `${st.undoCalls}-mal Rückgängig nach dem Radieren` : ""),
+    (st) => (st.drawing.some((s) => s.id === "r2") ? "r2 wieder da" : "")));
+// Der Radierer der App merkt sich die Zeichnung beim Aufsetzen und setzt sie am Ende ohne das Radierte: Ein Rückgängig
+// dazwischen (nach 2 s wird ohne Warten entschieden) ginge verloren, und Rückgängig träfe danach das Falsche
+add("∞ zieht die Auswahl mit, gleich danach radiert der Radierer der App bis 3 s: nichts zurückgenommen, Hinweis nennt zurückschieben", "falsch",
+  { drawing: [...word(), S("r2", 288, 380, 12, 10, 18)], sel: selWord, canUndo: true },
+  (st) => {
+    touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 }));
+    let start;
+    at(st, 0.25, () => { useTool(st); start = clone(st.drawing); });
+    at(st, 3.0, () => {
+      const was = clone(st.drawing), now = start.filter((s) => s.id !== "r2");
+      st.drawing = clone(now);
+      register(st, { undo: () => { st.drawing = clone(was); }, redo: () => { st.drawing = clone(now); } });
+      st.usingTool = false;
+      st.lastToolEnd = st.now;
+    });
+  },
+  all(movedHint("zurückschieben"), (st) => (st.reverted.length ? "zurückgenommen, während der Radierer arbeitete" : ""),
+    (st) => (st.decisions[0] && st.decisions[0].t >= 2 && st.decisions[0].t < 2.15 ? "" : "nicht nach 2 s entschieden")));
 add("… dabei kamen fremde Striche (kein Rückgängig mehr)", "falsch", { drawing: word(), sel: selWord, canUndo: true },
   (st) => { touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 })); remote(st, 0.3, (d) => d.push(S("r9", 500, 900, 30, 20, 25))); },
   movedHint("zurückschieben"));
-add("zweites ∞ auf der frischen Auswahl verschiebt sie: Frage 1 geht, Hinweis vom zweiten", "falsch", { drawing: word(), canUndo: true },
+add("zweites ∞ auf der frischen Auswahl zieht sie mit: zurückgenommen, beide fragen", "falsch", { drawing: word(), canUndo: true },
   (st) => { touch(st, -1, 0, inf()); touch(st, 0.3, 1.3, inf("zweites ∞", INF, { x: 340, y: 414 }, { x: 347, y: 418 })); },
-  all((st) => (st.questions.length === 1 && st.questions[0].name === "∞" ? "" : `Fragen: ${st.questions.map((x) => x.name).join(", ") || "keine"}`),
-    (st) => (st.hints.length === 1 && st.hints[0].name === "zweites ∞" && st.hints[0].text.includes("Rückgängig") ? "" : `Hinweise: ${st.hints.map((h) => h.name + ": " + h.text).join(" | ") || "keine"}`)));
+  all((st) => (st.questions.map((x) => x.name).join(", ") === "∞, zweites ∞" ? "" : `Fragen: ${st.questions.map((x) => x.name).join(", ") || "keine"}`),
+    withoutHint, backInPlace(word())));
 add("kleiner Ruck beim Antippen der frischen Auswahl: nicht dem ∞ angelastet", "falsch", { drawing: word(), canUndo: true },
   (st) => { touch(st, -1, 0, inf()); touch(st, 0.3, 0.42, { kind: "nudge", from: { x: 340, y: 415 }, to: { x: 342, y: 416 } }); },
   all(oneQuestion, (st) => (st.hints.length ? `Hinweis: ${st.hints[0].text}` : ""), (st) => (st.sel ? "Auswahl blieb" : "")));
 // Befund 2b: Auswahl weit weg vom ∞ (über Gedrucktem im PDF), ihr Bereich reicht bis unter den Anfang des ∞
 const notes = () => [S("a1", 120, 640, 30, 18, 61), S("a2", 160, 642, 40, 20, 75), S("a3", 600, 680, 35, 15, 48)];
-add("∞ in großer Auswahl, ihre Striche weit weg: erkannt", "falsch",
+add("∞ in großer Auswahl, ihre Striche weit weg: erkannt und zurückgenommen", "falsch",
   { pdf: true, drawing: notes(), sel: { name: "Lasso vorher", ids: ["a1", "a2", "a3"], region: { x: 100, y: 350, w: 600, h: 350 } }, canUndo: true },
-  (st) => touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 })), movedHint("Rückgängig"));
+  (st) => touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 })), all(oneQuestion, withoutHint, backInPlace(notes())));
 // Befund 2a: Änderungen nahe am ∞ in der Wartezeit, die nichts verschieben
 add("fremdes Gerät löscht neben dem Wort: Frage geht", "falsch", { drawing: [...word(), S("r1", 392, 405, 14, 20, 23)] },
   (st) => { touch(st, -1, 0, inf()); remote(st, 0.3, (d) => d.splice(d.findIndex((s) => s.id === "r1"), 1)); }, oneQuestion);
 add("eigener Radierer neben dem Wort (Werkzeug gewechselt): Frage geht", "falsch", { drawing: [...word(), S("r2", 288, 380, 12, 10, 18)] },
   (st) => {
     touch(st, -1, 0, inf());
-    at(st, 0.25, () => { st.usingTool = true; });
-    at(st, 0.4, () => { st.drawing.splice(st.drawing.findIndex((s) => s.id === "r2"), 1); st.usingTool = false; st.lastToolEnd = st.now; st.canUndo = true; });
+    at(st, 0.25, () => { useTool(st); });
+    at(st, 0.4, () => {
+      const r2 = { ...st.drawing.find((s) => s.id === "r2") };
+      removeId(st.drawing, "r2");
+      register(st, { undo: () => st.drawing.push({ ...r2 }), redo: () => removeId(st.drawing, "r2") });
+      st.usingTool = false;
+      st.lastToolEnd = st.now;
+    });
   }, oneQuestion);
 add("Doppel: einer von zwei gleichen Strichen gelöscht", "falsch", { drawing: [...word(), S("d1", 395, 410, 12, 12, 20), S("d2", 600, 900, 12, 12, 20)] },
   (st) => { touch(st, -1, 0, inf()); remote(st, 0.3, (d) => d.splice(d.findIndex((s) => s.id === "d1"), 1)); }, oneQuestion);
@@ -409,7 +540,7 @@ const unit = [
   ["einer dazu", word(), [...word(), S("x", 10, 10, 5, 5, 9)], false],
   ["verschoben und einer dazu", word(), [...word().map((s) => ({ ...s, y: s.y - 3 * K })), S("x", 10, 10, 5, 5, 9)], true],
   ["um ein Achtel Seitenpunkt (gerundet gleich)", word(), word().map((s) => ({ ...s, x: s.x + K / 10 })), false],
-  ["Strich ohne Punkte (renderBounds null)", [{ id: "z", x: Infinity, y: Infinity, w: 0, h: 0, n: 0 }, ...word()], [{ id: "z", x: Infinity, y: Infinity, w: 0, h: 0, n: 0 }, ...word()], false],
+  ["Strich ohne Punkte (zählt nicht)", [{ id: "z", x: Infinity, y: Infinity, w: 0, h: 0, n: 0 }, ...word()], [{ id: "z", x: Infinity, y: Infinity, w: 0, h: 0, n: 0 }, ...word()], false],
 ];
 for (const [name, a, b, want] of unit) {
   const got = strokesMoved(a, K, b, K);
