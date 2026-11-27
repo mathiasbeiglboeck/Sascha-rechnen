@@ -391,7 +391,8 @@ final class CameraEngine: NSObject, ObservableObject,
             Self.diag("conn after commit: angle=\(c.videoRotationAngle) mirrored=\(c.isVideoMirrored)")
         }
 
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
             let coord = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil)
             self.rotationCoordinator = coord
             self.coordinatorObservation = coord.observe(\.videoRotationAngleForHorizonLevelCapture,
