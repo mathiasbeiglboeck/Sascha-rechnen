@@ -27,7 +27,7 @@ const upload = async (p, bytes) => {
   if (!res.ok) throw new Error(`PUT ${p}: ${res.status}`);
 };
 
-const root = fs.mkdtempSync(path.join(os.tmpdir(), "nb-latex-srv-"));
+const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "nb-latex-srv-")));
 const proj = path.join(root, "Exciting Games");
 fs.mkdirSync(proj);
 fs.writeFileSync(path.join(proj, "notizbuch.json"), "{}");

@@ -346,7 +346,9 @@ export function findProjects(roots) {
     try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { continue; }
     for (const e of entries) {
       if (!e.isDirectory() || e.name.startsWith(".")) continue;
-      const dir = path.join(root, e.name);
+      // Aufgelöst: TeX schreibt echte Pfade in .fls und SyncTeX (macOS: /var → /private/var)
+      let dir = path.join(root, e.name);
+      try { dir = fs.realpathSync(dir); } catch {}
       const file = path.join(dir, "notizbuch.json");
       if (!fs.existsSync(file)) continue;
       let cfg = {};

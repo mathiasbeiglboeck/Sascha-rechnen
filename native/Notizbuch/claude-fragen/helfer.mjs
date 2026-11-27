@@ -1021,7 +1021,8 @@ Im Zweifel: Ein Imperativ ist ein Auftrag, ein Fragezeichen eine Frage.
 So gehst du vor:
 - Sieh dir zuerst mit Read das Bild der Nachricht an, dann die Stelle in der Quelle (die Nachricht zur Frage nennt \
 Datei und Zeilen, die unter der markierten Stelle liegen).
-- Lies, was du brauchst: die .tex-Dateien, den Unterordner „Hintergrund“ (alte Anträge, Material) und CLAUDE.md.
+- Lies, was du brauchst: die .tex-Dateien, die Unterordner mit Material (etwa alte Anträge und Hintergrund-Literatur; \
+mit Glob findest du sie) und CLAUDE.md.
 - CLAUDE.md in diesem Ordner ist das gemeinsame Gedächtnis des Projekts (auch Threads in der Claude-App lesen und \
 schreiben es): Halte dort kurz fest, was entschieden wurde und künftig gelten soll, nicht jede Kleinigkeit.
 - Nach einem Auftrag: eine Zeile ans Ende von AUFTRAEGE.md (anlegen, falls es fehlt): Datum, Dokument, der Auftrag \

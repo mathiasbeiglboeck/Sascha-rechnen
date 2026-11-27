@@ -38,7 +38,7 @@ const texbin = process.argv[2] || (fs.existsSync("/Library/TeX/texbin/latexmk") 
 if (!fs.existsSync(path.join(texbin, "latexmk"))) {
   console.log(`latexmk fehlt in ${texbin}: nur die reinen Teile getestet`);
 } else {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nb-latex-"));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "nb-latex-")));
   const proj = path.join(root, "Exciting Games");
   fs.mkdirSync(proj);
   fs.writeFileSync(path.join(proj, "notizbuch.json"), JSON.stringify({ ordner: "Exciting Games" }));
