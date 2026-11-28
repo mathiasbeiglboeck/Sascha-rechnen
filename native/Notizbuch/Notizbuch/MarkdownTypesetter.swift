@@ -311,9 +311,18 @@ enum MarkdownTypesetter {
     // Genau so breit wie die Textfläche, egal wie breit WebKit die Ansicht annimmt
     out.style.width = width + "px";
     render(md);
-    // Erst das Layout anstoßen: Die Schriften von KaTeX laden erst, wenn Text sie braucht
-    const fonts = () => Promise.race([document.fonts.ready, new Promise((done) => setTimeout(done, 5000))]);
-    out.getBoundingClientRect();
+    // Auf jede Schrift warten, die das Layout zu laden begann (höchstens 5 s je Aufruf), dann neu umbrechen. Zur
+    // Sicherheit wie bei den Notizen: Beginnt ein späteres Layout eine Schrift zu laden, wartet document.fonts.ready in
+    // älterem WebKit nicht darauf, und im PDF fehlen Zeichen aus den Zusatzschriften (ℝ, das große Σ), ihr Platz bleibt
+    // frei (gesehen bisher nur bei Notizen, mehrere in einer Ansicht). Nicht alle Schriften laden: Das PDF geht erst
+    // nach dem Setzen zum Server, die anderen Geräte warten darauf
+    const fonts = async () => {
+      out.getBoundingClientRect();
+      const loads = Array.from(document.fonts, (f) => (f.status === "loading" ? f.loaded.catch(() => null) : null));
+      const loaded = Promise.all(loads).then(() => document.fonts.ready);
+      await Promise.race([loaded, new Promise((done) => setTimeout(done, 5000))]);
+      out.getBoundingClientRect();
+    };
     await fonts();
 
     // Nummerierte Listen: links Platz für die breiteste Nummer (100., 1000.), sonst stünde sie über den Rand hinaus
@@ -353,7 +362,6 @@ enum MarkdownTypesetter {
       shrink(el, (e) => { const r = e.getBoundingClientRect(); return [r.right - r.left, outRight - r.left]; });
     }
     root.classList.add("fitted");
-    out.getBoundingClientRect();
     await fonts();
 
     // Was nicht durchgeschnitten werden darf: jede Textzeile, jede Formel, jede Tabellenzeile

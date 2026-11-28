@@ -361,10 +361,10 @@ struct ToolBar: View {
     }
 
     private func bar(spacing: CGFloat, compact: Bool, wide: Bool = false) -> some View {
-        HStack(spacing: spacing) {
-            Button(action: onClose) {
-                Image(systemName: "chevron.left").font(.body.weight(.semibold)).cell(wide)
-            }
+        // Innenrand der Leiste links und rechts, oben und unten: Die Fläche des Pfeils reicht bis an ihren Rand
+        let edge: CGFloat = wide ? 6 : (compact ? 12 : 16), rim: CGFloat = wide ? 2 : 8
+        return HStack(spacing: spacing) {
+            backButton(spacing: spacing, edge: edge, rim: rim, wide: wide)
             Button { tools.overviewShown = true } label: { Image(systemName: "square.grid.3x3").cell(wide) }
             divider
             if tools.viewOnly {
@@ -413,13 +413,37 @@ struct ToolBar: View {
             }
             }
         }
+        // Nur so hoch wie das höchste Feld: Der Pfeil füllt diese Höhe, ohne die Leiste zu strecken
+        .fixedSize(horizontal: false, vertical: !wide)
         .font(.body)
         .tint(.primary)
-        .padding(.horizontal, wide ? 6 : (compact ? 12 : 16))
-        .padding(.vertical, wide ? 2 : 8)
+        .padding(.horizontal, edge)
+        .padding(.vertical, rim)
         // Quer am iPhone nicht über die ganze, sehr breite Zeile
         .frame(maxWidth: wide ? 600 : nil)
         .barBackground()
+    }
+
+    /// Zurück zu den Notizbüchern. In der schmalen Leiste (iPad, iPhone quer) nahm nur das Symbol (etwa 11 × 20 Punkte)
+    /// das Tippen an, 7 bis 14 Punkte neben der Seitenübersicht (Wunsch 27.11.: am iPad oft nicht erkannt). Jetzt steht
+    /// es 6 Punkte weiter weg, und die Fläche reicht über die ganze Höhe der Leiste, links bis an ihren Rand und rechts
+    /// bis zur Mitte des Abstands; das Symbol bleibt in der Leiste, wo es ist (wie bei der Uhrzeit in der eigenen
+    /// Zeile). In der breiten Leiste (iPhone hochkant, schmale Fenster) ist jedes Feld ohnehin 44 Punkte hoch und so
+    /// breit, wie Platz ist
+    @ViewBuilder private func backButton(spacing: CGFloat, edge: CGFloat, rim: CGFloat, wide: Bool) -> some View {
+        let arrow = Image(systemName: "chevron.left").font(.body.weight(.semibold))
+        if wide {
+            Button(action: onClose) { arrow.cell(wide) }
+        } else {
+            let extra: CGFloat = 6, half = (spacing + extra) / 2
+            Button(action: onClose) {
+                arrow
+                    .frame(maxHeight: .infinity)
+                    .padding(EdgeInsets(top: rim, leading: edge, bottom: rim, trailing: half))
+                    .contentShape(LeadingCapsule())
+            }
+            .padding(EdgeInsets(top: -rim, leading: -edge, bottom: -rim, trailing: extra - half))
+        }
     }
 
     private var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
@@ -596,6 +620,13 @@ struct ToolBar: View {
                                         width: diameter, height: diameter)).fill()
         }
         return Image(uiImage: image.withRenderingMode(.alwaysOriginal)).renderingMode(.original)
+    }
+}
+
+/// Fläche des Pfeils: links halbrund wie das Ende der Leiste, damit Striche gleich daneben auf die Leinwand gehen
+private struct LeadingCapsule: Shape {
+    func path(in rect: CGRect) -> Path {
+        UnevenRoundedRectangle(topLeadingRadius: rect.height / 2, bottomLeadingRadius: rect.height / 2).path(in: rect)
     }
 }
 

@@ -2386,9 +2386,20 @@ extension CanvasController {
     }
 
     /// Schließt `base` samt allem, was darüber gezeigt wird (`base.dismiss` schlösse nur das Oberste darüber). Ist
-    /// `base` nicht mehr gezeigt, passiert nichts
+    /// `base` nicht mehr gezeigt oder geht es (oder sein Gastgeber) schon zu, passiert nichts. Vermutung (nicht belegt,
+    /// dafür gibt es debug/dismissprobe): Ein zweites dismiss am Gastgeber, während `base` noch wegfährt, nimmt UIKit
+    /// als Schließen des Gastgebers selbst, bei der Karte also als Schließen des ganzen Editors. Nach „Markierung
+    /// löschen“ kamen früher zwei: das der Karte selbst und gleich danach das von reloadAskMarks
     static func dismissStack(from base: UIViewController, animated: Bool) {
-        guard let host = base.presentingViewController, host.presentedViewController === base else { return }
+        #if DEBUG
+        let shownBy = base.presentingViewController
+        NSLog("Asks-Debug: dismissStack %@: geht schon zu %@, Gastgeber %@ (zeigt sie %@, geht selbst zu %@)",
+              "\(type(of: base))", base.isBeingDismissed ? "ja" : "nein",
+              shownBy.map { "\(type(of: $0))" } ?? "keiner", shownBy?.presentedViewController === base ? "ja" : "nein",
+              shownBy?.isBeingDismissed == true ? "ja" : "nein")
+        #endif
+        guard !base.isBeingDismissed, let host = base.presentingViewController, host.presentedViewController === base,
+              !host.isBeingDismissed else { return }
         host.dismiss(animated: animated)
     }
 
@@ -2759,7 +2770,8 @@ extension CanvasController: UIGestureRecognizerDelegate {
         if newPath {
             if newest { canvas.menuBlockedUntil = .distantPast }
         } else {
-            // Ein Antippen gleich danach öffnet noch kein Menü
+            // Ein Antippen gleich danach öffnet noch kein Menü. Nach dem Zurücknehmen ist die Auswahl schon weg; dann
+            // zählt das Lasso hiermit ab der zurückgeschobenen Zeichnung (rebaseLassoDrawing in applyTool)
             canvas.menuBlockedUntil = Date().addingTimeInterval(0.3)
             endLassoSelection()
         }
@@ -2817,6 +2829,11 @@ extension CanvasController: UIGestureRecognizerDelegate {
     private func undoInfinityMove(_ pending: PendingInfinity) -> Bool? {
         guard !toolBusy, toolUses == pending.toolUses, let undo = canvas.undoManager, undo.canUndo else { return nil }
         toolUsedSinceSave = true
+        // Erst die Auswahl aufheben, dann Rückgängig: So nimmt PencilKit zurück wie ohne Auswahl. Umgekehrt lief der
+        // Abbau der Auswahl vielleicht mitten in sein Neuzeichnen: Im Simulator mit iOS 27 blieb die Seite einmal leer
+        // (27.11.), belegt ist diese Ursache nicht. Das Aufheben kommt nicht in Rückgängig; geht das Zurücknehmen
+        // nicht, bleibt die Auswahl trotzdem aufgehoben
+        endLassoSelection()
         undo.undo()
         if Self.strokePrints(canvas.drawing, k: k) == Self.strokePrints(pending.before, k: pending.k) { return true }
         #if DEBUG
@@ -3020,7 +3037,9 @@ extension CanvasController: UIGestureRecognizerDelegate {
         model.onDelete = { [weak self, weak card] askID in
             guard let self else { return }
             self.sync.asks.delete(self.doc.id, askID)
-            card?.dismiss(animated: true)
+            // Über dismissStack wie jedes Schließen durch die App: Gleich danach will reloadAskMarks die Karte auch
+            // schließen (die Frage ist jetzt unsichtbar), und nur das erste dismiss darf zählen
+            if let card { CanvasController.dismissStack(from: card, animated: true) }
         }
         card.onClose = { [weak self] in self?.askOverlay.highlight(nil) }
         card.modalPresentationStyle = .popover
@@ -3030,6 +3049,8 @@ extension CanvasController: UIGestureRecognizerDelegate {
             pop.sourceView = source.view
             pop.sourceRect = source.rect
             pop.permittedArrowDirections = .any
+            // Antippen daneben schließt nur, was nicht schon zugeht (presentationControllerShouldDismiss)
+            pop.delegate = self
             let sheet = pop.adaptiveSheetPresentationController
             sheet.detents = [.medium(), .large()]
             sheet.prefersGrabberVisible = true
@@ -3038,6 +3059,19 @@ extension CanvasController: UIGestureRecognizerDelegate {
         answerCard = card
         askOverlay.highlight(id)
         present(card, animated: true)
+    }
+}
+
+extension CanvasController: UIPopoverPresentationControllerDelegate {
+    /// Ein zweites Antippen neben der Karte, während sie vom ersten schon zugeht (etwa zweimal schnell daneben
+    /// getippt), schließt nichts mehr: Ein zweites dismiss schlösse vermutlich den Editor (siehe dismissStack). Sonst
+    /// wie ohne Delegate
+    func presentationControllerShouldDismiss(_ presentationController: UIPresentationController) -> Bool {
+        let closing = presentationController.presentedViewController.isBeingDismissed
+        #if DEBUG
+        if closing { NSLog("Asks-Debug: Antippen neben der Karte, während sie zugeht: nichts") }
+        #endif
+        return !closing
     }
 }
 
@@ -3067,6 +3101,13 @@ extension CanvasController {
     ///   Breite W in Seitenpunkten (Vorgabe 200, 200, 80), um R Grad geneigt; Protokoll „Lasso-∞: …“
     /// - `debug/card?ask=<id>|first|last`: Karte der Frage zeigen
     /// - `debug/delete?ask=<id>|first|last`: Markierung löschen
+    /// - `debug/carddelete?ask=…`: wie „Löschen“ in der Bestätigung „Markierung löschen?“ der Karte (dieselbe Closure,
+    ///   sie schließt also auch die Karte); `debug/notedelete?ask=…&note=N`: wie „Diese Notiz entfernen“ (Notiz N der
+    ///   Frage, ab 0). Ist die Karte nicht offen, geht sie vorher auf; 1,5 s danach steht im Protokoll, ob Editor und
+    ///   Karte noch offen sind. Menü und Bestätigung der Karte selbst laufen dabei nicht mit
+    /// - `debug/dismissprobe`: von da an jedes dismiss ins Protokoll („Asks-Debug: Dismiss-Probe: …“, mit Aufrufern),
+    ///   bis die App endet. Zeigt, wer den Editor schließt, soweit es über dismiss(animated:completion:) geht (siehe
+    ///   auch „Asks-Debug: Editor zu“ in TabsModel)
     /// - `debug/pages?delete=N`, `?insert=N`, `?undo`, `?done`: Seiten ändern, Rückgängig, Rückgängig verwerfen
     /// - `debug/state`: nur den Stand
     /// Danach steht der Stand der Fragen im Protokoll („Asks-Debug: …“)
@@ -3353,6 +3394,39 @@ extension CanvasController {
             guard let id = pick() else { return log("delete: keine Frage") }
             sync.asks.delete(doc.id, id)
             log("delete: \(id)")
+        case "/carddelete", "/notedelete":
+            // Dieselben Closures wie in der Karte (showAnswer): debug/delete oben löscht nur, ohne dass die Karte sich
+            // selbst schließt, und stellt so nicht nach, was ihr Menü tut (laut Meldung vom 27.11. ging in 171 nach dem
+            // Entfernen einer Notiz der Editor zu; mit welchem Menüpunkt, ist offen)
+            guard let id = pick(), sync.asks.ask(doc.id, id) != nil else { return log("\(url.path): keine Frage") }
+            let removeNote = url.path == "/notedelete"
+            let n = value("note").flatMap { Int($0) } ?? 0
+            let placed = notesOverlay.placed.first { $0.ask == id && $0.index == n }
+            if removeNote, placed == nil { return log("notedelete: keine Notiz \(n) an \(id.prefix(8))") }
+            let opens = answerCard == nil
+            if opens || answerCard?.model.askID != id || (removeNote && answerCard?.model.note != placed?.note) {
+                // Wie Antippen der Notiz mit dem Finger (nur dann bietet die Karte „Diese Notiz entfernen“), sonst wie
+                // Antippen der Markierung
+                showAnswer(id, note: removeNote ? placed : nil)
+            }
+            let wait: Double = opens ? 1 : 0
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+                guard let self, let card = self.answerCard else { return log("\(url.path): keine Karte offen") }
+                if removeNote, let placed {
+                    card.model.onDeleteNote(id, placed.note)
+                } else {
+                    card.model.onDelete(id)
+                }
+                log("\(url.path): \(id.prefix(8)) ausgeführt, Karte geht zu: \(card.isBeingDismissed ? "ja" : "nein")")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                    let editor = self.map { $0.viewIfLoaded?.window != nil ? "offen" : "zu (nicht im Fenster)" }
+                        ?? "zu (Leinwand freigegeben)"
+                    log("\(url.path) nach 1,5 s: Editor \(editor), Karte \(self?.answerCard == nil ? "zu" : "offen")")
+                }
+            }
+        case "/dismissprobe":
+            _ = Self.dismissProbe
+            return log("dismissprobe: an")
         case "/pages":
             let done: (String?) -> Void = { log("pages: \($0 ?? "ok")") }
             if let n = value("delete").flatMap({ Int($0) }) {
@@ -3617,6 +3691,31 @@ extension CanvasController {
         overlay.addSublayer(orange)
         overlay.addSublayer(green)
         pagesView.layer.addSublayer(overlay)
+    }
+
+    /// `debug/dismissprobe`: einmal eingesetzt, bleibt bis zum Ende der App
+    private static let dismissProbe: Void = installDismissProbe()
+
+    /// Schreibt jedes dismiss eines View-Controllers ins Protokoll: Empfänger, was er zeigt, ob das schon zugeht, wer
+    /// ihn zeigt, und die Aufrufer. So zeigt sich im Simulator, wer den Editor schließt (die App oder UIKit selbst),
+    /// soweit es über diese Methode geht: Wege in UIKit oder SwiftUI an ihr vorbei sieht die Probe nicht
+    private static func installDismissProbe() {
+        let sel = #selector(UIViewController.dismiss(animated:completion:))
+        guard let method = class_getInstanceMethod(UIViewController.self, sel) else { return }
+        // Der Abschluss-Block geht unverändert weiter, darum nur als Objekt getippt
+        typealias Original = @convention(c) (AnyObject, Selector, Bool, AnyObject?) -> Void
+        let original = unsafeBitCast(method_getImplementation(method), to: Original.self)
+        let replacement: @convention(block) (AnyObject, Bool, AnyObject?) -> Void = { me, animated, completion in
+            let name: (UIViewController?) -> String = { $0.map { "\(type(of: $0))" } ?? "keiner" }
+            let vc = me as? UIViewController
+            let shown = vc?.presentedViewController
+            NSLog("Asks-Debug: Dismiss-Probe: %@.dismiss(animated: %@) zeigt %@ (geht schon zu %@), geht selbst zu %@, gezeigt von %@\n%@",
+                  name(vc), animated ? "ja" : "nein", name(shown), shown?.isBeingDismissed == true ? "ja" : "nein",
+                  vc?.isBeingDismissed == true ? "ja" : "nein", name(vc?.presentingViewController),
+                  Thread.callStackSymbols.prefix(40).joined(separator: "\n"))
+            original(me, sel, animated, completion)
+        }
+        method_setImplementation(method, imp_implementationWithBlock(replacement))
     }
 }
 #endif

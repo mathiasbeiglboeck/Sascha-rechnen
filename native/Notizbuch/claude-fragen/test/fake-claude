@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Ersatz für claude in Tests des Helfers: schreibt jeden Aufruf nach $FAKE_STATE/calls.jsonl und antwortet je nach
 // $FAKE_STATE/mode.json ({"mode": "ok" | "rich" | "denied" | "limit" | "limit-old" | "error" | "auth" | "authexpired" |
-// "refreshlock" | "maxturns" | "noresult" | "huge" | "toobig" | "write" | "writePage" | "writeEdge" | "writeMany" |
-// "writeLong", "delayMs": …}; die write…-Arten siehe unten). "rich" antwortet mit Formeln, Liste, Code
+// "refreshlock" | "maxturns" | "noresult" | "huge" | "toobig" | "write" | "writePage" | "writeMath" | "writeEdge" |
+// "writeMany" | "writeLong", "delayMs": …}; die write…-Arten siehe unten). "rich" antwortet mit Formeln, Liste, Code
 // und Quellen (Links), zum Ansehen der Karte in der App; "denied" antwortet, meldet aber abgelehnte Werkzeuge; "toobig"
 // scheitert nur beim Fortsetzen eines Chats (--resume) mit mode.message (Standard „Prompt is too long“), ein neuer Chat
 // antwortet; "noresult" hört ohne Zeile result und ohne Meldung auf (wie abgestürzt).
@@ -224,6 +224,18 @@ const finish = () => {
     { seite: qp, x: 10, y: 60, breite: 80, text: "Lösung unter dem Auftrag" },
     { seite: qp + 1, x: 10, y: 10, breite: 80, text: "Fortsetzung" },
   ]) + "\n```\n";
+  // "writeMath": drei Notizen unter dem Auftrag, zuerst eine nur mit den Grundschriften, danach Zeichen aus den
+  // Zusatzschriften von KaTeX (ℝ aus KaTeX_AMS, das große Σ aus KaTeX_Size2, Fraktur, Kalligrafie, Schreibschrift): Im
+  // PDF der Notiz fehlten solche Zeichen (27.11.). Die einfache Notiz steht vorn, weil die App die Notizen nacheinander
+  // in derselben Web-Ansicht setzt und ältere WebKit-Versionen ab der zweiten nicht mehr auf nachladende Schriften warten
+  const writeMath = "Formeln unter den Auftrag geschrieben.\n\n```notizen\n" + JSON.stringify([
+    { seite: qp, x: 10, y: 47, breite: 80, text: "Zuerst nur Grundschrift: $a^2 + b^2 = c^2$." },
+    { seite: qp, x: 10, y: 55, breite: 80, text: "Für $x \\in \\R$ und $f\\colon \\mathbb{R} \\to \\mathbb{R}$ gilt\n\n" +
+      "$$\\sum_{n=1}^{\\infty} \\frac{1}{n^2} = \\frac{\\pi^2}{6}$$\n\n" +
+      "mit $\\mathfrak{g}$, $\\mathcal{F}$ und $\\mathscr{L}$." },
+    { seite: qp, x: 10, y: 80, breite: 45, farbe: "rot",
+      text: "$\\displaystyle\\int_{\\mathbb{R}} e^{-x^2}\\,dx = \\sqrt{\\pi}$" },
+  ]) + "\n```\n";
   // Grenzfälle der Notizen: "writeEdge" nur ein Kasten, Schlüssel groß geschrieben, x als Wort, ein Codeblock im Text,
   // eingerücktes JSON und danach ein Beispiel in ```json; "writeMany" 150 Notizen (der Server nimmt 100); "writeLong" eine
   // Notiz mit 7999 „a“ und einem Zeichen aus zwei UTF-16-Einheiten (𝑥) an der Grenze von 8000
@@ -235,7 +247,7 @@ const finish = () => {
   ], null, 2) + "\n```\n\nZum Format etwa:\n```json\n{\"seite\": 1, \"x\": 10}\n```\n";
   const writeMany = "Viele Fehler.\n\n```notizen\n" + JSON.stringify(Array.from({ length: 150 }, (_, i) => ({ seite: 1, x: 10, y: (i % 90) + 1, breite: 10, text: "Fehler " + i }))) + "\n```\n";
   const writeLong = "Eine lange Notiz.\n\n```notizen\n" + JSON.stringify([{ seite: 1, x: 10, y: 10, breite: 80, text: "a".repeat(7999) + "\u{1D465}" }]) + "\n```\n";
-  const texts = { rich, write, writePage, writeEdge, writeMany, writeLong, huge: "x".repeat(210000) };
+  const texts = { rich, write, writePage, writeMath, writeEdge, writeMany, writeLong, huge: "x".repeat(210000) };
   const text = Object.hasOwn(texts, mode.mode) ? texts[mode.mode] : `Antwort (${get("--effort")}) auf ${files.join(", ")}: $x^2$`;
   if (streaming) {
     readLines();

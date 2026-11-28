@@ -1,8 +1,9 @@
 // Entscheidung nach einem ∞ mit dem Lasso: spiegelt lassoBegan, lassoEnded, infinityDrawn, infinitySettled,
-// strokesMoved, strokePrints und undoInfinityMove aus Notizbuch/CanvasController.swift und prüft sie mit simulierter
-// Zeit an Abläufen: Antippen der Auswahl, ein neuer Weg, zwei ∞ hintereinander, Tab-Wechsel, eine verschobene Auswahl
-// (seit 171 mit Rückgängig zurückgenommen, nicht während eines anderen Werkzeugs), fremde Änderungen (auch fremd
-// verschobene Striche, wie sie ein anderes Gerät, der Browser oder eingefügte Seiten bringen), Drehen.
+// strokesMoved, strokePrints, undoInfinityMove und endLassoSelection aus Notizbuch/CanvasController.swift und prüft sie
+// mit simulierter Zeit an Abläufen: Antippen der Auswahl, ein neuer Weg, zwei ∞ hintereinander, Tab-Wechsel, eine
+// verschobene Auswahl (seit 171 mit Rückgängig zurückgenommen, nicht während eines anderen Werkzeugs; seit 172 erst
+// nach dem Aufheben der Auswahl), fremde Änderungen (auch fremd verschobene Striche, wie sie ein anderes Gerät, der
+// Browser oder eingefügte Seiten bringen), Drehen.
 // PencilKit ist dabei nur nachgebildet (Annahmen bei `touch` und `remote`); das ersetzt keinen Test am Gerät.
 // Teil 1 vergleicht die gespiegelten Zeilen mit dem Swift-Code: Ändert sich dort etwas, hier nachziehen. Jeder Ablauf
 // läuft auch mit der Fassung vor den Korrekturen („vorher“, Commit 9f28905); sie muss an den genannten Stellen scheitern.
@@ -82,10 +83,26 @@ lines("strokePrints", prints, ["var shape: [CGFloat] { [dx, dy, CGFloat(points)]
   "if let p = strokePrint(stroke, k: k) { prints[p, default: 0] += 1 }"]);
 // Nach dem Hinweis endet der Zweig, nach dem Zurücknehmen geht es weiter zur Frage
 lines("infinitySettled", settled, ["onFlashTimed(\"∞ hat die Auswahl verschoben – \\(back), dann die Auswahl aufheben\", 3) return } } Log.ink.info(\"Lasso-∞: "]);
+// Seit 172 hebt undoInfinityMove die Auswahl vor dem Rückgängig auf (Modell `endLasso`), erst nach dem Wächter. Nach dem
+// Zurücknehmen läuft das in infinitySettled noch einmal: Dann zählt das Lasso ab der zurückgeschobenen Zeichnung
 order("undoInfinityMove", undoRegion, [
   "guard !toolBusy, toolUses == pending.toolUses, let undo = canvas.undoManager, undo.canUndo else { return nil }",
-  "undo.undo()", "if Self.strokePrints(canvas.drawing, k: k) == Self.strokePrints(pending.before, k: pending.k) { return true }",
+  "toolUsedSinceSave = true", "endLassoSelection() undo.undo()",
+  "if Self.strokePrints(canvas.drawing, k: k) == Self.strokePrints(pending.before, k: pending.k) { return true }",
   "if undo.canRedo { undo.redo() }", "return false"]);
+lines("endLassoSelection", settled + undoRegion, ["endLassoSelection()"], 2);
+// endLassoSelection: Werkzeug hin und zurück; applyTool setzt dabei lassoDrawing neu (rebaseLassoDrawing). Setzt die
+// Zeichnung nicht und zählt nicht als Werkzeug: Rückgängig trifft danach noch das Verschieben, kein Strich unterwegs geht
+// verloren, und Wächter und Hinweis (toolUses) merken nichts davon
+const endSel = between(swift, "private func endLassoSelection(", "private static var answerPageWarm");
+order("endLassoSelection", endSel, ["guard canvas.tool is PKLassoTool else { return }", "canvas.tool = inkingTool()",
+  "applyTool()", "canvas.endEditing(true)"]);
+lines("endLassoSelection", endSel, ["setDrawing(", "canvas.drawing =", "usingTool", "toolUses", "undoManager", "lastToolEnd", "async"], 0);
+lines("kein Neuzeichnen nach dem Zurücknehmen", settled + undoRegion, ["setDrawing(", "redrawInk"], 0);
+const toolApply = between(swift, "private func applyTool(", "private var pausedPencilKitHover");
+order("applyTool", toolApply, ["if lasso && !viewOnly {", "if !(canvas.tool is PKLassoTool) {", "canvas.tool = PKLassoTool()",
+  "rebaseLassoDrawing()"]);
+lines("applyTool", toolApply, ["setDrawing(", "canvas.drawing =", "usingTool", "toolUses", "undoManager"], 0);
 order("applyPendingWhenIdle", whenIdle, ["pendingWork?.cancel()", "guard !pending.isEmpty else { return }",
   "guard toolBusy || waitForPages || idWarmup != nil else {", "applyPending()", "return",
   "let work = DispatchWorkItem { [weak self] in self?.applyPendingWhenIdle() }",
@@ -169,6 +186,7 @@ function makeState(version, setup) {
     lassoStart: null, usingTool: false, lastToolEnd: -Infinity, menuBlockedUntil: -Infinity, left: false,
     waiting: new Set(), next: new Map(), pending: [], pendingWork: 0,
     questions: [], hints: [], menus: [], decisions: [], reverted: [],
+    lassoBase: null, undoUnderSel: 0,                            // lassoDrawing; Rückgängig bei bestehender Auswahl
   };
   if (setup.canUndo) st.undo.push({ undo() {}, redo() {} });
   if (setup.undoStroke) {
@@ -180,11 +198,15 @@ function makeState(version, setup) {
 const removeId = (d, id) => { const i = d.findIndex((s) => s.id === id); if (i >= 0) d.splice(i, 1); };
 const canUndo = (st) => st.undo.length > 0;
 const register = (st, step) => { st.undo.push(step); st.redo = []; };
-const doUndo = (st) => { st.undoCalls++; const step = st.undo.pop(); step.undo(); st.redo.push(step); };
+/// Gezählt wird auch, ob dabei noch PencilKits Auswahl bestand (seit 172 nie: darunter blieb die Seite einmal leer)
+const doUndo = (st) => { st.undoCalls++; if (st.sel) st.undoUnderSel++; const step = st.undo.pop(); step.undo(); st.redo.push(step); };
 const doRedo = (st) => { const step = st.redo.pop(); step.redo(); st.undo.push(step); };
 const clearUndo = (st) => { st.undo = []; st.redo = []; };            // removeAllActions
 /// usingTool = true; didSet zählt toolUses, wenn das Werkzeug vorher ruhte
 const useTool = (st) => { if (!st.usingTool) st.toolUses++; st.usingTool = true; };
+/// endLassoSelection: Werkzeug hin und zurück hebt PencilKits Auswahl auf, ohne als Werkzeug zu zählen und ohne
+/// Rückgängig; applyTool setzt lassoDrawing auf die Zeichnung von jetzt (rebaseLassoDrawing)
+const endLasso = (st) => { st.sel = null; st.lassoBase = clone(st.drawing); };
 const at = (st, t, f) => st.queue.push({ t, seq: st.seq++, f });
 function runAll(st) {
   while (st.queue.length) {
@@ -288,17 +310,19 @@ function settle(st, p) {
     }
   }
   if (newPath) { if (newest) st.menuBlockedUntil = -Infinity; }
-  else { st.menuBlockedUntil = st.now + 0.3; st.sel = null; }   // endLassoSelection
+  else { st.menuBlockedUntil = st.now + 0.3; endLasso(st); }    // nach dem Zurücknehmen: Auswahl schon weg
   // askMeaning: im Notizbuch muss unter dem ∞ etwas stehen
   if (!st.pdf && !st.drawing.some((s) => touches(p.match, s, st.k))) return st.hints.push({ t: st.now, name: p.name, text: "Unter dem ∞ steht nichts" });
   st.questions.push({ t: st.now, name: p.name });
 }
 
 const samePrints = (a, b) => a.size === b.size && [...a].every(([key, n]) => b.get(key) === n);
-/// undoInfinityMove: nicht, solange ein Werkzeug arbeitet oder seit dem Ende des ∞ eins begann (null: nicht versucht);
-/// dann Rückgängig. Gilt nur, wenn danach alles wie beim Aufsetzen des ∞ liegt, sonst wiederholt (false)
+/// undoInfinityMove: nicht, solange ein Werkzeug arbeitet oder seit dem Ende des ∞ eins begann (null: nicht versucht,
+/// die Auswahl bleibt); sonst erst die Auswahl aufheben, dann Rückgängig. Gilt nur, wenn danach alles wie beim Aufsetzen
+/// des ∞ liegt, sonst wiederholt (false; die Auswahl bleibt aufgehoben)
 function undoMove(st, p) {
   if (toolBusy(st) || st.toolUses !== p.toolUses || !canUndo(st)) return null;
+  endLasso(st);
   doUndo(st);
   if (samePrints(strokePrints(st.drawing, st.k), strokePrints(p.before, p.k))) return true;
   if (st.redo.length) doRedo(st);
@@ -378,7 +402,8 @@ add("zwei ∞: das ältere gibt das Menü des neueren nicht frei", "falsch", { d
 add("Tab gewechselt 0,3 s nach dem ∞: die Frage geht trotzdem", "falsch", { drawing: word() },
   (st) => { touch(st, -1, 0, inf()); leave(st, 0.3); }, oneQuestion);
 // Befund 3 und 6: Das ∞ beginnt in einer Auswahl und zieht sie mit. Seit 171 nimmt Rückgängig das zurück, und die
-// Frage geht (im Simulator mit iOS 27 legte PencilKit das Verschieben 13 ms nach dem Ende des Wegs ab, 27.11.)
+// Frage geht (im Simulator mit iOS 27 legte PencilKit das Verschieben 13 ms nach dem Ende des Wegs ab, 27.11.). Seit
+// 172 fällt die Auswahl vor dem Rückgängig weg: Darunter blieb die Seite im Simulator einmal leer (27.11.)
 const selWord = { name: "Lasso vorher", ids: ["w1", "w2", "w3", "w4"], region: { x: 295, y: 395, w: 90, h: 40 } };
 const movedHint = (want) => (st) => {
   if (st.questions.length) return `${st.questions.length} Fragen, obwohl Striche verschoben`;
@@ -386,18 +411,39 @@ const movedHint = (want) => (st) => {
 };
 const withoutHint = (st) => (st.hints.length ? `Hinweis: ${st.hints.map((h) => h.text).join(" | ")}` : "");
 const backInPlace = (initial) => (st) => (samePrints(strokePrints(st.drawing, st.k), strokePrints(initial, K)) ? "" : "Striche nicht zurückgeschoben");
-add("∞ beginnt in der Auswahl und zieht sie mit: zurückgenommen, Frage geht", "falsch", { drawing: word(), sel: selWord, canUndo: true },
+const notUnderSel = (st) => (st.undoUnderSel ? "Rückgängig bei noch bestehender Auswahl" : "");
+/// Das Lasso zählt ab der Zeichnung von jetzt (lassoDrawing, für selectionInkOnCanvas)
+const baseIsNow = (st) => (st.lassoBase && samePrints(strokePrints(st.lassoBase, st.k), strokePrints(st.drawing, st.k)) ? ""
+  : "Lasso zählt nicht ab der Zeichnung von jetzt");
+add("∞ beginnt in der Auswahl und zieht sie mit: Auswahl weg, dann zurückgenommen, Frage geht", "falsch",
+  { drawing: word(), sel: selWord, canUndo: true },
   (st) => touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 })),
   all(oneQuestion, withoutHint, backInPlace(word()), (st) => (st.reverted.length === 1 ? "" : `${st.reverted.length}-mal zurückgenommen`),
-    (st) => (st.sel ? "Auswahl blieb" : "")));
+    (st) => (st.sel ? "Auswahl blieb" : ""), notUnderSel, baseIsNow));
+// Gleich danach ein neues Lasso: Seine Auswahl bleibt (nichts setzt nach dem Zurücknehmen die Zeichnung neu)
+add("… gleich danach (0,7–0,9 s) ein neues Lasso anderswo: seine Auswahl bleibt", "falsch",
+  { drawing: [...word(), ...word2()], sel: selWord, canUndo: true },
+  (st) => {
+    touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 }));
+    touch(st, 0.7, 0.9, { kind: "path", name: "Lasso", region: INF2, from: { x: 90, y: 590 }, to: { x: 92, y: 592 } });
+  },
+  all(oneQuestion, (st) => (st.reverted.length === 1 && st.reverted[0].t < 0.7 ? "" : "nicht vor dem neuen Lasso zurückgenommen"),
+    notUnderSel, (st) => (st.sel && st.sel.name === "Lasso" ? "" : "Auswahl des neuen Lassos fehlt")));
 add("… und Antippen der Auswahl in der Wartezeit: zurückgenommen, kein Menü", "falsch", { drawing: word(), sel: selWord, canUndo: true },
   (st) => { touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 })); touch(st, 0.2, 0.3, tap(346, 417)); },
   all(oneQuestion, withoutHint, backInPlace(word()), noMenuOn("Lasso vorher")));
 // Rückgängig nimmt statt des Verschiebens den zuletzt geschriebenen Strich e1 zurück: wiederholen bringt ihn wieder
 const withE1 = () => [...word(), S("e1", 200, 300, 20, 10, 30)];
-add("… Rückgängig kennt das Verschieben nicht: wiederholt, Hinweis nennt zurückschieben", "falsch", { drawing: withE1(), sel: selWord, undoStroke: "e1" },
+// Die Auswahl ist dann schon aufgehoben; der Hinweis bleibt wie er war (nach dem Zurückschieben mit einem neuen Lasso
+// gilt „dann die Auswahl aufheben“ wieder)
+add("… Rückgängig kennt das Verschieben nicht: wiederholt, Auswahl bleibt aufgehoben, Hinweis nennt zurückschieben", "falsch",
+  { drawing: withE1(), sel: selWord, undoStroke: "e1" },
   (st) => touch(st, -1, 0, { ...inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 }), noUndo: true }),
-  all(movedHint("zurückschieben"), (st) => (backInPlace(withE1())(st) ? "" : "Striche zurückgeschoben, obwohl Rückgängig nicht passte"),
+  all(movedHint("zurückschieben"),
+    (st) => (st.hints.length && st.hints[0].text === "∞ hat die Auswahl verschoben – zurückschieben, dann die Auswahl aufheben" ? ""
+      : `Hinweis nicht genau wie bisher: ${st.hints.map((h) => h.text).join(" | ")}`),
+    (st) => (st.sel ? "Auswahl blieb (wird vor dem Rückgängig aufgehoben)" : ""), notUnderSel, baseIsNow,
+    (st) => (backInPlace(withE1())(st) ? "" : "Striche zurückgeschoben, obwohl Rückgängig nicht passte"),
     (st) => (st.drawing.some((s) => s.id === "e1") ? "" : "Strich e1 fehlt (nicht wiederholt)"),
     (st) => (st.undo.length === 1 && !st.redo.length ? "" : `Rückgängig ${st.undo.length}, Wiederholen ${st.redo.length} statt 1 und 0`)));
 // Ein neuer Weg zählt als Werkzeug: Ob Rückgängig dann noch das Verschieben träfe, ist nicht sicher
@@ -415,11 +461,13 @@ add("∞ zieht die Auswahl mit, in der Wartezeit ein Ruck an ihr: nichts zurück
     touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 }));
     touch(st, 0.3, 0.42, { kind: "nudge", from: { x: 346, y: 417 }, to: { x: 348, y: 418 } });
   },
-  all(movedHint("zurückschieben"), (st) => (st.reverted.length ? "zurückgenommen trotz Ruck" : "")));
+  all(movedHint("zurückschieben, dann die Auswahl aufheben"), (st) => (st.reverted.length ? "zurückgenommen trotz Ruck" : ""),
+    (st) => (st.sel && st.sel.name === "Lasso vorher" ? "" : "Auswahl weg, obwohl nichts versucht")));
 add("∞ zieht die Auswahl mit, dann liegt der Pencil 0,4–3,0 s auf ihr: nach 2 s nichts zurückgenommen, Hinweis nennt Rückgängig", "falsch",
   { drawing: word(), sel: selWord, canUndo: true },
   (st) => { touch(st, -1, 0, inf("∞", INF, { x: 340, y: 414 }, { x: 346, y: 417 })); touch(st, 0.4, 3.0, tap(346, 417)); },
-  all(movedHint("Rückgängig"), (st) => (st.undoCalls ? "Rückgängig, während PencilKit die Berührung verfolgte" : "")));
+  all(movedHint("Rückgängig, dann die Auswahl aufheben"), (st) => (st.undoCalls ? "Rückgängig, während PencilKit die Berührung verfolgte" : ""),
+    (st) => (st.sel && st.sel.name === "Lasso vorher" ? "" : "Auswahl weg, obwohl nichts versucht")));
 // Doppeltippen mit dem Pencil: gleich der Radierer der App. Rückgängig träfe sein Radieren; es bleibt unberührt
 add("∞ zieht die Auswahl mit, dann radiert der Radierer der App kurz (0,1–0,2 s): Rückgängig unberührt, Hinweis nennt zurückschieben", "falsch",
   { drawing: [...word(), S("r2", 288, 380, 12, 10, 18)], sel: selWord, canUndo: true },

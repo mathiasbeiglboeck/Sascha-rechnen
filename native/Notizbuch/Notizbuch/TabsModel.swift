@@ -32,7 +32,16 @@ final class TabsModel: ObservableObject {
     /// Zählt Wechsel: Jeder Wechsel bekommt eine frische Leinwand, auch wenn derselbe Tab wieder vorne ist
     @Published private(set) var generation = 0
     /// Der Editor (Vollbild über der Übersicht) ist offen
-    @Published var editorShown = false
+    @Published var editorShown = false {
+        didSet {
+            #if DEBUG
+            // Nur für Tests im Simulator: wer den Editor schließt (Pfeil, Kreuz des letzten Tabs oder UIKit)
+            if oldValue, !editorShown {
+                NSLog("Asks-Debug: Editor zu, von:\n%@", Thread.callStackSymbols.prefix(40).joined(separator: "\n"))
+            }
+            #endif
+        }
+    }
     /// Werkzeug, Farbe und Dicke gelten für alle Tabs; so lässt sich mit dem Lasso Ausgeschnittenes gleich im
     /// nächsten Tab einsetzen
     let tools = ToolState()

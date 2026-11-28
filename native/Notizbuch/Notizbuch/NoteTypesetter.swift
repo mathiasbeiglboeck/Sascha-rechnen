@@ -7,9 +7,9 @@ import WebKit
 /// PDF in ihrer Breite (Seitenpunkte, Seite = 768 breit) und so hoch, wie ihr Text braucht. Die Leinwand zeichnet es
 /// scharf in jeder Zoomstufe, der Export legt es auf die Seite.
 ///
-/// Gesetzte Notizen liegen im Speicher und als Datei in Caches/notizen/ (Name: Prüfsumme über Text, Breite, Farbe und
-/// Größe). Ändert sich nichts davon, wird nie neu gesetzt. Endet WebKit oder hängt es (etwa im Hintergrund), wird die
-/// Notiz später noch einmal gesetzt (höchstens dreimal, solange die App vorn ist).
+/// Gesetzte Notizen liegen im Speicher und als Datei in Caches/notizen/ (Name: Prüfsumme über die Fassung des Setzens,
+/// Text, Breite, Farbe und Größe). Ändert sich nichts davon, wird nie neu gesetzt. Endet WebKit oder hängt es (etwa im
+/// Hintergrund), wird die Notiz später noch einmal gesetzt (höchstens dreimal, solange die App vorn ist).
 @MainActor
 enum NoteTypesetter {
     /// Gesetzte Notiz: die Seite des PDFs und ihre Größe in Seitenpunkten (Breite = Breite der Notiz)
@@ -73,8 +73,10 @@ enum NoteTypesetter {
     /// Breite einer Notiz in Seitenpunkten (Seite 768 breit), mindestens 20
     nonisolated static func width(_ note: AskNote) -> Double { max(20, (note.w * Double(PageLayout.width)).rounded()) }
 
+    /// Vorn die Fassung des Setzens: Wächst sie, wird schon Gesetztes neu gesetzt (2: davor fehlten manchmal Zeichen
+    /// aus den Zusatzschriften von KaTeX, etwa ℝ oder das große Σ)
     private static func key(_ note: AskNote) -> String {
-        let raw = "1|\(width(note))|\(fontSize(note.size))|\(cssColor(note.color))|\(note.text)"
+        let raw = "2|\(width(note))|\(fontSize(note.size))|\(cssColor(note.color))|\(note.text)"
         return SHA256.hash(data: Data(raw.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
@@ -328,8 +330,23 @@ enum NoteTypesetter {
     render(md);
     // Farbe auch für Formeln und Tabellen (KaTeX erbt sie, ein paar Stile der Seite setzen eigene)
     for (const el of out.querySelectorAll("*")) if (!el.closest(".katex")) el.style.color = color;
-    const fonts = () => Promise.race([document.fonts.ready, new Promise((done) => setTimeout(done, 5000))]);
-    out.getBoundingClientRect();
+    // Erst alle Schriften von KaTeX laden und darauf warten (höchstens 5 s je Aufruf), dann neu umbrechen. Von sich aus
+    // lädt WebKit eine Schrift erst, wenn Text sie braucht, und document.fonts.ready wartet nicht immer darauf (älteres
+    // WebKit wie in iPadOS 18 ab der zweiten Notiz einer Ansicht nie): Dann fehlten im PDF Zeichen aus den
+    // Zusatzschriften (ℝ, das große Σ), ihr Platz blieb aber frei
+    const fonts = async () => {
+      let loads = Array.from(document.fonts, (f) => (f.status === "loaded" ? null : f.load()));
+      // Zählt document.fonts die Schriften aus dem CSS nicht auf: dieselben über Name, Gewicht und Stil
+      if (!loads.length) {
+        const names = ["AMS", "Caligraphic", "Fraktur", "Main", "Math", "SansSerif", "Script", "Size1", "Size2", "Size3",
+          "Size4", "Typewriter"];
+        loads = names.flatMap((name) => ["", "bold ", "italic ", "italic bold "]
+          .map((style) => document.fonts.load(style + "1em KaTeX_" + name)));
+      }
+      const loaded = Promise.all(loads.map((p) => p && p.catch(() => null))).then(() => document.fonts.ready);
+      await Promise.race([loaded, new Promise((done) => setTimeout(done, 5000))]);
+      out.getBoundingClientRect();
+    };
     await fonts();
     // Zu breite Formeln kleiner setzen (höchstens auf 40 %), statt sie abzuschneiden
     for (const el of out.querySelectorAll("eq, eqn, .katex-display")) {
@@ -342,7 +359,6 @@ enum NoteTypesetter {
         el.style.fontSize = next + "%";
       }
     }
-    out.getBoundingClientRect();
     await fonts();
     const r = out.getBoundingClientRect();
     // Unten etwas Luft für Unterlängen
