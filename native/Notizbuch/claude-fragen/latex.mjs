@@ -32,10 +32,9 @@ export const PRETEX = String.raw`% BetterNotes: eine lange Seite (vom Helfer vor
 \makeatletter
 \ifdefined\AddToHook\def\nb@hook{\AddToHook{begindocument/end}}\else\def\nb@hook{\AtBeginDocument}\fi
 % Wo im A4-PDF eine neue Seite beginnt: kurze gestrichelte Linie links und rechts mit „S. n“ (marken.tex vom Helfer)
-\def\nb@m#1#2{\put(0,-#1){\nb@grau{\multiput(14,0)(6,0){5}{\rule{3pt}{0.4pt}}\put(14,3.5){\fontsize{6}{7}\selectfont S.~#2}%
-  \multiput(\strip@pt\dimexpr\paperwidth-46pt\relax,0)(6,0){5}{\rule{3pt}{0.4pt}}%
-  \put(\strip@pt\dimexpr\paperwidth-46pt\relax,3.5){\fontsize{6}{7}\selectfont S.~#2}}}}
-\def\nb@grau#1{\ifdefined\textcolor\textcolor[gray]{0.55}{#1}\else#1\fi}
+\def\nb@m#1#2{\put(0,-#1){\multiput(10,0)(7,0){6}{\rule{4.5pt}{0.9pt}}\put(10,4){\fontsize{8}{9}\selectfont\bfseries S.~#2}%
+  \multiput(\strip@pt\dimexpr\paperwidth-50pt\relax,0)(7,0){6}{\rule{4.5pt}{0.9pt}}%
+  \put(\strip@pt\dimexpr\paperwidth-50pt\relax,4){\fontsize{8}{9}\selectfont\bfseries S.~#2}}}
 \nb@hook{%
   \ifdefined\nbMarken\InputIfFileExists{\nbMarken}{}{}\fi
   \@ifundefined{nb@allemarken}{}{\ifdefined\AddToHook\AddToHook{shipout/background}{\ifnum\value{page}=1 \nb@allemarken\fi}\fi}%
