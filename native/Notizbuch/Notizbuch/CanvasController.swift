@@ -352,7 +352,8 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
     private var redrawWork: DispatchWorkItem?
     /// Wartet das ausstehende Neuzeichnen, bis der Pencil nicht mehr schwebt? Nur nach dem Radieren (handleErase):
     /// Setzen der Zeichnung unter dem schwebenden Pencil versteckt PencilKits Live-Leinwand, und der nächste Strich
-    /// erschiene erst beim Absetzen. Alle anderen Anlässe (Drehen, Seitensprung, fremde Striche) warten nicht
+    /// erschiene erst beim Absetzen. Alle anderen Anlässe hier (Öffnen, Drehen, Seitensprung, fremde Striche, neue
+    /// Seitenordnung) warten nicht; das Neuzeichnen nach einem ∞ wartet für sich (redrawAfterInfinity)
     private var redrawWaitsForPencil = false
     private func redrawInkSoon(waitForPencil: Bool = false) {
         // Kommen mehrere Anlässe zusammen, wartet das Neuzeichnen nur, wenn alle warten dürfen
@@ -373,7 +374,41 @@ final class CanvasController: UIViewController, PKCanvasViewDelegate, UIPencilIn
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
     }
 
-    /// Baut die Tinte sofort neu auf; ein noch ausstehendes Neuzeichnen entfällt damit
+    /// Nach dem Zurücknehmen eines ∞ (infinitySettled) einmal die Tinte neu aufbauen: Im Simulator mit iOS 27 blieb die
+    /// Seite danach manchmal leer (in 180 nur beim ersten ∞ nach dem Booten des Simulators), bis Drehen die Zeichnung
+    /// neu setzte; ein Lasso mit dem Finger und Antippen halfen nicht (28.11.). Ob dieses Neuzeichnen allein reicht,
+    /// war am 28.11. noch ungeprüft: Drehen baut die Tinte ebenso mit redrawInkNow neu auf, ändert aber auch Maßstab
+    /// und Größe. Wie nach dem Radieren frühestens nach 0,5 s und erst, wenn kein Werkzeug arbeitet, der Pencil nicht
+    /// schwebt und keine Liste einer Auswahl offen ist; dazu erst, wenn auch kein Lasso arbeitet (auch kein Ziehen der
+    /// Auswahl, das PencilKit nicht als Werkzeug meldet). Ist seither ein neuer Weg des Lassos fertig, entfällt es: Das
+    /// Neuzeichnen höbe dessen Auswahl auf (setDrawing); bliebe die Seite dann leer, hülfe Drehen oder ein Tab-Wechsel.
+    /// Eine Auswahl ohne neuen Weg (Einsetzen an einer leeren Stelle), die entsteht, während es wartet, hebt es
+    /// trotzdem auf. Es entfällt auch, wenn die Leinwand verlassen oder verdeckt ist (reattach setzt die Zeichnung
+    /// ohnehin neu) oder schon ein anderes Neuzeichnen ansteht (redrawInkSoon, etwa nach dem Drehen)
+    private func redrawAfterInfinity(path: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, !self.left, !self.detached else { return }
+            guard self.lassoPaths == path, self.redrawWork == nil else {
+                #if DEBUG
+                NSLog("Asks-Debug: ∞: kein Neuzeichnen, %@",
+                      self.lassoPaths == path ? "ein anderes steht an" : "neuer Weg des Lassos")
+                #endif
+                return
+            }
+            if self.toolBusy || self.pencilNear || self.canvas.isShowingSelectionPanel || self.lassoTracker.isTracking
+                || Date().timeIntervalSince(self.lastLassoEnd) < 0.5 {
+                self.redrawAfterInfinity(path: path)
+            } else {
+                #if DEBUG
+                NSLog("Asks-Debug: ∞: Tinte neu aufbauen, %ld Striche", self.canvas.drawing.strokes.count)
+                #endif
+                self.redrawInkNow()
+            }
+        }
+    }
+
+    /// Baut die Tinte sofort neu auf; ein noch ausstehendes Neuzeichnen von redrawInkSoon entfällt damit (das nach
+    /// einem ∞ nicht, siehe redrawAfterInfinity)
     private func redrawInkNow() {
         redrawWork?.cancel()
         redrawWork = nil
@@ -2386,10 +2421,11 @@ extension CanvasController {
     }
 
     /// Schließt `base` samt allem, was darüber gezeigt wird (`base.dismiss` schlösse nur das Oberste darüber). Ist
-    /// `base` nicht mehr gezeigt oder geht es (oder sein Gastgeber) schon zu, passiert nichts. Vermutung (nicht belegt,
-    /// dafür gibt es debug/dismissprobe): Ein zweites dismiss am Gastgeber, während `base` noch wegfährt, nimmt UIKit
-    /// als Schließen des Gastgebers selbst, bei der Karte also als Schließen des ganzen Editors. Nach „Markierung
-    /// löschen“ kamen früher zwei: das der Karte selbst und gleich danach das von reloadAskMarks
+    /// `base` nicht mehr gezeigt oder geht es (oder sein Gastgeber) schon zu, passiert nichts. Ein zweites dismiss am
+    /// Gastgeber, während `base` noch wegfährt, nimmt UIKit als Schließen des Gastgebers selbst, bei der Karte also als
+    /// Schließen des ganzen Editors: Im Simulator schloss 171 beim Löschen der Frage einer offenen Karte (debug/card,
+    /// dann debug/delete) den Editor dreimal von drei, 180 mit dieser Sperre nie; reloadAskMarks kam dabei zweimal
+    /// hierher (28.11.). Nach „Markierung löschen“ kam früher zudem das dismiss der Karte selbst
     static func dismissStack(from base: UIViewController, animated: Bool) {
         #if DEBUG
         let shownBy = base.presentingViewController
@@ -2755,6 +2791,10 @@ extension CanvasController: UIGestureRecognizerDelegate {
             let undone = newPath ? nil : undoInfinityMove(pending)
             if undone == true {
                 Log.ink.info("Lasso-∞ verschob Striche: zurückgenommen")
+                // Danach einmal die Tinte neu aufbauen (im Simulator blieb die Seite nach einem gelungenen
+                // Zurücknehmen manchmal leer). Nicht nach einem misslungenen: Das stellt undoInfinityMove mit
+                // Wiederholen gleich wieder her
+                redrawAfterInfinity(path: pending.path)
             } else {
                 if newest { canvas.menuBlockedUntil = .distantPast }
                 Log.ink.info("Lasso-∞ verschob Striche: keine Frage")
@@ -2831,8 +2871,9 @@ extension CanvasController: UIGestureRecognizerDelegate {
         toolUsedSinceSave = true
         // Erst die Auswahl aufheben, dann Rückgängig: So nimmt PencilKit zurück wie ohne Auswahl. Umgekehrt lief der
         // Abbau der Auswahl vielleicht mitten in sein Neuzeichnen: Im Simulator mit iOS 27 blieb die Seite einmal leer
-        // (27.11.), belegt ist diese Ursache nicht. Das Aufheben kommt nicht in Rückgängig; geht das Zurücknehmen
-        // nicht, bleibt die Auswahl trotzdem aufgehoben
+        // (27.11.), belegt ist diese Ursache nicht. Auch in dieser Reihenfolge blieb sie leer (180, 28.11.), darum
+        // zeichnet infinitySettled danach neu (redrawAfterInfinity). Das Aufheben kommt nicht in Rückgängig; geht das
+        // Zurücknehmen nicht, bleibt die Auswahl trotzdem aufgehoben
         endLassoSelection()
         undo.undo()
         if Self.strokePrints(canvas.drawing, k: k) == Self.strokePrints(pending.before, k: pending.k) { return true }
@@ -3065,7 +3106,8 @@ extension CanvasController: UIGestureRecognizerDelegate {
 extension CanvasController: UIPopoverPresentationControllerDelegate {
     /// Ein zweites Antippen neben der Karte, während sie vom ersten schon zugeht (etwa zweimal schnell daneben
     /// getippt), schließt nichts mehr: Ein zweites dismiss schlösse vermutlich den Editor (siehe dismissStack). Sonst
-    /// wie ohne Delegate
+    /// wie ohne Delegate. Im iPhone-Simulator kam die Anfrage auch beim Wegwischen der Karte, kurz nachdem sie zu
+    /// gehen begann (im Protokoll als Antippen); die Karte ging trotzdem zu, der Editor blieb (180, 28.11.)
     func presentationControllerShouldDismiss(_ presentationController: UIPresentationController) -> Bool {
         let closing = presentationController.presentedViewController.isBeingDismissed
         #if DEBUG
@@ -3396,8 +3438,9 @@ extension CanvasController {
             log("delete: \(id)")
         case "/carddelete", "/notedelete":
             // Dieselben Closures wie in der Karte (showAnswer): debug/delete oben löscht nur, ohne dass die Karte sich
-            // selbst schließt, und stellt so nicht nach, was ihr Menü tut (laut Meldung vom 27.11. ging in 171 nach dem
-            // Entfernen einer Notiz der Editor zu; mit welchem Menüpunkt, ist offen)
+            // selbst schließt, und stellt so nicht ganz nach, was ihr Menü tut (laut Meldung vom 27.11. ging in 171
+            // nach dem Entfernen einer Notiz der Editor zu; im Simulator schloss 171 ihn, wenn debug/delete die Frage
+            // der mit debug/card geöffneten Karte löschte, nicht aber bei „Diese Notiz entfernen“ von Hand, 28.11.)
             guard let id = pick(), sync.asks.ask(doc.id, id) != nil else { return log("\(url.path): keine Frage") }
             let removeNote = url.path == "/notedelete"
             let n = value("note").flatMap { Int($0) } ?? 0

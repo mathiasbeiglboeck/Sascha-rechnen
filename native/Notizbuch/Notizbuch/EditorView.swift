@@ -427,22 +427,24 @@ struct ToolBar: View {
     /// Zurück zu den Notizbüchern. In der schmalen Leiste (iPad, iPhone quer) nahm nur das Symbol (etwa 11 × 20 Punkte)
     /// das Tippen an, 7 bis 14 Punkte neben der Seitenübersicht (Wunsch 27.11.: am iPad oft nicht erkannt). Jetzt steht
     /// es 6 Punkte weiter weg, und die Fläche reicht über die ganze Höhe der Leiste, links bis an ihren Rand und rechts
-    /// bis zur Mitte des Abstands; das Symbol bleibt in der Leiste, wo es ist (wie bei der Uhrzeit in der eigenen
-    /// Zeile). In der breiten Leiste (iPhone hochkant, schmale Fenster) ist jedes Feld ohnehin 44 Punkte hoch und so
-    /// breit, wie Platz ist
+    /// bis 3 Punkte vor die Mitte des Abstands; das Symbol bleibt in der Leiste, wo es ist (wie bei der Uhrzeit in der
+    /// eigenen Zeile). Die 3 Punkte: SwiftUI nimmt einen Klick (Finger) offenbar auch etwas neben der Fläche an; im
+    /// Simulator schloss in 180, wo sie bis zur Mitte reichte, ein Klick gerechnet 3 bis 5 Punkte rechts daneben noch
+    /// den Editor, ebenso einer gut 3 Punkte außerhalb der runden Ecke (28.11.). In der breiten Leiste (iPhone
+    /// hochkant, schmale Fenster) ist jedes Feld ohnehin 44 Punkte hoch und so breit, wie Platz ist
     @ViewBuilder private func backButton(spacing: CGFloat, edge: CGFloat, rim: CGFloat, wide: Bool) -> some View {
         let arrow = Image(systemName: "chevron.left").font(.body.weight(.semibold))
         if wide {
             Button(action: onClose) { arrow.cell(wide) }
         } else {
-            let extra: CGFloat = 6, half = (spacing + extra) / 2
+            let extra: CGFloat = 6, reach = (spacing + extra) / 2 - 3
             Button(action: onClose) {
                 arrow
                     .frame(maxHeight: .infinity)
-                    .padding(EdgeInsets(top: rim, leading: edge, bottom: rim, trailing: half))
+                    .padding(EdgeInsets(top: rim, leading: edge, bottom: rim, trailing: reach))
                     .contentShape(LeadingCapsule())
             }
-            .padding(EdgeInsets(top: -rim, leading: -edge, bottom: -rim, trailing: extra - half))
+            .padding(EdgeInsets(top: -rim, leading: -edge, bottom: -rim, trailing: extra - reach))
         }
     }
 
